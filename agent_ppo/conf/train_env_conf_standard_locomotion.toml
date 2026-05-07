@@ -446,6 +446,13 @@ ang_vel_threshold = 0.5
 promote_threshold = 0.62
 promote_count = 3
 
+# Require each velocity stage to run for at least this many PPO rollouts before
+# promotion.  This prevents pretrained policies from jumping through Stage 1/2
+# after only a few 48-step rollout checks.
+# 每个速度档至少停留这么多次 PPO rollout 检查后才允许升级，避免预训练模型
+# 只经过少数 48-step rollout 就从 Stage 1/2 连跳到最高档。
+min_checks_per_stage = 20
+
 # Demote when normalized tracking falls below 30% for consecutive checks.
 # tracking 比例连续低于 30% 时降级。
 demote_threshold = 0.38

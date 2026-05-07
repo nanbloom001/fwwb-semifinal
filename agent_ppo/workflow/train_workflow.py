@@ -91,6 +91,7 @@ class VelocityCurriculum:
         )
         self.promote_count:     int   = int(vc_conf.get("promote_count", 5))
         self.demote_count:      int   = int(vc_conf.get("demote_count",  3))
+        self.min_checks_per_stage: int = int(vc_conf.get("min_checks_per_stage", 0))
 
         raw_stages = vc_conf.get("stages", None)
         if raw_stages:
@@ -129,11 +130,13 @@ class VelocityCurriculum:
         self._tracking_key_resolved = None
         self._tracking_key_warning_logged = False
         self._debug_check_count = 0
+        self._stage_check_count = 0
         logger.info(
             f"[VelocityCurriculum] Initialized: {len(self.STAGES)} stages, "
             f"tracking_weight={self._tracking_reward_weight}, "
             f"promote_threshold={self.promote_threshold}, demote_threshold={self.demote_threshold}, "
-            f"promote_count={self.promote_count}, demote_count={self.demote_count}"
+            f"promote_count={self.promote_count}, demote_count={self.demote_count}, "
+            f"min_checks_per_stage={self.min_checks_per_stage}"
         )
 
     def _normalize_threshold(self, threshold_value: float, field_name: str) -> float:
@@ -276,6 +279,7 @@ class VelocityCurriculum:
 
         self._last_mean_tracking_reward = mean_reward
         self._last_mean_tracking_ratio = mean_ratio
+        self._stage_check_count += 1
 
         stage_changed = False
         old_stage = self._stage_idx
@@ -283,22 +287,35 @@ class VelocityCurriculum:
         if mean_ratio >= self.promote_threshold:
             self._promote_streak += 1
             self._demote_streak = 0
-            if self._promote_streak >= self.promote_count and self._stage_idx < len(self.STAGES) - 1:
+            has_min_stage_checks = self._stage_check_count >= self.min_checks_per_stage
+            if (
+                self._promote_streak >= self.promote_count
+                and has_min_stage_checks
+                and self._stage_idx < len(self.STAGES) - 1
+            ):
+                stage_checks_before_change = self._stage_check_count
                 self._stage_idx += 1
                 self._promote_streak = 0
+                self._demote_streak = 0
+                self._stage_check_count = 0
                 self.logger.warning(
                     f"[VelocityCurriculum] PROMOTE ↑ stage {self._stage_idx} "
                     f"(tracking_ratio={mean_ratio:.3f} >= {self.promote_threshold:.3f}, "
                     f"tracking_reward={mean_reward:.3f}, "
-                    f"for {self.promote_count} consecutive checks)"
+                    f"for {self.promote_count} consecutive checks, "
+                    f"stage_checks={stage_checks_before_change}/{self.min_checks_per_stage})"
                 )
                 stage_changed = True
+            elif self._stage_idx >= len(self.STAGES) - 1:
+                self._promote_streak = min(self._promote_streak, self.promote_count)
         elif mean_ratio < self.demote_threshold:
             self._demote_streak += 1
             self._promote_streak = 0
             if self._demote_streak >= self.demote_count and self._stage_idx > 0:
                 self._stage_idx -= 1
                 self._demote_streak = 0
+                self._promote_streak = 0
+                self._stage_check_count = 0
                 self.logger.warning(
                     f"[VelocityCurriculum] DEMOTE ↓ stage {self._stage_idx} "
                     f"(tracking_ratio={mean_ratio:.3f} < {self.demote_threshold:.3f}, "
@@ -324,6 +341,7 @@ class VelocityCurriculum:
                 f"@{self.promote_threshold:.3f}, "
                 f"demote={self._demote_streak}/{self.demote_count} "
                 f"@{self.demote_threshold:.3f}, "
+                f"stage_checks={self._stage_check_count}/{self.min_checks_per_stage}, "
                 f"ranges={current_cfg}"
             )
 
