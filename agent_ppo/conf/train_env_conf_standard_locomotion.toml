@@ -174,8 +174,8 @@ ang_vel_z = [-1.5, 1.5]
 # Curriculum will naturally expand range once robot walks reliably.
 # 下限回到 0.0：要求最低 0.3m/s 让初学者更难；允许零速命令以在简单地形上起步
 lin_vel_x = [0.0, 0.5]
-lin_vel_y = [-0.3, 0.3]
-ang_vel_yaw = [-1.0, 1.0]
+lin_vel_y = [-0.2, 0.2]
+ang_vel_yaw = [-0.8, 0.8]
 
 
 # =====================================================================
@@ -224,7 +224,7 @@ weight = -0.5
 # but loosen it from flat-ground shaping strength to avoid over-constraining body motion.
 # 楼梯上行需要一定 pitch/roll 调整，因此保留该惩罚但适度放松，
 # 避免像平地塑形那样过度限制机身姿态变化。
-weight = -0.30
+weight = -0.35
 
 # --- Negative: joint smoothness ---
 # --- 负向：关节 ---
@@ -255,7 +255,7 @@ weight = -0.3
 # Stairs require more decisive swing-leg action than flat walking.
 # Keep smoothing, but reduce the 1st-order action penalty slightly.
 # 台阶环境比平地更需要明确的摆腿动作，因此略微减小一阶动作变化惩罚。
-weight = -0.015
+weight = -0.02
 
 # --- Negative: undesired contacts ---
 # --- 负向：碰撞 ---
@@ -299,7 +299,7 @@ threshold = 0.6
 # 动作二阶平滑惩罚
 # Keep a mild 2nd-order smoothness term, but avoid suppressing stair step-up swing.
 # 保留温和的二阶平滑约束，但不能压制上台阶时的摆腿动作。
-weight = -0.0075
+weight = -0.01
 
 [rewards.energy]
 # Energy penalty: torque × joint velocity.
@@ -400,7 +400,7 @@ weight = -3.0
 # 关节速度不受约束是步态节律紊乱的根本原因；保守初值，可视情提升。
 # Stairs require faster leg swing than flat walking, so loosen this penalty.
 # 楼梯比平地需要更快的摆腿，因此放松该惩罚。
-weight = -3e-4
+weight = -5e-4
 
 [rewards.base_lateral_vel]
 # NEW Round-4: Penalize *untracked* lateral velocity error (actual_vy - cmd_vy)².
@@ -463,20 +463,15 @@ demote_count = 2
 # 4 个渐进速度阶段；Stage 0 必须与上方 commands.ranges 完全一致（启动时直接生效）
 [[velocity_curriculum.stages]]
 lin_vel_x   = [0.0,  0.5]
+lin_vel_y   = [-0.2,  0.2]
+ang_vel_yaw = [-0.8,  0.8]
+
+[[velocity_curriculum.stages]]
+lin_vel_x   = [0.0,  0.8]
 lin_vel_y   = [-0.3,  0.3]
 ang_vel_yaw = [-1.0,  1.0]
 
 [[velocity_curriculum.stages]]
-lin_vel_x   = [0.0,  0.8]
-lin_vel_y   = [-0.4,  0.4]
-ang_vel_yaw = [-1.2,  1.2]
-
-[[velocity_curriculum.stages]]
 lin_vel_x   = [0.0,  1.2]
-lin_vel_y   = [-0.6,  0.6]
-ang_vel_yaw = [-1.5,  1.5]
-
-[[velocity_curriculum.stages]]
-lin_vel_x   = [-0.3, 1.6]
-lin_vel_y   = [-0.8,  0.8]
-ang_vel_yaw = [-1.5,  1.5]
+lin_vel_y   = [-0.5,  0.5]
+ang_vel_yaw = [-1.2,  1.2]
