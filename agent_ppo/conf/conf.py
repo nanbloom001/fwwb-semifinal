@@ -59,7 +59,7 @@ class StageConfig:
 
     # --- Saving
     # 保存 ---
-    model_save_interval = 250
+    model_save_interval = 200
 
 
 class CustomConfig(StageConfig):

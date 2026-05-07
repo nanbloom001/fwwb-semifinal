@@ -239,7 +239,7 @@ class VelocityCurriculum:
             new_critic_obs = new_obs
         return torch.clone(new_obs), torch.clone(new_critic_obs), True
 
-    def check_and_update(self, ep_infos, usr_conf, env, obs, critic_obs):
+    def check_and_update(self, ep_infos, usr_conf, env, obs, critic_obs, rollout_stats=None):
         """Check episode-batch performance and promote / demote stage if warranted.
 
         Call this BEFORE ep_infos.clear() so the current batch's data is available.
@@ -252,14 +252,25 @@ class VelocityCurriculum:
         避免 env.reset 后旧累计值污染 rewbuffer 统计。
         """
         self._debug_check_count += 1
+        rollout_stats = rollout_stats or {}
         mean_reward, mean_ratio = self._mean_tracking_reward(ep_infos)
+        metric_source = "episode"
+        if mean_reward is None or mean_ratio is None:
+            rollout_reward = rollout_stats.get("rollout_track_lin_vel_xy_reward")
+            rollout_ratio = rollout_stats.get("rollout_track_lin_vel_xy_ratio")
+            if rollout_reward is not None and rollout_ratio is not None:
+                mean_reward = float(rollout_reward)
+                mean_ratio = float(rollout_ratio)
+                metric_source = "rollout_critic_obs"
+
         if mean_reward is None or mean_ratio is None:
             if self._debug_check_count <= 10 or self._debug_check_count % 20 == 0:
                 sample_keys = list(ep_infos[0].keys())[:40] if ep_infos else []
                 self.logger.warning(
                     "[VelocityCurriculumDebug] no tracking metric available; "
                     f"check={self._debug_check_count}, ep_infos={len(ep_infos)}, "
-                    f"resolved_key={self._tracking_key_resolved}, sample_keys={sample_keys}"
+                    f"resolved_key={self._tracking_key_resolved}, sample_keys={sample_keys}, "
+                    f"rollout_stats_keys={list(rollout_stats.keys())}"
                 )
             return obs, critic_obs, False
 
@@ -306,7 +317,8 @@ class VelocityCurriculum:
             self.logger.warning(
                 "[VelocityCurriculumDebug] "
                 f"check={self._debug_check_count}, ep_infos={len(ep_infos)}, "
-                f"key={self._tracking_key_resolved}, reward={mean_reward:.4f}, "
+                f"source={metric_source}, key={self._tracking_key_resolved}, "
+                f"reward={mean_reward:.4f}, "
                 f"ratio={mean_ratio:.4f}, stage={old_stage}->{self._stage_idx}, "
                 f"promote={self._promote_streak}/{self.promote_count} "
                 f"@{self.promote_threshold:.3f}, "
@@ -466,6 +478,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             cur_episode_length,
             rewbuffer,
             lenbuffer,
+            usr_conf,
         )
 
         episode += 1
@@ -473,7 +486,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         # Phase 1.5: Velocity Curriculum Check (performance-based, before ep_infos.clear)
         # 阶段1.5：速度课程检查（性能驱动，必须在 ep_infos.clear() 之前调用）
         last_obs, last_critic_obs, vel_reset = vel_curriculum.check_and_update(
-            ep_infos, usr_conf, env, last_obs, last_critic_obs
+            ep_infos, usr_conf, env, last_obs, last_critic_obs, rollout_stats=storage_stats
         )
         # If env.reset was triggered by a stage change, stale accumulated rewards
         # from interrupted episodes must be discarded to prevent corrupting rewbuffer.
@@ -731,6 +744,48 @@ def _compute_advantages_and_returns(storage, agent, critic_obs, logger):
     return storage_stats
 
 
+def _sample_rollout_tracking_stats(storage, usr_conf, logger=None):
+    """Estimate velocity-tracking curriculum metrics from rollout critic obs.
+
+    This avoids waiting for completed episodes.  With long stable episodes,
+    ``infos["episode"]`` may be absent for many PPO updates, so an episode-only
+    curriculum can remain stuck at zero even though the policy is already
+    tracking commands well.
+
+    critic_obs layout:
+      [0:3] base_lin_vel, [9:12] velocity command.
+    """
+    critic_obs = getattr(storage, "privileged_observations", None)
+    if critic_obs is None or storage.step <= 0 or critic_obs.shape[-1] < 12:
+        return {}
+
+    reward_conf = usr_conf.get("rewards", {}).get("track_lin_vel_xy", {})
+    params = reward_conf.get("params", {})
+    weight = abs(float(reward_conf.get("weight", 1.0)))
+    std = float(params.get("std", 0.25))
+    if weight <= 1e-6:
+        weight = 1.0
+    if std <= 1e-6:
+        if logger is not None:
+            logger.warning(
+                "[VelocityCurriculumDebug] invalid track_lin_vel_xy std in TOML; "
+                f"std={std}, falling back to 0.25"
+            )
+        std = 0.25
+
+    rollout_critic_obs = critic_obs[:storage.step]
+    actual_xy = rollout_critic_obs[..., 0:2]
+    command_xy = rollout_critic_obs[..., 9:11]
+    squared_error = torch.sum(torch.square(actual_xy - command_xy), dim=-1)
+    tracking_ratio = torch.exp(-squared_error / (std * std)).mean().item()
+    tracking_reward = tracking_ratio * weight
+
+    return {
+        "rollout_track_lin_vel_xy_ratio": tracking_ratio,
+        "rollout_track_lin_vel_xy_reward": tracking_reward,
+    }
+
+
 def _get_isaac_env(env):
     """Try to unwrap the KaiwuDRL env wrapper to the underlying Isaac Lab env.
 
@@ -938,6 +993,7 @@ def run_episodes_(
     cur_episode_length,
     rewbuffer,
     lenbuffer,
+    usr_conf,
 ):
     """
     Run episodes to collect trajectory data.
@@ -1024,6 +1080,7 @@ def run_episodes_(
         # Compute advantages and returns
         # 计算优势函数和回报
         storage_stats = _compute_advantages_and_returns(storage, agent, critic_obs, logger)
+        storage_stats.update(_sample_rollout_tracking_stats(storage, usr_conf, logger))
         last_obs = torch.clone(obs)
 
     # Note: batch generation now handled by AlgorithmPPO.learn()
