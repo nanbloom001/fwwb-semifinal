@@ -21,9 +21,15 @@ from tools.base_env.observation_process import ObservationProcess
 
 class CriticObservationProcess(ObservationProcess):
     target_group = "critic"
+    _EXPECTED_OBS_DIM = 316
 
     def process(self):
         obs = self.default_observation()
+        if obs.shape[-1] != self._EXPECTED_OBS_DIM:
+            raise ValueError(
+                f"Critic observation dim mismatch: expected {self._EXPECTED_OBS_DIM}, got {obs.shape[-1]}. "
+                "This usually means height_scan or privileged observation layout changed unexpectedly."
+            )
         # TODO (track terrain): if the policy observation appends goal features,
         # the critic observation must keep the same task-information convention.
         # TODO (track 地形)：如果 policy 观测追加了 goal 特征，

@@ -74,6 +74,7 @@ class RewardProcess(RewardProcessBase):
         stand_still_scale: float = 5.0,
         velocity_threshold: float = 0.1,
         cmd_threshold: float = 0.1,
+        ang_cmd_threshold: float = 0.2,
     ):
         """Penalize joint position deviation from default pose.
 
@@ -98,17 +99,67 @@ class RewardProcess(RewardProcessBase):
                                 机体速度阈值，低于此值判定为静止 (m/s)。
             cmd_threshold: Command norm threshold below which robot is "standing still" (m/s).
                            速度指令模长阈值，低于此值视为零速指令 (m/s)。
+            ang_cmd_threshold: Yaw-rate command threshold below which robot is treated as not turning.
+                               偏航角速度指令阈值，低于此值视为未被要求转向。
         """
         asset = self._get_robot_asset()
-        cmd = torch.linalg.norm(self.env.command_manager.get_command("base_velocity"), dim=1)
+        cmd = self.env.command_manager.get_command("base_velocity")
+        cmd_xy = torch.linalg.norm(cmd[:, :2], dim=1)
+        cmd_yaw = torch.abs(cmd[:, 2])
         body_vel = torch.linalg.norm(asset.data.root_lin_vel_b[:, :2], dim=1)
         deviation = torch.linalg.norm(asset.data.joint_pos - asset.data.default_joint_pos, dim=1)
-        is_moving = torch.logical_or(cmd > cmd_threshold, body_vel > velocity_threshold)
+        is_moving = torch.logical_or(
+            torch.logical_or(cmd_xy > cmd_threshold, cmd_yaw > ang_cmd_threshold),
+            body_vel > velocity_threshold,
+        )
         return torch.where(
             is_moving,
             deviation,
             stand_still_scale * deviation,
         )
+
+    def _reward_stand_still_motion(
+        self,
+        command_name: str = "base_velocity",
+        lin_cmd_threshold: float = 0.15,
+        ang_cmd_threshold: float = 0.2,
+        vertical_vel_scale: float = 0.5,
+        ang_vel_scale: float = 0.5,
+        joint_vel_scale: float = 0.1,
+    ):
+        """Penalize body oscillation and leg fidgeting under near-zero commands.
+
+        连续命令采样几乎不会精确落在 0 速度，因此“站立不动”往往训练不足。
+        本奖励在近零线速度/角速度命令带内激活，直接惩罚机身上下晃动、
+        pitch/roll 摇摆以及小腿频繁抬放造成的关节速度。
+
+        Args:
+            lin_cmd_threshold: Near-zero threshold for XY linear command norm (m/s).
+            ang_cmd_threshold: Near-zero threshold for yaw command magnitude (rad/s).
+            vertical_vel_scale: Weight for vertical body velocity in the penalty.
+            ang_vel_scale: Weight for pitch/roll angular velocity in the penalty.
+            joint_vel_scale: Weight for mean absolute joint velocity in the penalty.
+        """
+        asset = self._get_robot_asset()
+        cmd = self.env.command_manager.get_command(command_name)
+
+        near_zero_cmd = (
+            torch.linalg.norm(cmd[:, :2], dim=1) < lin_cmd_threshold
+        ) & (
+            torch.abs(cmd[:, 2]) < ang_cmd_threshold
+        )
+
+        base_lin_vel = asset.data.root_lin_vel_b
+        base_ang_vel = asset.data.root_ang_vel_b
+        mean_abs_joint_vel = torch.mean(torch.abs(asset.data.joint_vel), dim=1)
+
+        motion_penalty = (
+            torch.linalg.norm(base_lin_vel[:, :2], dim=1)
+            + vertical_vel_scale * torch.abs(base_lin_vel[:, 2])
+            + ang_vel_scale * torch.linalg.norm(base_ang_vel[:, :2], dim=1)
+            + joint_vel_scale * mean_abs_joint_vel
+        )
+        return near_zero_cmd.float() * motion_penalty
 
     def _reward_feet_stumble(self):
         """Penalize feet hitting vertical surfaces (stair edges, walls).

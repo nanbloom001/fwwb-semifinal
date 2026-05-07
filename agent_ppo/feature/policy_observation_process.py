@@ -38,9 +38,15 @@ from tools.base_env.observation_process import ObservationProcess
 
 class PolicyObservationProcess(ObservationProcess):
     target_group = "policy"
+    _EXPECTED_OBS_DIM = 301
 
     def process(self):
         obs = self.default_observation()
+        if obs.shape[-1] != self._EXPECTED_OBS_DIM:
+            raise ValueError(
+                f"Policy observation dim mismatch: expected {self._EXPECTED_OBS_DIM}, got {obs.shape[-1]}. "
+                "This usually means height_scan is missing or the observation layout changed."
+            )
         # TODO (track terrain): you can construct features from env.goal_positions /
         # env.goal_yaw or env.scene.sensors["nav_scanner"] and concatenate them to obs.
         # TODO (track 地形)：可按需从 env.goal_positions / env.goal_yaw

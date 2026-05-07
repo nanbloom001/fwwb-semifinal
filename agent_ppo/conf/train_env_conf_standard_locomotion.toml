@@ -1,15 +1,14 @@
 # =============================================================================
-# Standard Locomotion — Phase-0: Flat-ground Gait Shaping
-# Standard Locomotion — 第零阶段：平地步态塑形
+# Standard Locomotion — Full-Difficulty Standard Curriculum
+# Standard Locomotion — Standard 模式完整难度课程训练
 #
-# Goal: train a clean, symmetric gait (proper joint angles, rhythm, no crab-walking)
-# BEFORE introducing complex terrain. Curriculum is OFF; all terrain is flat slope.
-# 目标：在引入复杂地形之前，先在平地上训练出规整步态（正确关节角、对称节律、无螃蟹步）。
-# 课程学习关闭，地形全部固定为最简单平地坡面（difficulty=0 时坡度≈0）。
+# Goal: keep the gait clean and symmetric while training across the full
+# standard-terrain difficulty band with curriculum.
+# 目标：在保持规整步态的同时，在 standard 模式完整难度带上进行课程训练。
 #
-# → Phase-1 升级条件（满足后切换到完整 standard 配置）：
-#   - step_score 稳定 > 0（机器人能走穿地形）
-#   - forward_score > 30
+# → Next-phase 升级条件：
+#   - step_score 在 stairs/stairs_inv 上稳定为正
+#   - forward_score 持续提升且无明显台阶前犹豫/绊倒
 #   - 步态视觉上规整（无明显跛行/螃蟹步/鬼畜）
 # =============================================================================
 
@@ -40,10 +39,9 @@ mode = "standard"
 # In standard mode, num_rows = number of difficulty tiers (curriculum levels along X),
 # valid range [1, 10], recommended 10.
 # standard 模式下 num_rows 表示**难度级别数**（沿 X 轴的课程档位），合法范围：[1, 10]，推荐 10
-# Phase-0: 3 rows, difficulty_range=[0,0.2] → only mild slopes; keeps terrain effectively flat
-# while letting curriculum promote/demote within this narrow band.
-# Phase-0：仅保留3档，难度上限0.2（坡度极缓），保证地形接近平地的同时允许课程运作
-num_rows = 3
+# Use full 10 curriculum tiers again across the standard terrain difficulty band.
+# 恢复 10 个课程档位，并覆盖 standard 模式完整难度带。
+num_rows = 10
 
 # In standard mode, num_cols = parallel plots within the same difficulty tier along Y,
 # valid range [1, 40], recommended 20.
@@ -54,25 +52,26 @@ num_cols = 20
 
 # Difficulty range [min, max], valid range: [0.0, 1.0].
 # 难度范围 [min, max]，合法范围：[0.0, 1.0]
-# Phase-0: cap at 0.2 — even the hardest tier is a barely perceptible slope.
-# Phase-0：上限0.2，最难档也是几乎感知不到的微坡，保证平地训练质量
-difficulty_range = [0.0, 0.2]
+# Restore the full standard-mode difficulty band.
+# 恢复 standard 模式的完整难度范围。
+difficulty_range = [0.0, 1.0]
 
 # Whether to enable terrain curriculum (promote/demote difficulty by performance).
 # 是否启用地形课程学习（按表现晋级/降级难度）
-# Phase-0: ENABLED with narrow difficulty_range=[0,0.2] and num_rows=3.
+# Curriculum stays enabled across the full difficulty band.
 # terrain.curriculum also controls the built-in velocity range expansion; the
 # Python-side VelocityCurriculum independently manages command sampling ranges,
 # so enabling terrain.curriculum here only affects terrain difficulty, not commands.
 # (Built-in velocity expansion is bounded by commands.limit, already correct.)
-# Phase-0：开启，但难度限制在 [0,0.2] + 3档，地形实质仍是近似平地；
+# 地形课程保持开启，覆盖 [0,1] 的完整难度带，共 10 档；
 # 速度范围独立由 Python 侧 VelocityCurriculum 管理（见 [velocity_curriculum] 节）
 curriculum = true
 
 # Max init difficulty tier for robot placement, valid range: [0, 9].
 # 机器人初始放置的最大难度档，合法范围：[0, 9]
-# Phase-0: locked to 0 (flat). Phase-1: raise to 2~5 after gait is clean.
-# 第零阶段锁定 0（平地）。步态规整后升至 2~5
+# Keep the initial placement cap at the default easiest tier unless the user
+# explicitly wants to raise it.
+# 初始放置等级恢复到默认最简单档，除非后续明确要求提高。
 max_init_terrain_level = 0
 
 
@@ -83,20 +82,23 @@ max_init_terrain_level = 0
 # 合法子地形：pyramid_slope | pyramid_slope_inv | pyramid_stairs | pyramid_stairs_inv | maze
 # 注意：不存在"平地"地形类型。平地效果 = pyramid_slope + max_init_terrain_level=0（难度0时坡度≈0）
 #
-# Phase-0: 100% flat slope (50/50 normal/inv for symmetric sampling).
-# 第零阶段：100% 平地坡面（正反各50%，保证机器人面对两个方向均匀训练），0% 楼梯/迷宫。
-# → Phase-1 时改为：slope=0.40, slope_inv=0.30, stairs=0.20, stairs_inv=0.10, maze=0.0
+# Phase-0.5: introduce LOW-difficulty stairs while keeping terrain difficulty range unchanged.
+# Keep most envs on slopes for gait stability, but add a meaningful fraction of stairs/stairs_inv
+# so the robot actually sees step-up and step-down transitions during data collection.
+# 第 0.5 阶段：在保持低难度不变的前提下，引入低难度楼梯。
+# 大部分环境仍保留在坡面上维持步态稳定，同时加入一定比例的正/反楼梯，
+# 让策略在采样中真正见到上台阶和下台阶。
 [terrain.standard.pyramid_slope]
-proportion = 0.50
+proportion = 0.35
 
 [terrain.standard.pyramid_slope_inv]
-proportion = 0.50
+proportion = 0.35
 
 [terrain.standard.pyramid_stairs]
-proportion = 0.0
+proportion = 0.15
 
 [terrain.standard.pyramid_stairs_inv]
-proportion = 0.0
+proportion = 0.15
 
 [terrain.standard.maze]
 proportion = 0.0
@@ -218,9 +220,11 @@ weight = -0.5
 [rewards.ang_vel_xy]
 # Penalty on pitch/roll angular velocity.
 # X/Y 方向角速度惩罚（抑制 pitch/roll 抖动）
-# Phase-0 increase: -0.1→-0.5 (pairs with flat_orientation; both enforce upright on flat terrain)
-# Phase-0 加强：与 flat_orientation 联动，共同扩大竖直走姿约束
-weight = -0.5
+# For stairs, some pitch/roll is necessary during step-up. Keep the penalty,
+# but loosen it from flat-ground shaping strength to avoid over-constraining body motion.
+# 楼梯上行需要一定 pitch/roll 调整，因此保留该惩罚但适度放松，
+# 避免像平地塑形那样过度限制机身姿态变化。
+weight = -0.35
 
 # --- Negative: joint smoothness ---
 # --- 负向：关节 ---
@@ -248,9 +252,10 @@ weight = -0.3
 [rewards.action_rate]
 # Delta between consecutive actions (1st order).
 # 相邻动作差（一阶）
-# Round-4 balance: -0.01→-0.03 (3×; conservative, reference end value -0.1)
-# 第四轮平衡：保守 3×，参考终值为 -0.1
-weight = -0.03
+# Stairs require more decisive swing-leg action than flat walking.
+# Keep smoothing, but reduce the 1st-order action penalty slightly.
+# 台阶环境比平地更需要明确的摆腿动作，因此略微减小一阶动作变化惩罚。
+weight = -0.02
 
 # --- Negative: undesired contacts ---
 # --- 负向：碰撞 ---
@@ -268,10 +273,11 @@ threshold = 1
 [rewards.flat_orientation]
 # Penalty on deviation from flat base orientation.
 # 基座偏离水平姿态的惩罚
-# Phase-0 PRIMARY target: -0.5→-3.0 (6×). Flat terrain = no excuse for tilting.
-# Robot MUST keep body level. Strong signal shapes upright walking from the start.
-# Phase-0 核心目标：6× 加强。平地上没有倾斑的理由，必须保持机身水平
-weight = -3.0
+# Flat-ground shaping used a very strong upright-body prior. For stairs this becomes
+# counter-productive because the robot must pitch its body while climbing.
+# 平地阶段使用了很强的“机身必须水平”先验；切到楼梯后这会妨碍上台阶，
+# 因为机器人需要在上行时适当俯仰机身。
+weight = -1.5
 
 [rewards.reach_goal]
 # Reach-goal reward example (active only when env.goal_positions is maintained, i.e. track terrain).
@@ -291,9 +297,9 @@ threshold = 0.6
 [rewards.action_smoothness]
 # 2nd-order action smoothness penalty.
 # 动作二阶平滑惩罚
-# Round-4 balance: -0.01→-0.02 (2×; pairs with action_rate increase)
-# 第四轮平衡：与 action_rate 同步加强，二者共同约束抖振
-weight = -0.02
+# Keep a mild 2nd-order smoothness term, but avoid suppressing stair step-up swing.
+# 保留温和的二阶平滑约束，但不能压制上台阶时的摆腿动作。
+weight = -0.01
 
 [rewards.energy]
 # Energy penalty: torque × joint velocity.
@@ -303,9 +309,10 @@ weight = -2e-5
 [rewards.correct_base_height]
 # Penalize deviation of base height from target.
 # 惩罚机身高度偏离目标，对应赛题 posture 评分项
-# Phase-0 increase: -0.3→-2.0 (posture score directly depends on consistent base height).
-# Phase-0 加强：posture 评分项直接取决于机身高度，平地上高度应非常稳定
-weight = -2.0
+# On stairs the base height must vary while stepping up/down, so the flat-ground
+# penalty is too strict and discourages climbing.
+# 楼梯上/下时机身高度本来就会变化，平地阶段的高度惩罚过强，会压制上阶动作。
+weight = -0.8
 [rewards.correct_base_height.params]
 # Go2 nominal standing height (m).
 # Go2 标准站立高度 (m)
@@ -323,17 +330,29 @@ target_height = 0.38
 
 # ── 自定义（reward_process.py 已实现）──────────────────────────────
 [rewards.joint_position_penalty]
-# Phase-0 increase: -0.15→-0.5 (full-body joint angle constraint is key for gait shaping).
-# stand_still_scale 2.0→1.5: bug-fixed version now uses cmd_threshold so it fires correctly;
-# 1.5× during standing still provides a clear incentive to hold default stance.
-# cmd_threshold lowered 0.1→0.05: prevents misclassifying low-speed commands (0.05~0.1 m/s)
-# as "standing still", which would suppress slow-speed tracking.
-# Phase-0 加强：全身关节角度约束是步态塑形的核心。
-# cmd_threshold 从 0.1→0.05：防止把 0.05~0.1 m/s 的低速指令误判为靳立，避免压制低速跟踪性
-weight = -0.5
+# Keep joint-angle regularization, but reduce it for stairs because knees/hips need
+# larger deviation from nominal pose during ascent.
+# 关节角正则仍然保留，但楼梯上行时膝/髋需要比平地更大的偏离幅度，因此适当降权。
+weight = -0.3
 [rewards.joint_position_penalty.params]
-stand_still_scale = 1.5
-cmd_threshold = 0.05
+stand_still_scale = 2.0
+cmd_threshold = 0.10
+ang_cmd_threshold = 0.20
+
+[rewards.stand_still_motion]
+# Penalize body bobbing, pitch/roll摇摆, and repeated leg lifting when the
+# command is near zero. This specifically targets the "原地上下晃动 + 小腿抬放"
+# failure mode that global gait rewards cannot reliably suppress.
+# 近零命令下惩罚机身上下晃动、pitch/roll 摇摆和小腿反复抬放，
+# 专门针对当前出现的原地抖动问题。
+weight = -0.8
+[rewards.stand_still_motion.params]
+command_name = "base_velocity"
+lin_cmd_threshold = 0.15
+ang_cmd_threshold = 0.20
+vertical_vel_scale = 0.5
+ang_vel_scale = 0.5
+joint_vel_scale = 0.1
 
 [rewards.feet_air_time]
 # Adjusted: weight 1.0→0.5, threshold 0.25→0.18.
@@ -345,10 +364,13 @@ cmd_threshold = 0.05
 # Lower weight to reduce exploit incentive; air_time_variance_penalty handles symmetry.
 # 修复：0.25s门槛对慢速过高，导致奖励持续为负。
 # 同时封山了「腿永远悬空不落地」的exploit（右后腿画圈问题根因）。
-weight = 0.5
+# Stair ascent needs longer swing and more decisive foot lift than flat walking.
+# Increase the positive signal slightly so policy is less afraid to lift the leg.
+# 上台阶需要更长的摆腿和更明确的抬脚，因此略微增强正向滞空奖励。
+weight = 0.8
 [rewards.feet_air_time.params]
 command_name = "base_velocity"
-threshold = 0.18
+threshold = 0.16
 
 [rewards.feet_slide]
 # Penalize foot sliding (velocity when foot is in contact).
@@ -358,7 +380,10 @@ weight = -0.1
 [rewards.feet_stumble]
 # Penalize feet hitting stair edges / walls (horizontal force >> vertical).
 # 惩罚脚碰台阶边缘或墙壁（水平力 >> 垂直力）
-weight = -0.1
+# Keep this penalty, but lower it slightly during stair adaptation so exploratory
+# toe contact with the step edge is not over-punished before the policy learns lift.
+# 楼梯适应阶段略微降权，避免策略在尚未学会抬脚前就因为探索性碰边被过度惩罚。
+weight = -0.05
 
 [rewards.termination]
 # Phase-0 increase: -1.0→-3.0. On flat terrain the robot SHOULD NOT fall.
@@ -373,7 +398,9 @@ weight = -3.0
 # NEW Round-4: Penalize large joint velocities (sum of squared joint velocities).
 # 新增：惩罚关节速度过大（关节速度平方和），抑制"鬼畜"步态。
 # 关节速度不受约束是步态节律紊乱的根本原因；保守初值，可视情提升。
-weight = -1e-3
+# Stairs require faster leg swing than flat walking, so loosen this penalty.
+# 楼梯比平地需要更快的摆腿，因此放松该惩罚。
+weight = -5e-4
 
 [rewards.base_lateral_vel]
 # NEW Round-4: Penalize *untracked* lateral velocity error (actual_vy - cmd_vy)².
@@ -412,22 +439,16 @@ ang_vel_threshold = 0.5
 # 根据 reward_track_lin_vel_xy 均值，逐阶扩大速度指令采样范围。
 # =============================================================================
 [velocity_curriculum]
-# Promote to next stage when mean_tracking >= promote_threshold for
-# promote_count consecutive episode-batch checks.
-# 连续 promote_count 次检查均值 >= promote_threshold 时升级
-#
-# FIX: weight was reduced 3.0→2.5 but threshold was not adjusted.
-# Old: 2.0/3.0=67% accuracy needed. New: 2.0/2.5=80% accuracy (too strict).
-# Corrected: 1.6/2.5=64% accuracy (equivalent to original intent).
-# promote_count lowered 5→3: curve hovers near threshold, fewer consecutive checks.
-# 修复：weight从3.0降到2.5但阈值未同步调整。原意67%追踪精度，现实成了80%，门槛实质变严。
-promote_threshold = 1.6
-promote_count = 3
+# Thresholds now use tracking ratio in [0,1] instead of absolute weighted reward.
+# This prevents curriculum behavior from drifting when reward weight changes.
+# 现改为 tracking 比例阈值（[0,1]），避免 reward weight 一改，课程门槛就漂移。
+# 0.55 means current tracking reward reaches 55% of its theoretical maximum.
+promote_threshold = 0.55
+promote_count = 2
 
-# Demote to previous stage when mean_tracking < demote_threshold for
-# demote_count consecutive checks.
-# 连续 demote_count 次检查均值 < demote_threshold 时降级
-demote_threshold = 0.8
+# Demote when normalized tracking falls below 30% for consecutive checks.
+# tracking 比例连续低于 30% 时降级。
+demote_threshold = 0.30
 demote_count = 3
 
 # Velocity stages: 4 progressive levels.

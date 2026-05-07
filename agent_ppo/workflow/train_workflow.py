@@ -29,7 +29,7 @@ class VelocityCurriculum:
     stays in the neutral zone [demote_threshold, promote_threshold).
 
     Completely independent of terrain.curriculum — terrain difficulty is managed
-    separately (num_rows=3, difficulty_range=[0,0.2]). Stage changes call
+    separately (num_rows=10, difficulty_range=[0,1.0]). Stage changes call
     env.reset(usr_conf) to apply new velocity ranges.
     Policy weights are NOT affected — only env command-sampling changes.
 
@@ -39,7 +39,7 @@ class VelocityCurriculum:
 
     性能驱动的速度课程，复用地形课程逻辑（表现好则升级，差则降级）。
     与 terrain.curriculum 完全独立——地形难度由 TOML [terrain] 节独立管理
-    （3档，难度上限0.2，接近平地）。
+    （10 档，覆盖完整 [0,1] 难度带）。
     所有阈值和阶段定义均从 TOML [velocity_curriculum] 节读取。
     """
 
@@ -65,9 +65,23 @@ class VelocityCurriculum:
         """
         self.logger = logger
         vc_conf = usr_conf.get("velocity_curriculum", {})
+        tracking_reward_conf = usr_conf.get("rewards", {}).get("track_lin_vel_xy", {})
 
-        self.promote_threshold: float = float(vc_conf.get("promote_threshold", 2.0))
-        self.demote_threshold:  float = float(vc_conf.get("demote_threshold",  0.8))
+        self._tracking_reward_weight = abs(float(tracking_reward_conf.get("weight", 1.0)))
+        if self._tracking_reward_weight <= 1e-6:
+            logger.warning(
+                "[VelocityCurriculum] track_lin_vel_xy weight is non-positive; "
+                "falling back to 1.0 for curriculum normalization. "
+                "Please check [rewards.track_lin_vel_xy].weight in TOML."
+            )
+            self._tracking_reward_weight = 1.0
+
+        self.promote_threshold: float = self._normalize_threshold(
+            float(vc_conf.get("promote_threshold", 0.64)), "promote_threshold"
+        )
+        self.demote_threshold:  float = self._normalize_threshold(
+            float(vc_conf.get("demote_threshold", 0.32)), "demote_threshold"
+        )
         self.promote_count:     int   = int(vc_conf.get("promote_count", 5))
         self.demote_count:      int   = int(vc_conf.get("demote_count",  3))
 
@@ -88,22 +102,67 @@ class VelocityCurriculum:
                 "falling back to hard-coded default stages."
             )
 
+        command_ranges = usr_conf.get("commands", {}).get("ranges", {})
+        stage0 = self.STAGES[0]
+        if (
+            list(command_ranges.get("lin_vel_x", [])) != stage0["lin_vel_x"]
+            or list(command_ranges.get("lin_vel_y", [])) != stage0["lin_vel_y"]
+            or list(command_ranges.get("ang_vel_yaw", [])) != stage0["ang_vel_yaw"]
+        ):
+            raise ValueError(
+                "Velocity curriculum Stage 0 must exactly match [commands.ranges] in TOML. "
+                f"Got commands.ranges={command_ranges}, stage0={stage0}."
+            )
+
         self._stage_idx = 0
         self._promote_streak = 0  # consecutive checks above promote_threshold
         self._demote_streak = 0   # consecutive checks below demote_threshold
+        self._last_mean_tracking_reward = 0.0
+        self._last_mean_tracking_ratio = 0.0
         logger.info(
             f"[VelocityCurriculum] Initialized: {len(self.STAGES)} stages, "
+            f"tracking_weight={self._tracking_reward_weight}, "
             f"promote_threshold={self.promote_threshold}, demote_threshold={self.demote_threshold}, "
             f"promote_count={self.promote_count}, demote_count={self.demote_count}"
         )
+
+    def _normalize_threshold(self, threshold_value: float, field_name: str) -> float:
+        """Normalize legacy absolute thresholds into reward-ratio thresholds.
+
+        Historical configs stored absolute weighted reward thresholds (e.g. 1.6).
+        That makes curriculum behavior drift every time reward weight changes.
+        New configs should store ratios in [0, 1], e.g. 0.55 means 55% of the
+        current track_lin_vel_xy maximum reward.
+        历史配置使用加权 reward 的绝对阈值（如 1.6），reward weight 一改就会漂。
+        现在统一转为比例阈值：[0,1] 区间，0.55 表示达到当前最大 tracking reward 的 55%。
+        """
+        if threshold_value <= 1.0:
+            return threshold_value
+
+        normalized = threshold_value / self._tracking_reward_weight
+        self.logger.warning(
+            f"[VelocityCurriculum] {field_name}={threshold_value} detected as legacy absolute reward; "
+            f"normalized to ratio {normalized:.3f} using tracking weight {self._tracking_reward_weight:.3f}."
+        )
+        return normalized
 
     @property
     def stage(self) -> int:
         return self._stage_idx
 
-    def _mean_tracking_reward(self, ep_infos) -> Optional[float]:
-        """Average reward_track_lin_vel_xy across all completed episodes in batch.
-        Returns None if ep_infos is empty or key is absent.
+    @property
+    def last_tracking_reward(self) -> float:
+        return self._last_mean_tracking_reward
+
+    @property
+    def last_tracking_ratio(self) -> float:
+        return self._last_mean_tracking_ratio
+
+    def _mean_tracking_reward(self, ep_infos) -> Tuple[Optional[float], Optional[float]]:
+        """Average reward_track_lin_vel_xy across completed episodes.
+
+        Returns both the raw weighted reward and the normalized ratio.
+        返回加权后的原始 tracking reward，以及相对当前 reward weight 的归一化比例。
         """
         values = []
         for ep_info in ep_infos:
@@ -111,7 +170,12 @@ class VelocityCurriculum:
                 continue
             v = ep_info[self._TRACKING_KEY]
             values.append(v.float().mean().item() if isinstance(v, torch.Tensor) else float(v))
-        return sum(values) / len(values) if values else None
+        if not values:
+            return None, None
+
+        mean_reward = sum(values) / len(values)
+        mean_ratio = mean_reward / self._tracking_reward_weight
+        return mean_reward, mean_ratio
 
     def _apply_stage(self, usr_conf, env, obs, critic_obs):
         """Write current stage ranges into usr_conf and call env.reset.
@@ -130,7 +194,7 @@ class VelocityCurriculum:
         data = env.reset(usr_conf)
         if data is None:
             self.logger.error("[VelocityCurriculum] env.reset failed after stage change!")
-            return obs, critic_obs, False
+            raise RuntimeError("VelocityCurriculum env.reset failed after stage change")
         new_obs, new_critic_obs = data
         if new_critic_obs is None:
             new_critic_obs = new_obs
@@ -148,13 +212,16 @@ class VelocityCurriculum:
         reset_happened=True 时调用方需清零 cur_reward_sum / cur_episode_length，
         避免 env.reset 后旧累计值污染 rewbuffer 统计。
         """
-        mean_reward = self._mean_tracking_reward(ep_infos)
-        if mean_reward is None:
+        mean_reward, mean_ratio = self._mean_tracking_reward(ep_infos)
+        if mean_reward is None or mean_ratio is None:
             return obs, critic_obs, False
+
+        self._last_mean_tracking_reward = mean_reward
+        self._last_mean_tracking_ratio = mean_ratio
 
         stage_changed = False
 
-        if mean_reward >= self.promote_threshold:
+        if mean_ratio >= self.promote_threshold:
             self._promote_streak += 1
             self._demote_streak = 0
             if self._promote_streak >= self.promote_count and self._stage_idx < len(self.STAGES) - 1:
@@ -162,11 +229,12 @@ class VelocityCurriculum:
                 self._promote_streak = 0
                 self.logger.info(
                     f"[VelocityCurriculum] PROMOTE ↑ stage {self._stage_idx} "
-                    f"(mean_tracking={mean_reward:.3f} >= {self.promote_threshold} "
+                    f"(tracking_ratio={mean_ratio:.3f} >= {self.promote_threshold:.3f}, "
+                    f"tracking_reward={mean_reward:.3f}, "
                     f"for {self.promote_count} consecutive checks)"
                 )
                 stage_changed = True
-        elif mean_reward < self.demote_threshold:
+        elif mean_ratio < self.demote_threshold:
             self._demote_streak += 1
             self._promote_streak = 0
             if self._demote_streak >= self.demote_count and self._stage_idx > 0:
@@ -174,7 +242,8 @@ class VelocityCurriculum:
                 self._demote_streak = 0
                 self.logger.info(
                     f"[VelocityCurriculum] DEMOTE ↓ stage {self._stage_idx} "
-                    f"(mean_tracking={mean_reward:.3f} < {self.demote_threshold} "
+                    f"(tracking_ratio={mean_ratio:.3f} < {self.demote_threshold:.3f}, "
+                    f"tracking_reward={mean_reward:.3f}, "
                     f"for {self.demote_count} consecutive checks)"
                 )
                 stage_changed = True
@@ -201,6 +270,23 @@ def _initialize_training_state(env, agent, logger):
                 cur_reward_sum, cur_episode_length, reward_keys, usr_conf)
     """
     usr_conf, usr_conf_file, is_eval, stage = Config.load_conf(logger)
+
+    terrain_conf = usr_conf.get("terrain", {}).get("standard", {})
+    terrain_keys = (
+        "pyramid_slope",
+        "pyramid_slope_inv",
+        "pyramid_stairs",
+        "pyramid_stairs_inv",
+        "maze",
+    )
+    terrain_total = sum(float(terrain_conf.get(key, {}).get("proportion", 0.0)) for key in terrain_keys)
+    if abs(terrain_total - 1.0) > 1e-6:
+        message = (
+            f"Invalid standard terrain proportions: sum={terrain_total:.6f}, expected 1.0. "
+            f"Please check {usr_conf_file}."
+        )
+        logger.error(message)
+        raise ValueError(message)
 
     # Validate configuration before proceeding
     # 在继续之前校验配置
@@ -289,10 +375,12 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     episode = 0
 
     # Velocity curriculum: expands command ranges independently of terrain curriculum.
-    # terrain difficulty is limited to [0, 0.2] via difficulty_range in TOML;
+    # terrain difficulty spans the full [0, 1.0] band via difficulty_range in TOML,
+    # with 10 curriculum rows and initial placement capped at level 0;
     # velocity stages expand independently via VelocityCurriculum.
     # 速度课程：独立于地形课程扩大速度指令范围。
-    # 地形难度由 TOML difficulty_range=[0,0.2] 独立限制，速度范围由 VelocityCurriculum 逐阶扩大。
+    # 地形难度由 TOML difficulty_range=[0,1.0] + 10 个课程档位独立限制，
+    # 初始放置等级上限为 0；速度范围由 VelocityCurriculum 逐阶扩大。
     vel_curriculum = VelocityCurriculum(logger, usr_conf)
 
     # Main Training Loop
@@ -332,13 +420,6 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         if vel_reset:
             cur_reward_sum.zero_()
             cur_episode_length.zero_()
-        # If env.reset was triggered by a stage change, stale accumulated rewards
-        # from the interrupted episodes must be discarded to prevent corrupting rewbuffer.
-        # 若阶段切换触发了 env.reset，必须清零未完成 episode 的累计统计，
-        # 防止旧值在下次 dones 触发时污染 rewbuffer。
-        if vel_reset:
-            cur_reward_sum.zero_()
-            cur_episode_length.zero_()
 
         # Phase 2: Policy Update
         # 阶段2：策略更新
@@ -357,7 +438,10 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         now = time.time()
         if now - last_report_monitor_time >= 60:
             report_monitor_data(ep_infos, reward_keys, agent, monitor, episode, storage_stats,
-                                vel_stage=vel_curriculum.stage)
+                                vel_stage=vel_curriculum.stage,
+                                vel_tracking_ratio=vel_curriculum.last_tracking_ratio,
+                                vel_tracking_reward=vel_curriculum.last_tracking_reward,
+                                lenbuffer=lenbuffer, rewbuffer=rewbuffer)
             last_report_monitor_time = now
 
         ep_infos.clear()
@@ -411,16 +495,30 @@ def _collect_episode_metrics(ep_infos, reward_keys, device):
 
 
 def report_monitor_data(ep_infos, reward_keys, agent, monitor, episode, storage_stats=None,
-                        vel_stage: int = 0):
+                        vel_stage: int = 0, vel_tracking_ratio: float = 0.0,
+                        vel_tracking_reward: float = 0.0, lenbuffer=None, rewbuffer=None):
     """
     Report monitoring data to monitor system.
     上报监控数据到监控系统。
     """
-    monitor_data = {"episode_cnt": episode, "vel_curriculum_stage": vel_stage}
+    monitor_data = {
+        "episode_cnt": episode,
+        "vel_curriculum_stage": vel_stage,
+        "vel_curriculum_tracking_ratio": vel_tracking_ratio,
+        "vel_curriculum_tracking_reward": vel_tracking_reward,
+    }
 
+    # Merge all storage stats: reward_mean/reward_std AND physics obs_ keys.
+    # 将所有 storage_stats 合并写入，包含 reward 统计和物理量观测 obs_ 键。
     if storage_stats:
-        monitor_data["reward_mean"] = storage_stats.get("reward_mean", 0.0)
-        monitor_data["reward_std"] = storage_stats.get("reward_std", 0.0)
+        monitor_data.update(storage_stats)
+
+    # Episode health metrics: episode length and cumulative reward per episode.
+    # 训练进展指标：episode 存活步数和每 episode 累计奖励（与权重无关）。
+    if lenbuffer:
+        monitor_data["mean_episode_length"] = float(sum(lenbuffer) / len(lenbuffer))
+    if rewbuffer:
+        monitor_data["mean_episode_reward"] = float(sum(rewbuffer) / len(rewbuffer))
 
     if ep_infos:
         metrics = _collect_episode_metrics(ep_infos, reward_keys, agent.device)
@@ -550,6 +648,137 @@ def _compute_advantages_and_returns(storage, agent, critic_obs, logger):
     return storage_stats
 
 
+def _get_isaac_env(env):
+    """Try to unwrap the KaiwuDRL env wrapper to the underlying Isaac Lab env.
+
+    尝试解包 KaiwuDRL 包装层，获取底层的 Isaac Lab 环境对象。
+    Returns the first object that exposes a `command_manager` attribute,
+    or None if none is found.
+    返回第一个带有 command_manager 属性的对象，找不到则返回 None。
+    """
+    # Walk common wrapper chains recursively instead of assuming one fixed depth.
+    # 递归遍历常见 wrapper 链，避免假设包装层只有固定一层。
+    seen_ids = set()
+    pending = [env]
+    while pending:
+        candidate = pending.pop(0)
+        if candidate is None or id(candidate) in seen_ids:
+            continue
+        seen_ids.add(id(candidate))
+        if hasattr(candidate, "command_manager") and hasattr(candidate, "scene"):
+            return candidate
+        for attr_name in ("env", "_env", "unwrapped", "wrapped_env", "_wrapped_env", "venv"):
+            pending.append(getattr(candidate, attr_name, None))
+    return None
+
+
+def _has_robot_state(asset) -> bool:
+    data = getattr(asset, "data", None)
+    return (
+        data is not None
+        and hasattr(data, "root_lin_vel_b")
+        and hasattr(data, "root_pos_w")
+        and hasattr(data, "root_ang_vel_b")
+    )
+
+
+def _get_robot_asset_from_env(isaac_env):
+    """Best-effort robot asset lookup across common Isaac Lab scene layouts.
+
+    奖励模块通过平台基类间接取 robot asset，这里无法复用闭源 helper，
+    因此改为遍历常见 scene 容器布局做稳健查找。
+    """
+    if isaac_env is None:
+        return None
+
+    scene = getattr(isaac_env, "scene", None)
+    if scene is None:
+        return None
+
+    if hasattr(scene, "__getitem__"):
+        for key in ("robot", "Robot"):
+            try:
+                asset = scene[key]
+            except Exception:
+                asset = None
+            if _has_robot_state(asset):
+                return asset
+
+    for container_name in ("articulations", "rigid_objects", "entities"):
+        container = getattr(scene, container_name, None)
+        if container is None:
+            continue
+
+        if hasattr(container, "get"):
+            for key in ("robot", "Robot"):
+                asset = container.get(key)
+                if _has_robot_state(asset):
+                    return asset
+
+        values = getattr(container, "values", None)
+        if callable(values):
+            for asset in values():
+                if _has_robot_state(asset):
+                    return asset
+
+    for attr_name in ("robot", "_robot"):
+        asset = getattr(isaac_env, attr_name, None)
+        if _has_robot_state(asset):
+            return asset
+
+    return None
+
+
+def _sample_physics_stats(env, logger=None):
+    """Take a point-in-time snapshot of key physical quantities across all envs.
+
+    在所有并行环境上对关键物理量做一次快照（均值）。
+    这些指标与 reward 权重无关，是判断策略真实收敛情况的第一手依据：
+      obs_lin_vel_x_error — 前向速度追踪误差 |cmd_vx - actual_vx| (m/s)
+      obs_lin_vel_y_error — 侧向速度追踪误差 |cmd_vy - actual_vy| (m/s)
+      obs_actual_vel_x    — 机体前向实际速度均值 (m/s)
+      obs_base_height     — 机身高度均值 (m)，目标 0.38 m
+      obs_ang_vel_xy      — pitch/roll 角速度幅值均值 (rad/s)
+
+    Returns empty dict if the underlying Isaac Lab env is not accessible.
+    如果访问不到底层 Isaac Lab 环境，则返回空字典。
+    """
+    try:
+        isaac_env = _get_isaac_env(env)
+        if isaac_env is None:
+            if logger is not None and not getattr(env, "_physics_stats_error_logged", False):
+                env._physics_stats_error_logged = True
+                logger.warning("[PhysicsStats] Failed to unwrap Isaac Lab env; physics metrics disabled.")
+            return {}
+
+        cmd = isaac_env.command_manager.get_command("base_velocity")  # (N, 3)
+        asset = _get_robot_asset_from_env(isaac_env)
+        if asset is None:
+            if logger is not None and not getattr(env, "_physics_stats_error_logged", False):
+                env._physics_stats_error_logged = True
+                logger.warning("[PhysicsStats] Failed to locate robot asset in scene; physics metrics disabled.")
+            return {}
+
+        actual_vx = asset.data.root_lin_vel_b[:, 0]
+        actual_vy = asset.data.root_lin_vel_b[:, 1]
+        cmd_vx    = cmd[:, 0]
+        cmd_vy    = cmd[:, 1]
+
+        return {
+            "obs_lin_vel_x_error": torch.abs(actual_vx - cmd_vx).mean().item(),
+            "obs_lin_vel_y_error": torch.abs(actual_vy - cmd_vy).mean().item(),
+            "obs_actual_vel_x":    actual_vx.mean().item(),
+            "obs_base_height":     asset.data.root_pos_w[:, 2].mean().item(),
+            "obs_ang_vel_xy":      torch.norm(
+                asset.data.root_ang_vel_b[:, :2], dim=1).mean().item(),
+        }
+    except Exception as exc:
+        if logger is not None and not getattr(env, "_physics_stats_error_logged", False):
+            env._physics_stats_error_logged = True
+            logger.warning(f"[PhysicsStats] Failed to sample physics metrics: {exc}")
+        return {}
+
+
 def run_episodes_(
     env,
     agent,
@@ -655,5 +884,11 @@ def run_episodes_(
     # Storage will be cleared after learning
     # 注：batch 生成已由 AlgorithmPPO.learn() 处理，
     # storage 将在训练完成后被清空。
+
+    # Append a physics snapshot (averaged across all envs).
+    # Wrapped in try/except inside _sample_physics_stats, so always safe.
+    # 追加物理量快照（跨所有并行环境取均值）。
+    # _sample_physics_stats 内部已有 try/except，调用总是安全的。
+    storage_stats.update(_sample_physics_stats(env, logger))
 
     return last_obs, critic_obs, storage_stats
