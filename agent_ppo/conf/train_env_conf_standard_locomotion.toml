@@ -39,8 +39,9 @@ mode = "standard"
 # In standard mode, num_rows = number of difficulty tiers (curriculum levels along X),
 # valid range [1, 10], recommended 10.
 # standard 模式下 num_rows 表示**难度级别数**（沿 X 轴的课程档位），合法范围：[1, 10]，推荐 10
-# Use full 10 curriculum tiers again across the standard terrain difficulty band.
-# 恢复 10 个课程档位，并覆盖 standard 模式完整难度带。
+# Stair-specialization phase: keep 10 curriculum tiers but narrow the difficulty
+# band so the policy repeatedly sees learnable stair heights.
+# 台阶专项阶段：保留 10 个课程档位，但收窄难度带，让策略反复接触可学习的台阶高度。
 num_rows = 10
 
 # In standard mode, num_cols = parallel plots within the same difficulty tier along Y,
@@ -52,27 +53,27 @@ num_cols = 20
 
 # Difficulty range [min, max], valid range: [0.0, 1.0].
 # 难度范围 [min, max]，合法范围：[0.0, 1.0]
-# Restore the full standard-mode difficulty band.
-# 恢复 standard 模式的完整难度范围。
-difficulty_range = [0.0, 1.0]
+# Temporarily narrow the standard-mode difficulty band for stair acquisition.
+# 台阶专项阶段临时收窄 standard 难度范围。
+difficulty_range = [0.0, 0.6]
 
 # Whether to enable terrain curriculum (promote/demote difficulty by performance).
 # 是否启用地形课程学习（按表现晋级/降级难度）
-# Curriculum stays enabled across the full difficulty band.
+# Curriculum stays enabled across the narrowed stair-specialization band.
 # terrain.curriculum also controls the built-in velocity range expansion; the
 # Python-side VelocityCurriculum independently manages command sampling ranges,
 # so enabling terrain.curriculum here only affects terrain difficulty, not commands.
 # (Built-in velocity expansion is bounded by commands.limit, already correct.)
-# 地形课程保持开启，覆盖 [0,1] 的完整难度带，共 10 档；
+# 地形课程保持开启，覆盖 [0,0.6] 的台阶专项难度带，共 10 档；
 # 速度范围独立由 Python 侧 VelocityCurriculum 管理（见 [velocity_curriculum] 节）
 curriculum = true
 
 # Max init difficulty tier for robot placement, valid range: [0, 9].
 # 机器人初始放置的最大难度档，合法范围：[0, 9]
-# Keep the initial placement cap at the default easiest tier unless the user
-# explicitly wants to raise it.
-# 初始放置等级恢复到默认最简单档，除非后续明确要求提高。
-max_init_terrain_level = 0
+# Start from the first two easy levels; the previous run already learned stable
+# basic walking, so level 1 gives more stair exposure without jumping too far.
+# 从前两个简单档起步；上一轮已经学会基础稳定行走，level 1 能增加台阶暴露但不过激。
+max_init_terrain_level = 1
 
 
 # Sub-terrain proportions (all proportions must sum to 1.0).
@@ -82,23 +83,22 @@ max_init_terrain_level = 0
 # 合法子地形：pyramid_slope | pyramid_slope_inv | pyramid_stairs | pyramid_stairs_inv | maze
 # 注意：不存在"平地"地形类型。平地效果 = pyramid_slope + max_init_terrain_level=0（难度0时坡度≈0）
 #
-# Phase-0.5: introduce LOW-difficulty stairs while keeping terrain difficulty range unchanged.
-# Keep most envs on slopes for gait stability, but add a meaningful fraction of stairs/stairs_inv
-# so the robot actually sees step-up and step-down transitions during data collection.
-# 第 0.5 阶段：在保持低难度不变的前提下，引入低难度楼梯。
-# 大部分环境仍保留在坡面上维持步态稳定，同时加入一定比例的正/反楼梯，
-# 让策略在采样中真正见到上台阶和下台阶。
+# Stair-specialization mix: keep enough slopes to preserve the learned gait, but
+# make stairs/stairs_inv the majority so step-up and step-down failures dominate
+# the gradient.
+# 台阶专项地形比例：保留部分坡面以维持已有步态，但让正/反楼梯占多数，
+# 使上台阶和下台阶失败样本成为主要梯度来源。
 [terrain.standard.pyramid_slope]
-proportion = 0.35
+proportion = 0.20
 
 [terrain.standard.pyramid_slope_inv]
-proportion = 0.35
+proportion = 0.20
 
 [terrain.standard.pyramid_stairs]
-proportion = 0.15
+proportion = 0.30
 
 [terrain.standard.pyramid_stairs_inv]
-proportion = 0.15
+proportion = 0.30
 
 [terrain.standard.maze]
 proportion = 0.0
@@ -224,7 +224,7 @@ weight = -0.5
 # but loosen it from flat-ground shaping strength to avoid over-constraining body motion.
 # 楼梯上行需要一定 pitch/roll 调整，因此保留该惩罚但适度放松，
 # 避免像平地塑形那样过度限制机身姿态变化。
-weight = -0.35
+weight = -0.30
 
 # --- Negative: joint smoothness ---
 # --- 负向：关节 ---
@@ -255,7 +255,7 @@ weight = -0.3
 # Stairs require more decisive swing-leg action than flat walking.
 # Keep smoothing, but reduce the 1st-order action penalty slightly.
 # 台阶环境比平地更需要明确的摆腿动作，因此略微减小一阶动作变化惩罚。
-weight = -0.02
+weight = -0.015
 
 # --- Negative: undesired contacts ---
 # --- 负向：碰撞 ---
@@ -299,7 +299,7 @@ threshold = 0.6
 # 动作二阶平滑惩罚
 # Keep a mild 2nd-order smoothness term, but avoid suppressing stair step-up swing.
 # 保留温和的二阶平滑约束，但不能压制上台阶时的摆腿动作。
-weight = -0.01
+weight = -0.0075
 
 [rewards.energy]
 # Energy penalty: torque × joint velocity.
@@ -367,10 +367,10 @@ joint_vel_scale = 0.1
 # Stair ascent needs longer swing and more decisive foot lift than flat walking.
 # Increase the positive signal slightly so policy is less afraid to lift the leg.
 # 上台阶需要更长的摆腿和更明确的抬脚，因此略微增强正向滞空奖励。
-weight = 0.8
+weight = 1.0
 [rewards.feet_air_time.params]
 command_name = "base_velocity"
-threshold = 0.16
+threshold = 0.18
 
 [rewards.feet_slide]
 # Penalize foot sliding (velocity when foot is in contact).
@@ -400,7 +400,7 @@ weight = -3.0
 # 关节速度不受约束是步态节律紊乱的根本原因；保守初值，可视情提升。
 # Stairs require faster leg swing than flat walking, so loosen this penalty.
 # 楼梯比平地需要更快的摆腿，因此放松该惩罚。
-weight = -5e-4
+weight = -3e-4
 
 [rewards.base_lateral_vel]
 # NEW Round-4: Penalize *untracked* lateral velocity error (actual_vy - cmd_vy)².
@@ -442,14 +442,14 @@ ang_vel_threshold = 0.5
 # Thresholds now use tracking ratio in [0,1] instead of absolute weighted reward.
 # This prevents curriculum behavior from drifting when reward weight changes.
 # 现改为 tracking 比例阈值（[0,1]），避免 reward weight 一改，课程门槛就漂移。
-# 0.55 means current tracking reward reaches 55% of its theoretical maximum.
-promote_threshold = 0.55
-promote_count = 2
+# 0.62 means current tracking reward reaches 62% of its theoretical maximum.
+promote_threshold = 0.62
+promote_count = 3
 
 # Demote when normalized tracking falls below 30% for consecutive checks.
 # tracking 比例连续低于 30% 时降级。
-demote_threshold = 0.30
-demote_count = 3
+demote_threshold = 0.38
+demote_count = 2
 
 # Velocity stages: 4 progressive levels.
 # Stage 0 must match commands.ranges above (applied at startup, no env.reset needed).
@@ -460,17 +460,16 @@ lin_vel_y   = [-0.3,  0.3]
 ang_vel_yaw = [-1.0,  1.0]
 
 [[velocity_curriculum.stages]]
-lin_vel_x   = [0.0,  1.0]
-lin_vel_y   = [-0.5,  0.5]
+lin_vel_x   = [0.0,  0.8]
+lin_vel_y   = [-0.4,  0.4]
+ang_vel_yaw = [-1.2,  1.2]
+
+[[velocity_curriculum.stages]]
+lin_vel_x   = [0.0,  1.2]
+lin_vel_y   = [-0.6,  0.6]
 ang_vel_yaw = [-1.5,  1.5]
 
 [[velocity_curriculum.stages]]
-lin_vel_x   = [0.0,  1.5]
+lin_vel_x   = [-0.3, 1.6]
 lin_vel_y   = [-0.8,  0.8]
 ang_vel_yaw = [-1.5,  1.5]
-
-[[velocity_curriculum.stages]]
-lin_vel_x   = [-0.5, 2.0]
-lin_vel_y   = [-1.0,  1.0]
-ang_vel_yaw = [-1.5,  1.5]
-

@@ -52,10 +52,17 @@ class VelocityCurriculum:
         {"lin_vel_x": [-0.5, 2.0], "lin_vel_y": [-1.0,  1.0], "ang_vel_yaw": [-1.5,  1.5]},
     ]
 
-    # ep_info key used as performance signal.
-    # track_lin_vel_xy: weight=2.5, std=0.25 → max ≃2.5 per step.
-    # promote=2.0 means ~80% tracking accuracy; demote=0.8 means ~32%.
+    # ep_info key used as performance signal.  Different framework versions may
+    # expose reward terms with slightly different names, so lookup is tolerant.
+    # 用于速度课程的 episode 指标。不同框架版本可能使用略有差异的 reward key，
+    # 因此实际查找时会做兼容匹配。
     _TRACKING_KEY = "reward_track_lin_vel_xy"
+    _TRACKING_KEY_CANDIDATES = (
+        "reward_track_lin_vel_xy",
+        "track_lin_vel_xy",
+        "Episode_Reward/reward_track_lin_vel_xy",
+        "Episode_Reward/track_lin_vel_xy",
+    )
 
     def __init__(self, logger, usr_conf: dict):
         """Build curriculum from usr_conf["velocity_curriculum"] (TOML section).
@@ -119,6 +126,8 @@ class VelocityCurriculum:
         self._demote_streak = 0   # consecutive checks below demote_threshold
         self._last_mean_tracking_reward = 0.0
         self._last_mean_tracking_ratio = 0.0
+        self._tracking_key_resolved = None
+        self._tracking_key_warning_logged = False
         logger.info(
             f"[VelocityCurriculum] Initialized: {len(self.STAGES)} stages, "
             f"tracking_weight={self._tracking_reward_weight}, "
@@ -158,6 +167,27 @@ class VelocityCurriculum:
     def last_tracking_ratio(self) -> float:
         return self._last_mean_tracking_ratio
 
+    def _resolve_tracking_metric(self, ep_info):
+        """Return the tracking metric value and the key used to find it.
+
+        返回 episode info 中的速度追踪指标值，以及命中的 key。
+        """
+        if self._tracking_key_resolved and self._tracking_key_resolved in ep_info:
+            return ep_info[self._tracking_key_resolved], self._tracking_key_resolved
+
+        for key in self._TRACKING_KEY_CANDIDATES:
+            if key in ep_info:
+                self._tracking_key_resolved = key
+                return ep_info[key], key
+
+        for key, value in ep_info.items():
+            normalized = str(key).replace("/", "_")
+            if normalized.endswith("track_lin_vel_xy"):
+                self._tracking_key_resolved = key
+                return value, key
+
+        return None, None
+
     def _mean_tracking_reward(self, ep_infos) -> Tuple[Optional[float], Optional[float]]:
         """Average reward_track_lin_vel_xy across completed episodes.
 
@@ -166,11 +196,19 @@ class VelocityCurriculum:
         """
         values = []
         for ep_info in ep_infos:
-            if self._TRACKING_KEY not in ep_info:
+            v, key = self._resolve_tracking_metric(ep_info)
+            if key is None:
                 continue
-            v = ep_info[self._TRACKING_KEY]
             values.append(v.float().mean().item() if isinstance(v, torch.Tensor) else float(v))
         if not values:
+            if ep_infos and not self._tracking_key_warning_logged:
+                sample_keys = list(ep_infos[0].keys())
+                self.logger.warning(
+                    "[VelocityCurriculum] Cannot find tracking metric for velocity curriculum. "
+                    f"Tried keys={self._TRACKING_KEY_CANDIDATES}; "
+                    f"sample episode keys={sample_keys[:40]}"
+                )
+                self._tracking_key_warning_logged = True
             return None, None
 
         mean_reward = sum(values) / len(values)
@@ -667,7 +705,20 @@ def _get_isaac_env(env):
         seen_ids.add(id(candidate))
         if hasattr(candidate, "command_manager") and hasattr(candidate, "scene"):
             return candidate
-        for attr_name in ("env", "_env", "unwrapped", "wrapped_env", "_wrapped_env", "venv"):
+        for attr_name in (
+            "env",
+            "_env",
+            "unwrapped",
+            "wrapped_env",
+            "_wrapped_env",
+            "venv",
+            "isaac_env",
+            "_isaac_env",
+            "sim_env",
+            "_sim_env",
+            "task",
+            "_task",
+        ):
             pending.append(getattr(candidate, attr_name, None))
     return None
 
@@ -696,7 +747,14 @@ def _get_robot_asset_from_env(isaac_env):
         return None
 
     if hasattr(scene, "__getitem__"):
-        for key in ("robot", "Robot"):
+        scene_keys = []
+        keys_fn = getattr(scene, "keys", None)
+        if callable(keys_fn):
+            try:
+                scene_keys = list(keys_fn())
+            except Exception:
+                scene_keys = []
+        for key in ("robot", "Robot", "go2", "Go2", "unitree_go2", "UnitreeGo2", *scene_keys):
             try:
                 asset = scene[key]
             except Exception:
@@ -704,13 +762,20 @@ def _get_robot_asset_from_env(isaac_env):
             if _has_robot_state(asset):
                 return asset
 
-    for container_name in ("articulations", "rigid_objects", "entities"):
+    for container_name in (
+        "articulations",
+        "_articulations",
+        "rigid_objects",
+        "_rigid_objects",
+        "entities",
+        "_entities",
+    ):
         container = getattr(scene, container_name, None)
         if container is None:
             continue
 
         if hasattr(container, "get"):
-            for key in ("robot", "Robot"):
+            for key in ("robot", "Robot", "go2", "Go2", "unitree_go2", "UnitreeGo2"):
                 asset = container.get(key)
                 if _has_robot_state(asset):
                     return asset
@@ -729,7 +794,33 @@ def _get_robot_asset_from_env(isaac_env):
     return None
 
 
-def _sample_physics_stats(env, logger=None):
+def _sample_physics_stats_from_critic_obs(critic_obs):
+    """Fallback physics metrics from critic observation layout.
+
+    critic_obs layout is:
+      [0:3] base_lin_vel, [3:6] base_ang_vel, [9:12] velocity command.
+
+    This path does not provide base height because height is not part of the
+    documented critic observation.  It still keeps velocity and attitude panels
+    alive when the wrapped Isaac env cannot be reached from the workflow.
+    """
+    if critic_obs is None or not hasattr(critic_obs, "shape") or critic_obs.shape[-1] < 12:
+        return {}
+
+    actual_vx = critic_obs[:, 0]
+    actual_vy = critic_obs[:, 1]
+    cmd_vx = critic_obs[:, 9]
+    cmd_vy = critic_obs[:, 10]
+
+    return {
+        "obs_lin_vel_x_error": torch.abs(actual_vx - cmd_vx).mean().item(),
+        "obs_lin_vel_y_error": torch.abs(actual_vy - cmd_vy).mean().item(),
+        "obs_actual_vel_x": actual_vx.mean().item(),
+        "obs_ang_vel_xy": torch.norm(critic_obs[:, 3:5], dim=1).mean().item(),
+    }
+
+
+def _sample_physics_stats(env, logger=None, critic_obs=None):
     """Take a point-in-time snapshot of key physical quantities across all envs.
 
     在所有并行环境上对关键物理量做一次快照（均值）。
@@ -740,24 +831,31 @@ def _sample_physics_stats(env, logger=None):
       obs_base_height     — 机身高度均值 (m)，目标 0.38 m
       obs_ang_vel_xy      — pitch/roll 角速度幅值均值 (rad/s)
 
-    Returns empty dict if the underlying Isaac Lab env is not accessible.
-    如果访问不到底层 Isaac Lab 环境，则返回空字典。
+    Falls back to critic_obs for metrics that are available there if the
+    underlying Isaac Lab env is not accessible.
+    如果访问不到底层 Isaac Lab 环境，则从 critic_obs 中兜底计算可用指标。
     """
     try:
         isaac_env = _get_isaac_env(env)
         if isaac_env is None:
             if logger is not None and not getattr(env, "_physics_stats_error_logged", False):
                 env._physics_stats_error_logged = True
-                logger.warning("[PhysicsStats] Failed to unwrap Isaac Lab env; physics metrics disabled.")
-            return {}
+                logger.warning(
+                    "[PhysicsStats] Failed to unwrap Isaac Lab env; "
+                    "falling back to critic_obs for partial physics metrics."
+                )
+            return _sample_physics_stats_from_critic_obs(critic_obs)
 
         cmd = isaac_env.command_manager.get_command("base_velocity")  # (N, 3)
         asset = _get_robot_asset_from_env(isaac_env)
         if asset is None:
             if logger is not None and not getattr(env, "_physics_stats_error_logged", False):
                 env._physics_stats_error_logged = True
-                logger.warning("[PhysicsStats] Failed to locate robot asset in scene; physics metrics disabled.")
-            return {}
+                logger.warning(
+                    "[PhysicsStats] Failed to locate robot asset in scene; "
+                    "falling back to critic_obs for partial physics metrics."
+                )
+            return _sample_physics_stats_from_critic_obs(critic_obs)
 
         actual_vx = asset.data.root_lin_vel_b[:, 0]
         actual_vy = asset.data.root_lin_vel_b[:, 1]
@@ -775,8 +873,11 @@ def _sample_physics_stats(env, logger=None):
     except Exception as exc:
         if logger is not None and not getattr(env, "_physics_stats_error_logged", False):
             env._physics_stats_error_logged = True
-            logger.warning(f"[PhysicsStats] Failed to sample physics metrics: {exc}")
-        return {}
+            logger.warning(
+                f"[PhysicsStats] Failed to sample physics metrics from Isaac env: {exc}; "
+                "falling back to critic_obs for partial physics metrics."
+            )
+        return _sample_physics_stats_from_critic_obs(critic_obs)
 
 
 def run_episodes_(
@@ -889,6 +990,6 @@ def run_episodes_(
     # Wrapped in try/except inside _sample_physics_stats, so always safe.
     # 追加物理量快照（跨所有并行环境取均值）。
     # _sample_physics_stats 内部已有 try/except，调用总是安全的。
-    storage_stats.update(_sample_physics_stats(env, logger))
+    storage_stats.update(_sample_physics_stats(env, logger, critic_obs=critic_obs))
 
     return last_obs, critic_obs, storage_stats
