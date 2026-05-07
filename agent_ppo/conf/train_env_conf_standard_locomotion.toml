@@ -336,17 +336,19 @@ stand_still_scale = 1.5
 cmd_threshold = 0.05
 
 [rewards.feet_air_time]
-# Phase-0 adjustment: weight 1.5→1.0, threshold 0.5→0.25.
-# Rationale: threshold=0.5s on flat ground can incentivize "suspend legs as long as possible then land",
-# leading to 2-leg walking or hopping. Lowering to 0.25s encourages quick, light footsteps instead.
-# Weight reduced 1.5→1.0 to match lower threshold magnitude.
-# Combined with air_time_variance_penalty, symmetric trot is still strongly encouraged.
-# Phase-0 调整：0.5s 阈値在平地上会鼓励“脱脚尽量长再落地”，导致两脚走路刷分。
-# 降至 0.25s 鼓励轻快远跟式迷路走路；配合 air_time_variance_penalty 保证对称步态
-weight = 1.0
+# Adjusted: weight 1.0→0.5, threshold 0.25→0.18.
+# Problem: at slow speeds (0–0.5 m/s) natural air time is <0.25s, so the
+# reward was consistently NEGATIVE (≈0.25/step), acting as a net penalty.
+# This also created an exploit: one leg stays airborne indefinitely to avoid
+# the "air_time < threshold on landing" penalty — causing the RR leg circling.
+# Lower threshold so slow-speed steps earn positive reward.
+# Lower weight to reduce exploit incentive; air_time_variance_penalty handles symmetry.
+# 修复：0.25s门槛对慢速过高，导致奖励持续为负。
+# 同时封山了「腿永远悬空不落地」的exploit（右后腿画圈问题根因）。
+weight = 0.5
 [rewards.feet_air_time.params]
 command_name = "base_velocity"
-threshold = 0.25
+threshold = 0.18
 
 [rewards.feet_slide]
 # Penalize foot sliding (velocity when foot is in contact).
@@ -380,11 +382,14 @@ weight = -1e-3
 weight = -0.5
 
 [rewards.air_time_variance_penalty]
-# NEW Round-4: Penalize variance in per-foot air time — enforces gait symmetry.
-# 新增：惩罚各脚滞空时间方差，促进对称步态节律（trot 等对称步法更节能）。
-# Phase-0 increase: -0.1→-0.3 (gait symmetry is the Phase-0 primary metric).
-# Phase-0 加强：步态对称性是本阶段主要训练目标
-weight = -0.3
+# Increased -0.3→-0.8: primary fix for RR-leg circling (asymmetric air time).
+# With feet_air_time weight reduced, variance penalty must be the main enforcer
+# of 4-leg symmetry. -0.8 is strong enough to prevent any single leg staying
+# airborne while others contact — directly blocks the circling exploit.
+# 加强 -0.3→-0.8：直接修复右后腿画圈问题。
+# feet_air_time已降权，需要方差惩罚成为四踢对称的主要执行者。
+# -0.8足以阻断「单腿不落地」的exploit。
+weight = -0.8
 
 [rewards.pivot_turning]
 # NEW Round-4: Penalize pivoting on spot (low linear vel + high yaw vel with feet on ground).
@@ -410,8 +415,14 @@ ang_vel_threshold = 0.5
 # Promote to next stage when mean_tracking >= promote_threshold for
 # promote_count consecutive episode-batch checks.
 # 连续 promote_count 次检查均值 >= promote_threshold 时升级
-promote_threshold = 2.0
-promote_count = 5
+#
+# FIX: weight was reduced 3.0→2.5 but threshold was not adjusted.
+# Old: 2.0/3.0=67% accuracy needed. New: 2.0/2.5=80% accuracy (too strict).
+# Corrected: 1.6/2.5=64% accuracy (equivalent to original intent).
+# promote_count lowered 5→3: curve hovers near threshold, fewer consecutive checks.
+# 修复：weight从3.0降到2.5但阈值未同步调整。原意67%追踪精度，现实成了80%，门槛实质变严。
+promote_threshold = 1.6
+promote_count = 3
 
 # Demote to previous stage when mean_tracking < demote_threshold for
 # demote_count consecutive checks.
