@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Checkpoints / model outputs
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+saved_models/
+runs/
+
+# Logs
+*.log
+logs/
+tensorboard/
+
+# Temp / IDE
+.DS_Store
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+
+# Platform temp files
+.tmp_*.json
+
+# Secrets / env
+.env
+*.key
