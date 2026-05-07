@@ -128,6 +128,7 @@ class VelocityCurriculum:
         self._last_mean_tracking_ratio = 0.0
         self._tracking_key_resolved = None
         self._tracking_key_warning_logged = False
+        self._debug_check_count = 0
         logger.info(
             f"[VelocityCurriculum] Initialized: {len(self.STAGES)} stages, "
             f"tracking_weight={self._tracking_reward_weight}, "
@@ -250,14 +251,23 @@ class VelocityCurriculum:
         reset_happened=True 时调用方需清零 cur_reward_sum / cur_episode_length，
         避免 env.reset 后旧累计值污染 rewbuffer 统计。
         """
+        self._debug_check_count += 1
         mean_reward, mean_ratio = self._mean_tracking_reward(ep_infos)
         if mean_reward is None or mean_ratio is None:
+            if self._debug_check_count <= 10 or self._debug_check_count % 20 == 0:
+                sample_keys = list(ep_infos[0].keys())[:40] if ep_infos else []
+                self.logger.warning(
+                    "[VelocityCurriculumDebug] no tracking metric available; "
+                    f"check={self._debug_check_count}, ep_infos={len(ep_infos)}, "
+                    f"resolved_key={self._tracking_key_resolved}, sample_keys={sample_keys}"
+                )
             return obs, critic_obs, False
 
         self._last_mean_tracking_reward = mean_reward
         self._last_mean_tracking_ratio = mean_ratio
 
         stage_changed = False
+        old_stage = self._stage_idx
 
         if mean_ratio >= self.promote_threshold:
             self._promote_streak += 1
@@ -265,7 +275,7 @@ class VelocityCurriculum:
             if self._promote_streak >= self.promote_count and self._stage_idx < len(self.STAGES) - 1:
                 self._stage_idx += 1
                 self._promote_streak = 0
-                self.logger.info(
+                self.logger.warning(
                     f"[VelocityCurriculum] PROMOTE ↑ stage {self._stage_idx} "
                     f"(tracking_ratio={mean_ratio:.3f} >= {self.promote_threshold:.3f}, "
                     f"tracking_reward={mean_reward:.3f}, "
@@ -278,7 +288,7 @@ class VelocityCurriculum:
             if self._demote_streak >= self.demote_count and self._stage_idx > 0:
                 self._stage_idx -= 1
                 self._demote_streak = 0
-                self.logger.info(
+                self.logger.warning(
                     f"[VelocityCurriculum] DEMOTE ↓ stage {self._stage_idx} "
                     f"(tracking_ratio={mean_ratio:.3f} < {self.demote_threshold:.3f}, "
                     f"tracking_reward={mean_reward:.3f}, "
@@ -290,6 +300,20 @@ class VelocityCurriculum:
             # 中性区间：缓慢衰减两个计数器，避免振荡。
             self._promote_streak = max(0, self._promote_streak - 1)
             self._demote_streak = max(0, self._demote_streak - 1)
+
+        if self._debug_check_count <= 10 or self._debug_check_count % 20 == 0 or stage_changed:
+            current_cfg = self.STAGES[self._stage_idx]
+            self.logger.warning(
+                "[VelocityCurriculumDebug] "
+                f"check={self._debug_check_count}, ep_infos={len(ep_infos)}, "
+                f"key={self._tracking_key_resolved}, reward={mean_reward:.4f}, "
+                f"ratio={mean_ratio:.4f}, stage={old_stage}->{self._stage_idx}, "
+                f"promote={self._promote_streak}/{self.promote_count} "
+                f"@{self.promote_threshold:.3f}, "
+                f"demote={self._demote_streak}/{self.demote_count} "
+                f"@{self.demote_threshold:.3f}, "
+                f"ranges={current_cfg}"
+            )
 
         if stage_changed:
             return self._apply_stage(usr_conf, env, obs, critic_obs)
@@ -560,8 +584,29 @@ def report_monitor_data(ep_infos, reward_keys, agent, monitor, episode, storage_
 
     if ep_infos:
         metrics = _collect_episode_metrics(ep_infos, reward_keys, agent.device)
-        monitor_data.update(metrics)
+        # Do not let episode-level missing keys overwrite workflow-level metrics.
+        # monitor_builder exposes non-episode metrics such as vel_curriculum_* and
+        # obs_*; _collect_episode_metrics returns 0 for keys absent from ep_info.
+        # If blindly updated, those valid workflow/storage values become flat 0
+        # on the dashboard.
+        # 不允许 episode 聚合结果覆盖 workflow/storage 级指标。对于 ep_info 中不存在的
+        # vel_curriculum_* / obs_*，_collect_episode_metrics 会返回 0；盲目 update
+        # 会把真实上报值覆盖成 0。
+        for key, value in metrics.items():
+            if key not in monitor_data:
+                monitor_data[key] = value
         monitor_data["episode_reward"] = sum(monitor_data.get(key, 0) for key in reward_keys)
+
+    logger = getattr(agent, "logger", None)
+    if logger is not None:
+        logger.warning(
+            "[MonitorDebug] reporting curriculum metrics: "
+            f"episode={episode}, stage={monitor_data.get('vel_curriculum_stage')}, "
+            f"tracking_ratio={monitor_data.get('vel_curriculum_tracking_ratio')}, "
+            f"tracking_reward={monitor_data.get('vel_curriculum_tracking_reward')}, "
+            f"has_obs_lin_vel_x_error={'obs_lin_vel_x_error' in monitor_data}, "
+            f"has_obs_base_height={'obs_base_height' in monitor_data}"
+        )
 
     monitor.put_data({os.getpid(): monitor_data})
 
