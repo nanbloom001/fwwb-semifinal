@@ -157,32 +157,66 @@ Current Standard terrain config:
 - `terrain.mode = "standard"`.
 - `num_rows = 10`.
 - `num_cols = 20`.
-- `difficulty_range = [0.0, 1.0]`.
+- `difficulty_range = [0.0, 0.6]`.
 - `terrain.curriculum = true`.
-- `max_init_terrain_level = 0`.
-- Terrain proportions currently favor locomotion stability:
-  - `pyramid_slope = 0.35`
-  - `pyramid_slope_inv = 0.35`
-  - `pyramid_stairs = 0.15`
-  - `pyramid_stairs_inv = 0.15`
+- `max_init_terrain_level = 1`.
+- Terrain proportions currently favor stair acquisition while preserving some slope gait:
+  - `pyramid_slope = 0.20`
+  - `pyramid_slope_inv = 0.20`
+  - `pyramid_stairs = 0.30`
+  - `pyramid_stairs_inv = 0.30`
   - `maze = 0.0`
 - Domain randomization is enabled.
 - Friction randomization is enabled with `[0.3, 1.5]`.
 - External pushes are currently disabled.
 - Observation noise is enabled.
 - `num_envs = 4096`, which is inside the documented valid range `[1, 4096]`.
+- Model checkpoints are saved every `200` training episodes via `model_save_interval`.
 
 Velocity curriculum is managed in Python by `VelocityCurriculum` in `train_workflow.py`.
 It is separate from terrain curriculum.
+It first tries episode-level `reward_track_lin_vel_xy` metrics.  If no episode
+ends during the current PPO rollout, it falls back to rollout-level tracking
+computed from critic observations:
+
+- `critic_obs[..., 0:2]`: actual body-frame XY velocity.
+- `critic_obs[..., 9:11]`: commanded XY velocity.
+- `rollout_track_lin_vel_xy_ratio = mean(exp(-||actual_xy - command_xy||^2 / std^2))`.
+
+This fallback is intentional because long stable episodes can leave
+`infos["episode"]` empty for many PPO updates.
 
 Current velocity stages:
 
-- Stage 0: `lin_vel_x [0.0, 0.5]`, `lin_vel_y [-0.3, 0.3]`, `ang_vel_yaw [-1.0, 1.0]`.
-- Stage 1: `lin_vel_x [0.0, 1.0]`, `lin_vel_y [-0.5, 0.5]`, `ang_vel_yaw [-1.5, 1.5]`.
-- Stage 2: `lin_vel_x [0.0, 1.5]`, `lin_vel_y [-0.8, 0.8]`, `ang_vel_yaw [-1.5, 1.5]`.
-- Stage 3: `lin_vel_x [-0.5, 2.0]`, `lin_vel_y [-1.0, 1.0]`, `ang_vel_yaw [-1.5, 1.5]`.
+- Stage 0: `lin_vel_x [0.0, 0.5]`, `lin_vel_y [-0.2, 0.2]`, `ang_vel_yaw [-0.8, 0.8]`.
+- Stage 1: `lin_vel_x [0.0, 0.8]`, `lin_vel_y [-0.3, 0.3]`, `ang_vel_yaw [-1.0, 1.0]`.
+- Stage 2: `lin_vel_x [0.0, 1.2]`, `lin_vel_y [-0.5, 0.5]`, `ang_vel_yaw [-1.2, 1.2]`.
 
 Stage 0 must exactly match `[commands.ranges]`, or startup raises a `ValueError`.
+The current promotion rules are:
+
+- `promote_threshold = 0.62`
+- `promote_count = 3`
+- `min_checks_per_stage = 40`
+- `demote_threshold = 0.38`
+- `demote_count = 2`
+
+The maximum commanded forward speed is intentionally capped at `1.2 m/s`
+because higher velocity ranges were observed to hurt posture stability and
+energy efficiency more than they helped Standard-mode scoring.
+
+Recent stability-related reward settings are intentionally kept close to the
+pre-stair-specialization values:
+
+- `ang_vel_xy = -0.35`
+- `action_rate = -0.02`
+- `action_smoothness = -0.01`
+- `dof_vel = -5e-4`
+
+Do not assume stair climbing requires globally relaxed posture constraints.
+The preferred direction is to preserve dynamic stability and add better
+foot-clearance signals when needed, rather than letting the base pitch/roll
+freely to solve stairs.
 
 ## Development Guidance
 
