@@ -38,6 +38,8 @@ tensorboard/
 *.key
 tencent-arena-auth.json
 # Codex RPC runtime files
+agent_diy/codex_rpc_bridge_runtime/
+agent_diy/codex_rpc_bridge/__pycache__/
 codex_rpc_bridge_runtime/
 .codex_rpc/
 .codex_rpc/token
