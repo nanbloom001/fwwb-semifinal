@@ -36,3 +36,12 @@ tensorboard/
 # Secrets / env
 .env
 *.key
+tencent-arena-auth.json
+# Codex RPC runtime files
+codex_rpc_bridge_runtime/
+.codex_rpc/
+.codex_rpc/token
+.codex_rpc/admin_token
+.codex_rpc/codex_file_rpc.log
+.codex_rpc/backups/
+.codex_rpc/__pycache__/
