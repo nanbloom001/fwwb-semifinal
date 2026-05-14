@@ -59,6 +59,20 @@ standard 地形模式比赛评分维度如下：
 
 说明：当前 policy 与 critic 观测处理器都加入了运行时维度断言，用于尽早暴露 height scan 缺失或观测布局漂移问题。
 
+### Track 观测补充
+
+- `height_scanner` 已包含在默认 301 维 policy obs 的 `[45:301]`，是 16x16
+  前方高度扫描；默认 observation term 已做 `scale=2.5` 和 `clip=[-5, 5]`。
+  自定义 reward/obs 中读取原始几何高度差时使用：
+  `sensor.data.pos_w[:, 2:3] - sensor.data.ray_hits_w[..., 2]`。
+- `nav_scanner` 默认不在 301 维 obs 中。它是约 `13x11=143` rays 的前瞻
+  遮挡扫描，覆盖前方约 `2.5m x 2.0m`，适合迷宫转向/堵路判断。推荐先从
+  `env.scene.sensors["nav_scanner"]` 提取左/中/右 clearance 或 wall score 等
+  紧凑特征，再决定是否扩展 actor 输入维度。
+- `goal_position_in_robot_frame()` 当前在多个分支中被调用，但本地和开发容器
+  搜索没有找到实际定义。启用 `track_goal` 前应显式实现该 helper；推荐 4 维
+  语义为 robot-frame 相对目标 XY、目标距离、目标/出口 yaw error。
+
 ---
 
 ## 当前训练配置

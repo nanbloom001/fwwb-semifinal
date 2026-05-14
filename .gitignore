@@ -39,6 +39,8 @@ node_modules/
 
 # Secrets / env
 .env
+.env.local
+.env.*.local
 *.key
 tencent-arena-auth.json
 # Codex RPC runtime files

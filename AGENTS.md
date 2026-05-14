@@ -138,6 +138,24 @@ Track extras:
 - `env.scene.sensors["nav_scanner"]`: wider forward occlusion scan for navigation.
 - These are not included in default 301-dim observation. If appending them, update policy obs processing, critic obs processing, config dimensions, and model inputs together.
 
+Track observation implementation notes:
+
+- `goal_position_in_robot_frame()` is referenced by several branches and by the
+  current `agent_ppo` `track_goal` path, but container/source searches found no
+  actual method definition. Do not rely on this helper unless you first implement
+  it locally. Expected semantics for a 4-dim goal feature are robot-frame
+  relative goal XY, goal distance, and wrapped yaw error to the goal/exit.
+- `height_scanner` is already included in the default policy observation as
+  `obs[:, 45:301]`. It is a 16x16 scan from
+  `env.scene.sensors["height_scanner"]`, scaled by 2.5 and clipped to `[-5, 5]`
+  by the default observation term. For raw geometry in custom code, use:
+  `scan = sensor.data.pos_w[:, 2:3] - sensor.data.ray_hits_w[..., 2]`.
+- `nav_scanner` is not included in the default 301-dim observation. It is a
+  forward occlusion scan from `env.scene.sensors["nav_scanner"]`, configured as
+  about 13x11 = 143 rays over 2.5m forward by 2.0m lateral. Access raw hits with
+  `nav.data.ray_hits_w` and `nav.data.pos_w`; prefer compact left/center/right
+  clearance or wall features before increasing actor input by the full 143 dims.
+
 ## Current Training State
 
 Active stage is `Config.CURRENT = LocomotionConfig` in `agent_ppo/conf/conf.py`.
@@ -264,6 +282,11 @@ AI agent operating rule:
   `CODEX_RPC_TOKEN` and `CODEX_RPC_ADMIN_TOKEN` supplied by the user or local
   environment. Never write those token values into files, commits, logs, or
   final answers.
+- When checking `${CODEX_RPC_BASE}/api/health` through a browser, open it in a
+  new tab rather than replacing the active IDE tab. After the first successful
+  browser health check in a work session, do not keep opening health pages;
+  use the RPC/fetch path directly for subsequent health, read, write, and exec
+  calls.
 - If RPC is not reachable, ask the user to start it inside the container with
   `bash agent_diy/codex_rpc_bridge/start_rpc.sh`.
 - If the IDE needs to stay open, use the local keepalive manager:
