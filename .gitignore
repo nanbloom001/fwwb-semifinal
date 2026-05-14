@@ -32,6 +32,9 @@ tensorboard/
 
 # Platform temp files
 .tmp_*.json
+*.har
+tmp_training_*.png
+node_modules/
 
 # Secrets / env
 .env
@@ -41,6 +44,8 @@ tencent-arena-auth.json
 agent_diy/codex_rpc_bridge_runtime/
 agent_diy/codex_rpc_bridge/__pycache__/
 codex_rpc_bridge_runtime/
+.arena_frontend_monitor/
+arena_frontend_monitor_runtime/
 .codex_rpc/
 .codex_rpc/token
 .codex_rpc/admin_token
