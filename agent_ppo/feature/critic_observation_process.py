@@ -19,7 +19,10 @@ critic 观测需保持与 policy 同步的任务信息约定。
 import torch
 
 from agent_ppo.conf.conf import Config
-from agent_ppo.feature.height_scan_features import compact_maze_scan_features
+from agent_ppo.feature.track_observation_features import (
+    compact_scan_nav_features,
+    compact_track_goal_nav_features,
+)
 from tools.base_env.observation_process import ObservationProcess
 
 
@@ -49,21 +52,11 @@ class CriticObservationProcess(ObservationProcess):
         mode = getattr(stage, "extra_obs_mode", "none")
         if mode == "none":
             return None
-        if mode == "track_goal":
-            return self.goal_position_in_robot_frame()
+        if mode == "track_goal_nav":
+            return compact_track_goal_nav_features(self.env, obs[:, -256:])
         if mode == "maze_scan":
             return self._maze_scan_features(obs[:, -256:])
         raise ValueError(f"Unsupported critic extra_obs_mode: {mode}")
 
     def _maze_scan_features(self, scan_flat):
-        grid = scan_flat.view(scan_flat.shape[0], 16, 16)
-        # Critic observations use the same scaled height-scan convention as
-        # policy observations, so use matching scaled geometry thresholds.
-        return compact_maze_scan_features(
-            grid,
-            wall_height_threshold=0.18 * 2.5,
-            body_clearance_threshold=0.30 * 2.5,
-            wall_jump_threshold=0.16 * 2.5,
-            stair_min_delta=0.03 * 2.5,
-            stair_max_delta=0.24 * 2.5,
-        )
+        return compact_scan_nav_features(scan_flat)

@@ -41,7 +41,7 @@ class StageConfig:
     num_proprio_obs = 45  # proprioceptive obs dim / 本体感知观测维度
     num_scan = 256  # 16x16 height-scan dim / 16x16 高度扫描维度
     num_extra_obs = 0  # optional task-specific features appended to policy obs
-    extra_obs_mode = "none"  # none | maze_scan | track_goal
+    extra_obs_mode = "none"  # none | maze_scan | track_goal_nav
     num_critic_observations = 316  # proprio(45) + scan(256) + privileged(15)
 
     # --- Model architecture
@@ -159,15 +159,15 @@ class StandardMazeConfig(StageConfig):
 
 class TrackNavConfig(StageConfig):
     """
-    Stage: nav — Track navigation with compact goal observations.
-    阶段：nav —— Track 导航训练，拼接紧凑目标特征。
+    Stage: nav — Track navigation with compact goal and local obstacle observations.
+    阶段：nav —— Track 导航训练，拼接紧凑目标与局部障碍特征。
     """
 
     name = "nav"
     task_type = "track"
-    num_extra_obs = 4
-    extra_obs_mode = "track_goal"
-    num_critic_observations = 320
+    num_extra_obs = 10
+    extra_obs_mode = "track_goal_nav"
+    num_critic_observations = 326
     lr = 1e-4
     num_learning_epochs = 3
     num_mini_batches = 4
@@ -225,6 +225,7 @@ class Config:
         from common_python.config.config_control import CONFIG
         from kaiwudrl.common.utils.kaiwudrl_define import KaiwuDRLDefine
 
+        requested_stage_name = os.environ.get("FWWB_STAGE", "").strip()
         stage = Config.current_stage()
         task_type = stage.task_type
 
@@ -253,6 +254,13 @@ class Config:
             error_msg = f"usr_conf is None, please check {usr_conf_file}"
             logger.error(error_msg)
             raise Exception(error_msg)
+
+        if is_eval and not requested_stage_name and usr_conf.get("terrain", {}).get("mode") == "track":
+            stage = TrackNavConfig
+            task_type = stage.task_type
+
+        usr_conf.setdefault("env", {})
+        usr_conf["env"]["num_goal_obs"] = getattr(stage, "num_extra_obs", 0)
 
         logger.info(f"Stage: {stage.name}, task_type: {task_type}, model: {stage.model_class}")
 

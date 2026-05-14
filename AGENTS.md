@@ -282,11 +282,12 @@ AI agent operating rule:
   `CODEX_RPC_TOKEN` and `CODEX_RPC_ADMIN_TOKEN` supplied by the user or local
   environment. Never write those token values into files, commits, logs, or
   final answers.
-- When checking `${CODEX_RPC_BASE}/api/health` through a browser, open it in a
-  new tab rather than replacing the active IDE tab. After the first successful
-  browser health check in a work session, do not keep opening health pages;
-  use the RPC/fetch path directly for subsequent health, read, write, and exec
-  calls.
+- Strictly distinguish first-time RPC setup from daily use. Only open
+  `${CODEX_RPC_BASE}/api/health` in a new browser tab when `IDE_ID`, Tencent
+  Arena login state, or the RPC proxy address has not yet been confirmed. If an
+  IDE tab such as `/p/common/competition/ide/...` is already open and RPC has
+  been verified by script or fetch, do not open more health tabs; use the
+  existing IDE/session RPC/fetch path for health, read, write, and exec calls.
 - If RPC is not reachable, ask the user to start it inside the container with
   `bash agent_diy/codex_rpc_bridge/start_rpc.sh`.
 - If the IDE needs to stay open, use the local keepalive manager:

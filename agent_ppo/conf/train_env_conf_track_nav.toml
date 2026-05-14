@@ -5,8 +5,8 @@
 
 [env]
 num_envs = 2048
-episode_length_s = 35
-num_goal_obs = 4
+episode_length_s = 60
+num_goal_obs = 10
 
 [env_conf]
 seed = 0
@@ -15,9 +15,9 @@ seed = 0
 mode = "track"
 num_rows = 10
 num_cols = 10
-difficulty_range = [0.0, 0.8]
+difficulty_range = [0.0, 0.4]
 curriculum = true
-max_init_terrain_level = 1
+max_init_terrain_level = 0
 
 [terrain.track]
 track_length = 5
@@ -27,13 +27,13 @@ num_parallel_tracks = 8
 [domain_rand]
 enable_domain_rand = true
 randomize_friction = true
-friction_range = [0.4, 1.4]
+friction_range = [0.6, 1.3]
 push_robots = false
 push_interval_s = 15
 max_push_vel_xy = 0.0
 
 [noise]
-add_noise = true
+add_noise = false
 
 [init_state]
 pos = [0.0, 0.0, 0.35]
@@ -42,23 +42,23 @@ pos = [0.0, 0.0, 0.35]
 resampling_time = [6.0, 8.0]
 
 [commands.limit]
-lin_vel_x = [0.0, 1.0]
-lin_vel_y = [-0.5, 0.5]
-ang_vel_z = [-1.5, 1.5]
+lin_vel_x = [0.0, 0.8]
+lin_vel_y = [-0.3, 0.3]
+ang_vel_z = [-1.0, 1.0]
 
 [commands.ranges]
-lin_vel_x = [0.0, 0.45]
-lin_vel_y = [-0.15, 0.15]
-ang_vel_yaw = [-0.8, 0.8]
+lin_vel_x = [0.0, 0.35]
+lin_vel_y = [-0.10, 0.10]
+ang_vel_yaw = [-0.5, 0.5]
 
 [rewards.track_lin_vel_xy]
-weight = 0.8
+weight = 0.5
 [rewards.track_lin_vel_xy.params]
 std = 0.25
 command_name = "base_velocity"
 
 [rewards.track_ang_vel_z]
-weight = 0.5
+weight = 0.3
 [rewards.track_ang_vel_z.params]
 std = 0.25
 command_name = "base_velocity"
@@ -69,16 +69,27 @@ weight = 10.0
 threshold = 0.6
 
 [rewards.goal_progress]
-weight = 1.5
+weight = 3.0
 
 [rewards.heading_to_goal]
-weight = 0.4
+weight = 0.45
+[rewards.heading_to_goal.params]
+std = 0.75
+
+[rewards.obstacle_evasion]
+weight = -0.5
+[rewards.obstacle_evasion.params]
+command_name = "base_velocity"
+wall_score_threshold = 0.08
+wall_vs_stair_margin = 1.6
+height_scan_weight = 1.0
+nav_scan_weight = 0.0
 
 [rewards.navigation_time]
-weight = -0.02
+weight = -0.01
 
 [rewards.navigation_termination]
-weight = -3.0
+weight = -4.0
 
 [rewards.lin_vel_z]
 weight = -0.8
@@ -137,7 +148,7 @@ weight = -0.1
 weight = -0.06
 
 [rewards.termination]
-weight = -3.0
+weight = -4.0
 
 [rewards.action_smoothness]
 weight = -0.01

@@ -43,15 +43,6 @@ class VelocityCurriculum:
     所有阈值和阶段定义均从 TOML [velocity_curriculum] 节读取。
     """
 
-    # Default stages used only when usr_conf has no [velocity_curriculum] section.
-    # 仅当 TOML 缺少 [velocity_curriculum] 节时作为退路默认值。
-    _DEFAULT_STAGES = [
-        {"lin_vel_x": [0.0,  0.5], "lin_vel_y": [-0.3,  0.3], "ang_vel_yaw": [-1.0,  1.0]},
-        {"lin_vel_x": [0.0,  1.0], "lin_vel_y": [-0.5,  0.5], "ang_vel_yaw": [-1.5,  1.5]},
-        {"lin_vel_x": [0.0,  1.5], "lin_vel_y": [-0.8,  0.8], "ang_vel_yaw": [-1.5,  1.5]},
-        {"lin_vel_x": [-0.5, 2.0], "lin_vel_y": [-1.0,  1.0], "ang_vel_yaw": [-1.5,  1.5]},
-    ]
-
     # ep_info key used as performance signal.  Different framework versions may
     # expose reward terms with slightly different names, so lookup is tolerant.
     # 用于速度课程的 episode 指标。不同框架版本可能使用略有差异的 reward key，
@@ -67,11 +58,27 @@ class VelocityCurriculum:
     def __init__(self, logger, usr_conf: dict):
         """Build curriculum from usr_conf["velocity_curriculum"] (TOML section).
 
-        Falls back to _DEFAULT_STAGES / hard-coded thresholds if the section is absent.
-        从 TOML 的 [velocity_curriculum] 节加载配置；节缺失时回退到默认值。
+        Disabled when the TOML section is absent.
+        从 TOML 的 [velocity_curriculum] 节加载配置；节缺失时禁用。
         """
         self.logger = logger
-        vc_conf = usr_conf.get("velocity_curriculum", {})
+        vc_conf = usr_conf.get("velocity_curriculum")
+        self.enabled = bool(vc_conf)
+        self._stage_idx = 0
+        self._promote_streak = 0
+        self._demote_streak = 0
+        self._last_mean_tracking_reward = 0.0
+        self._last_mean_tracking_ratio = 0.0
+        self._tracking_key_resolved = None
+        self._tracking_key_warning_logged = False
+        self._debug_check_count = 0
+        self._stage_check_count = 0
+        self.STAGES = []
+
+        if not self.enabled:
+            logger.info("[VelocityCurriculum] Disabled: no [velocity_curriculum] section in usr_conf.")
+            return
+
         tracking_reward_conf = usr_conf.get("rewards", {}).get("track_lin_vel_xy", {})
 
         self._tracking_reward_weight = abs(float(tracking_reward_conf.get("weight", 1.0)))
@@ -94,21 +101,17 @@ class VelocityCurriculum:
         self.min_checks_per_stage: int = int(vc_conf.get("min_checks_per_stage", 0))
 
         raw_stages = vc_conf.get("stages", None)
-        if raw_stages:
-            self.STAGES = [
-                {
-                    "lin_vel_x":   list(s["lin_vel_x"]),
-                    "lin_vel_y":   list(s["lin_vel_y"]),
-                    "ang_vel_yaw": list(s["ang_vel_yaw"]),
-                }
-                for s in raw_stages
-            ]
-        else:
-            self.STAGES = self._DEFAULT_STAGES
-            logger.info(
-                "[VelocityCurriculum] No [velocity_curriculum.stages] found in usr_conf; "
-                "falling back to hard-coded default stages."
-            )
+        if not raw_stages:
+            raise ValueError("[VelocityCurriculum] enabled but no [[velocity_curriculum.stages]] found.")
+
+        self.STAGES = [
+            {
+                "lin_vel_x":   list(s["lin_vel_x"]),
+                "lin_vel_y":   list(s["lin_vel_y"]),
+                "ang_vel_yaw": list(s["ang_vel_yaw"]),
+            }
+            for s in raw_stages
+        ]
 
         command_ranges = usr_conf.get("commands", {}).get("ranges", {})
         stage0 = self.STAGES[0]
@@ -122,15 +125,6 @@ class VelocityCurriculum:
                 f"Got commands.ranges={command_ranges}, stage0={stage0}."
             )
 
-        self._stage_idx = 0
-        self._promote_streak = 0  # consecutive checks above promote_threshold
-        self._demote_streak = 0   # consecutive checks below demote_threshold
-        self._last_mean_tracking_reward = 0.0
-        self._last_mean_tracking_ratio = 0.0
-        self._tracking_key_resolved = None
-        self._tracking_key_warning_logged = False
-        self._debug_check_count = 0
-        self._stage_check_count = 0
         logger.info(
             f"[VelocityCurriculum] Initialized: {len(self.STAGES)} stages, "
             f"tracking_weight={self._tracking_reward_weight}, "
@@ -172,6 +166,8 @@ class VelocityCurriculum:
         return self._last_mean_tracking_ratio
 
     def refresh_tracking_reward_weight(self, usr_conf):
+        if not self.enabled:
+            return
         tracking_reward_conf = usr_conf.get("rewards", {}).get("track_lin_vel_xy", {})
         new_weight = abs(float(tracking_reward_conf.get("weight", self._tracking_reward_weight)))
         if new_weight <= 1e-6:
@@ -272,6 +268,9 @@ class VelocityCurriculum:
         reset_happened=True 时调用方需清零 cur_reward_sum / cur_episode_length，
         避免 env.reset 后旧累计值污染 rewbuffer 统计。
         """
+        if not self.enabled:
+            return obs, critic_obs, False
+
         self._debug_check_count += 1
         rollout_stats = rollout_stats or {}
         mean_reward, mean_ratio = self._mean_tracking_reward(ep_infos)
@@ -938,6 +937,9 @@ def _update_episode_statistics(
     rewbuffer,
     lenbuffer,
     ep_infos,
+    env=None,
+    logger=None,
+    usr_conf=None,
 ):
     """Update episode statistics and buffers.
 
@@ -950,11 +952,89 @@ def _update_episode_statistics(
     cur_episode_length += 1
 
     new_ids = (dones > 0).nonzero(as_tuple=False)
+    _log_track_episode_diagnostics(new_ids, infos, cur_reward_sum, cur_episode_length, env, logger, usr_conf)
     rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
     lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
 
     cur_reward_sum[new_ids] = 0
     cur_episode_length[new_ids] = 0
+
+
+def _log_track_episode_diagnostics(new_ids, infos, cur_reward_sum, cur_episode_length, env, logger, usr_conf):
+    if logger is None or new_ids.numel() == 0:
+        return
+    if not isinstance(usr_conf, dict) or usr_conf.get("terrain", {}).get("mode") != "track":
+        return
+
+    isaac_env = _get_isaac_env(env)
+    if isaac_env is None or not hasattr(isaac_env, "goal_positions") or isaac_env.goal_positions is None:
+        return
+
+    asset = _get_robot_asset_from_env(isaac_env)
+    if asset is None:
+        return
+
+    env_ids = new_ids[:, 0].detach().to(device=cur_reward_sum.device, dtype=torch.long)
+    root_xy = asset.data.root_pos_w[:, :2].detach().to(cur_reward_sum.device)
+    goal_xy = isaac_env.goal_positions[:, :2].detach().to(cur_reward_sum.device)
+    final_goal_dist = torch.linalg.norm(goal_xy[env_ids] - root_xy[env_ids], dim=1)
+
+    episode_info = infos.get("episode") if isinstance(infos, dict) else {}
+    progress = _episode_metric_for_ids(episode_info, "reward_goal_progress", env_ids, cur_reward_sum.device)
+    reach_goal = _episode_metric_for_ids(episode_info, "reward_reach_goal", env_ids, cur_reward_sum.device)
+    reason_text = _done_reason_text(infos, env_ids, cur_reward_sum.device)
+
+    logger.info(
+        "[TrackDiag] "
+        f"done_envs={int(env_ids.numel())}, "
+        f"final_goal_dist_mean={float(final_goal_dist.mean().item()):.3f}, "
+        f"final_goal_dist_min={float(final_goal_dist.min().item()):.3f}, "
+        f"reward_goal_progress_mean={_mean_or_zero(progress):.5f}, "
+        f"reward_reach_goal_mean={_mean_or_zero(reach_goal):.5f}, "
+        f"done_reason={reason_text}"
+    )
+
+
+def _episode_metric_for_ids(episode_info, key, env_ids, device):
+    if not isinstance(episode_info, dict) or key not in episode_info:
+        return None
+    value = episode_info[key]
+    if not isinstance(value, torch.Tensor):
+        value = torch.tensor(value, device=device)
+    value = value.detach().to(device=device, dtype=torch.float32).reshape(-1)
+    if value.numel() == 1:
+        return value
+    if value.numel() == env_ids.numel():
+        return value
+    return value[env_ids]
+
+
+def _mean_or_zero(value):
+    if value is None:
+        return 0.0
+    return float(value.mean().item())
+
+
+def _done_reason_text(infos, env_ids, device):
+    if not isinstance(infos, dict):
+        return "unknown"
+    parts = []
+    for key in ("time_outs", "terminated", "truncated"):
+        value = infos.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, torch.Tensor):
+            value = torch.tensor(value, device=device)
+        value = value.detach().to(device=device).reshape(-1)
+        if value.numel() == 1:
+            count = int((value > 0).sum().item())
+        elif value.numel() == env_ids.numel():
+            count = int((value > 0).sum().item())
+        else:
+            count = int((value[env_ids] > 0).sum().item())
+        if count > 0:
+            parts.append(f"{key}:{count}")
+    return ",".join(parts) or "unknown"
 
 
 def _compute_advantages_and_returns(storage, agent, critic_obs, logger):
@@ -1210,6 +1290,32 @@ def _sample_physics_stats(env, logger=None, critic_obs=None):
         return _sample_physics_stats_from_critic_obs(critic_obs)
 
 
+def _sample_track_goal_stats(env, usr_conf, logger=None):
+    if not isinstance(usr_conf, dict) or usr_conf.get("terrain", {}).get("mode") != "track":
+        return {}
+    try:
+        isaac_env = _get_isaac_env(env)
+        if isaac_env is None or not hasattr(isaac_env, "goal_positions") or isaac_env.goal_positions is None:
+            return {}
+        asset = _get_robot_asset_from_env(isaac_env)
+        if asset is None:
+            return {}
+        goal_dist = torch.linalg.norm(
+            isaac_env.goal_positions[:, :2].to(asset.data.root_pos_w.device) - asset.data.root_pos_w[:, :2],
+            dim=1,
+        )
+        return {
+            "track_goal_dist_mean": goal_dist.mean().item(),
+            "track_goal_dist_min": goal_dist.min().item(),
+            "track_goal_dist_p25": torch.quantile(goal_dist, 0.25).item(),
+        }
+    except Exception as exc:
+        if logger is not None and not getattr(env, "_track_goal_stats_error_logged", False):
+            env._track_goal_stats_error_logged = True
+            logger.info(f"[TrackStats] Failed to sample Track goal metrics: {exc}")
+        return {}
+
+
 def run_episodes_(
     env,
     agent,
@@ -1286,6 +1392,9 @@ def run_episodes_(
                 rewbuffer,
                 lenbuffer,
                 ep_infos,
+                env=env,
+                logger=logger,
+                usr_conf=usr_conf,
             )
 
             # Write transition to storage every step (flat PPO)
@@ -1323,5 +1432,6 @@ def run_episodes_(
     # 追加物理量快照（跨所有并行环境取均值）。
     # _sample_physics_stats 内部已有 try/except，调用总是安全的。
     storage_stats.update(_sample_physics_stats(env, logger, critic_obs=critic_obs))
+    storage_stats.update(_sample_track_goal_stats(env, usr_conf, logger))
 
     return last_obs, critic_obs, storage_stats
