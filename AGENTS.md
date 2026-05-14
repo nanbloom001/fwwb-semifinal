@@ -220,6 +220,64 @@ freely to solve stairs.
 
 ## Development Guidance
 
+### Local-To-Container Workflow
+
+Make source changes in the local repository first. Treat the Tencent Kaiwu
+development container as a runtime target, not as the primary edit source.
+
+Container persistence rule:
+
+- Only these top-level directories are expected to persist across development
+  container restarts: `agent_diy`, `agent_ppo`, `conf`, and `log`.
+- Store durable project code and operating docs under those directories first.
+- Other top-level directories may disappear after a container restart; use them
+  only for temporary experiments, scratch uploads, or disposable test outputs.
+
+Recommended flow:
+
+1. Modify and review files locally in this repository.
+2. Run local syntax/static checks where possible.
+3. Commit or otherwise record the local change set.
+4. Synchronize the final intended files to the online development container in
+   one batch through the RPC bridge.
+5. Verify the container copy by reading back hashes or running a targeted check.
+
+Default sync command:
+
+```bash
+bash agent_diy/codex_rpc_bridge/sync_repo_to_container.sh --dry-run
+CODEX_RPC_TOKEN="<normal token>" \
+CODEX_RPC_ADMIN_TOKEN="<admin token>" \
+bash agent_diy/codex_rpc_bridge/sync_repo_to_container.sh --apply --py-compile
+```
+
+AI agent operating rule:
+
+- When the user asks to sync, deploy, copy local changes to the container, or
+  verify local/container parity, prefer the safe sync script above instead of
+  editing files directly in the container.
+- Always run `--dry-run` first and inspect the file count/sample list before
+  `--apply`.
+- `--dry-run` is local-only and does not require `agent-browser`, RPC tokens, or
+  an active container.
+- `--apply` requires a logged-in Tencent Arena browser context plus
+  `CODEX_RPC_TOKEN` and `CODEX_RPC_ADMIN_TOKEN` supplied by the user or local
+  environment. Never write those token values into files, commits, logs, or
+  final answers.
+- If RPC is not reachable, ask the user to start it inside the container with
+  `bash agent_diy/codex_rpc_bridge/start_rpc.sh`.
+- If the IDE needs to stay open, use the local keepalive manager:
+  `bash agent_diy/codex_rpc_bridge/start_keepalive.sh --status` and
+  `bash agent_diy/codex_rpc_bridge/start_keepalive.sh`.
+- Full RPC bridge instructions are in
+  `agent_diy/codex_rpc_bridge/README.md`,
+  `agent_diy/codex_rpc_bridge/SETUP.md`, and
+  `agent_diy/codex_rpc_bridge/DAILY_USAGE.md`.
+
+Do not make exploratory edits directly in the container unless the user
+explicitly asks for a container-only experiment. If container testing requires a
+patch, apply the same patch locally first, then sync it to the container.
+
 Prioritize changes according to scoring:
 
 - Standard: first increase traversal reliability and distance, then improve speed, energy, and posture.
