@@ -16,6 +16,10 @@ with the policy on the task-information convention.
 critic 观测需保持与 policy 同步的任务信息约定。
 """
 
+import torch
+
+from agent_ppo.conf.conf import Config
+from agent_ppo.feature.height_scan_features import compact_maze_scan_features
 from tools.base_env.observation_process import ObservationProcess
 
 
@@ -25,13 +29,41 @@ class CriticObservationProcess(ObservationProcess):
 
     def process(self):
         obs = self.default_observation()
-        if obs.shape[-1] != self._EXPECTED_OBS_DIM:
+        stage = Config.current_stage()
+        extra_obs = self._build_extra_obs(obs, stage)
+        if extra_obs is not None:
+            if hasattr(self, "concatenate_terms"):
+                obs = self.concatenate_terms(obs, extra_obs)
+            else:
+                obs = torch.cat((obs, extra_obs), dim=-1)
+
+        expected_dim = self._EXPECTED_OBS_DIM + int(getattr(stage, "num_extra_obs", 0))
+        if obs.shape[-1] != expected_dim:
             raise ValueError(
-                f"Critic observation dim mismatch: expected {self._EXPECTED_OBS_DIM}, got {obs.shape[-1]}. "
+                f"Critic observation dim mismatch: expected {expected_dim}, got {obs.shape[-1]}. "
                 "This usually means height_scan or privileged observation layout changed unexpectedly."
             )
-        # TODO (track terrain): if the policy observation appends goal features,
-        # the critic observation must keep the same task-information convention.
-        # TODO (track 地形)：如果 policy 观测追加了 goal 特征，
-        # critic 观测也需保持同步的任务信息约定。
         return obs
+
+    def _build_extra_obs(self, obs, stage):
+        mode = getattr(stage, "extra_obs_mode", "none")
+        if mode == "none":
+            return None
+        if mode == "track_goal":
+            return self.goal_position_in_robot_frame()
+        if mode == "maze_scan":
+            return self._maze_scan_features(obs[:, -256:])
+        raise ValueError(f"Unsupported critic extra_obs_mode: {mode}")
+
+    def _maze_scan_features(self, scan_flat):
+        grid = scan_flat.view(scan_flat.shape[0], 16, 16)
+        # Critic observations use the same scaled height-scan convention as
+        # policy observations, so use matching scaled geometry thresholds.
+        return compact_maze_scan_features(
+            grid,
+            wall_height_threshold=0.18 * 2.5,
+            body_clearance_threshold=0.30 * 2.5,
+            wall_jump_threshold=0.16 * 2.5,
+            stair_min_delta=0.03 * 2.5,
+            stair_max_delta=0.24 * 2.5,
+        )

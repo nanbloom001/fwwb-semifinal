@@ -40,6 +40,8 @@ class StageConfig:
     num_actions = 12  # Go2 joint action dim / Go2 关节动作维度
     num_proprio_obs = 45  # proprioceptive obs dim / 本体感知观测维度
     num_scan = 256  # 16x16 height-scan dim / 16x16 高度扫描维度
+    num_extra_obs = 0  # optional task-specific features appended to policy obs
+    extra_obs_mode = "none"  # none | maze_scan | track_goal
     num_critic_observations = 316  # proprio(45) + scan(256) + privileged(15)
 
     # --- Model architecture
@@ -102,6 +104,77 @@ class LocomotionConfig(StageConfig):
     task_type = "standard"
 
 
+class StairsConfig(StageConfig):
+    """
+    Stage: stairs — stair-focused Standard training with constrained commands.
+    阶段：stairs —— Standard 楼梯专项训练，限制横移和转向指令。
+    """
+
+    name = "stairs"
+    task_type = "standard"
+
+
+class StairInvFineTuneConfig(StageConfig):
+    """
+    Stage: stair_inv_finetune — conservative fine-tune for inverse stairs.
+    阶段：stair_inv_finetune —— 反楼梯专项保守微调。
+    """
+
+    name = "stair_inv_finetune"
+    task_type = "standard"
+    lr = 1e-4
+    num_learning_epochs = 3
+    num_mini_batches = 4
+    num_steps_per_env = 48
+    model_save_interval = 100
+
+
+class StandardReplayConfig(StageConfig):
+    """
+    Stage: standard_replay — balanced Standard replay after stair specialists.
+    阶段：standard_replay —— 楼梯专项后的四类地形均衡回放。
+    """
+
+    name = "standard_replay"
+    task_type = "standard"
+
+
+class StandardMazeConfig(StageConfig):
+    """
+    Stage: maze — Standard-mode maze pretraining with compact obstacle features.
+    阶段：maze —— Standard 迷宫预训练，拼接紧凑障碍特征。
+    """
+
+    name = "maze"
+    task_type = "standard"
+    num_extra_obs = 6
+    extra_obs_mode = "maze_scan"
+    num_critic_observations = 322
+    lr = 1e-4
+    num_learning_epochs = 3
+    num_mini_batches = 4
+    num_steps_per_env = 48
+    model_save_interval = 100
+
+
+class TrackNavConfig(StageConfig):
+    """
+    Stage: nav — Track navigation with compact goal observations.
+    阶段：nav —— Track 导航训练，拼接紧凑目标特征。
+    """
+
+    name = "nav"
+    task_type = "track"
+    num_extra_obs = 4
+    extra_obs_mode = "track_goal"
+    num_critic_observations = 320
+    lr = 1e-4
+    num_learning_epochs = 3
+    num_mini_batches = 4
+    num_steps_per_env = 48
+    model_save_interval = 100
+
+
 class Config:
     """
     Unified config entry point.
@@ -114,9 +187,28 @@ class Config:
     ``Config.CURRENT.lr``、``Config.CURRENT.num_mini_batches`` 等读取超参数。
     """
 
-    # Switch stage by changing CURRENT
-    # 通过修改 CURRENT 切换阶段
-    CURRENT = LocomotionConfig
+    STAGES = {
+        "locomotion": LocomotionConfig,
+        "stairs": StairsConfig,
+        "stair_inv_finetune": StairInvFineTuneConfig,
+        "standard_replay": StandardReplayConfig,
+        "maze": StandardMazeConfig,
+        "nav": TrackNavConfig,
+        "track_nav": TrackNavConfig,
+    }
+
+    # Default stage. Override with FWWB_STAGE at runtime when needed.
+    # 默认阶段。需要时可通过 FWWB_STAGE 在运行时切换。
+    CURRENT = StandardMazeConfig
+
+    @staticmethod
+    def current_stage():
+        stage_name = os.environ.get("FWWB_STAGE", "").strip()
+        if not stage_name:
+            return Config.CURRENT
+        if stage_name not in Config.STAGES:
+            raise ValueError(f"Invalid FWWB_STAGE='{stage_name}'. Available stages: {sorted(Config.STAGES)}")
+        return Config.STAGES[stage_name]
 
     @staticmethod
     def load_conf(logger):
@@ -133,7 +225,7 @@ class Config:
         from common_python.config.config_control import CONFIG
         from kaiwudrl.common.utils.kaiwudrl_define import KaiwuDRLDefine
 
-        stage = Config.CURRENT
+        stage = Config.current_stage()
         task_type = stage.task_type
 
         if task_type not in _VALID_TASKS:

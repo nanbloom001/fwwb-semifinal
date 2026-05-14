@@ -32,6 +32,7 @@ tensorboard/
 
 # Platform temp files
 .tmp_*.json
+code-legged_robot_competition_26-IDE-*.zip
 
 # Secrets / env
 .env

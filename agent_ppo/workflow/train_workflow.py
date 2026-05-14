@@ -8,9 +8,9 @@ Author: Tencent AI Arena Authors
 """
 
 
-from common_python.utils.common_func import Frame
 import os
 import time
+from common_python.utils.common_func import Frame
 from typing import List, Optional, Tuple
 from agent_ppo.conf.conf import Config
 from agent_ppo.feature.definition import RolloutStorage
@@ -76,7 +76,7 @@ class VelocityCurriculum:
 
         self._tracking_reward_weight = abs(float(tracking_reward_conf.get("weight", 1.0)))
         if self._tracking_reward_weight <= 1e-6:
-            logger.warning(
+            logger.info(
                 "[VelocityCurriculum] track_lin_vel_xy weight is non-positive; "
                 "falling back to 1.0 for curriculum normalization. "
                 "Please check [rewards.track_lin_vel_xy].weight in TOML."
@@ -105,7 +105,7 @@ class VelocityCurriculum:
             ]
         else:
             self.STAGES = self._DEFAULT_STAGES
-            logger.warning(
+            logger.info(
                 "[VelocityCurriculum] No [velocity_curriculum.stages] found in usr_conf; "
                 "falling back to hard-coded default stages."
             )
@@ -153,7 +153,7 @@ class VelocityCurriculum:
             return threshold_value
 
         normalized = threshold_value / self._tracking_reward_weight
-        self.logger.warning(
+        self.logger.info(
             f"[VelocityCurriculum] {field_name}={threshold_value} detected as legacy absolute reward; "
             f"normalized to ratio {normalized:.3f} using tracking weight {self._tracking_reward_weight:.3f}."
         )
@@ -170,6 +170,24 @@ class VelocityCurriculum:
     @property
     def last_tracking_ratio(self) -> float:
         return self._last_mean_tracking_ratio
+
+    def refresh_tracking_reward_weight(self, usr_conf):
+        tracking_reward_conf = usr_conf.get("rewards", {}).get("track_lin_vel_xy", {})
+        new_weight = abs(float(tracking_reward_conf.get("weight", self._tracking_reward_weight)))
+        if new_weight <= 1e-6:
+            self.logger.info(
+                "[VelocityCurriculum] track_lin_vel_xy weight became non-positive after schedule update; "
+                "keeping previous normalization weight %.6f.",
+                self._tracking_reward_weight,
+            )
+            return
+        if abs(new_weight - self._tracking_reward_weight) > 1e-9:
+            self.logger.info(
+                "[VelocityCurriculum] refresh tracking normalization weight %.6f -> %.6f",
+                self._tracking_reward_weight,
+                new_weight,
+            )
+            self._tracking_reward_weight = new_weight
 
     def _resolve_tracking_metric(self, ep_info):
         """Return the tracking metric value and the key used to find it.
@@ -207,7 +225,7 @@ class VelocityCurriculum:
         if not values:
             if ep_infos and not self._tracking_key_warning_logged:
                 sample_keys = list(ep_infos[0].keys())
-                self.logger.warning(
+                self.logger.info(
                     "[VelocityCurriculum] Cannot find tracking metric for velocity curriculum. "
                     f"Tried keys={self._TRACKING_KEY_CANDIDATES}; "
                     f"sample episode keys={sample_keys[:40]}"
@@ -269,7 +287,7 @@ class VelocityCurriculum:
         if mean_reward is None or mean_ratio is None:
             if self._debug_check_count <= 10 or self._debug_check_count % 20 == 0:
                 sample_keys = list(ep_infos[0].keys())[:40] if ep_infos else []
-                self.logger.warning(
+                self.logger.info(
                     "[VelocityCurriculumDebug] no tracking metric available; "
                     f"check={self._debug_check_count}, ep_infos={len(ep_infos)}, "
                     f"resolved_key={self._tracking_key_resolved}, sample_keys={sample_keys}, "
@@ -298,7 +316,7 @@ class VelocityCurriculum:
                 self._promote_streak = 0
                 self._demote_streak = 0
                 self._stage_check_count = 0
-                self.logger.warning(
+                self.logger.info(
                     f"[VelocityCurriculum] PROMOTE ↑ stage {self._stage_idx} "
                     f"(tracking_ratio={mean_ratio:.3f} >= {self.promote_threshold:.3f}, "
                     f"tracking_reward={mean_reward:.3f}, "
@@ -316,7 +334,7 @@ class VelocityCurriculum:
                 self._demote_streak = 0
                 self._promote_streak = 0
                 self._stage_check_count = 0
-                self.logger.warning(
+                self.logger.info(
                     f"[VelocityCurriculum] DEMOTE ↓ stage {self._stage_idx} "
                     f"(tracking_ratio={mean_ratio:.3f} < {self.demote_threshold:.3f}, "
                     f"tracking_reward={mean_reward:.3f}, "
@@ -331,7 +349,7 @@ class VelocityCurriculum:
 
         if self._debug_check_count <= 10 or self._debug_check_count % 20 == 0 or stage_changed:
             current_cfg = self.STAGES[self._stage_idx]
-            self.logger.warning(
+            self.logger.info(
                 "[VelocityCurriculumDebug] "
                 f"check={self._debug_check_count}, ep_infos={len(ep_infos)}, "
                 f"source={metric_source}, key={self._tracking_key_resolved}, "
@@ -348,6 +366,146 @@ class VelocityCurriculum:
         if stage_changed:
             return self._apply_stage(usr_conf, env, obs, critic_obs)
         return obs, critic_obs, False
+
+
+class TrainingScheduleController:
+    """Episode-based linear schedules for terrain proportions and reward weights."""
+
+    TERRAIN_KEYS = (
+        "pyramid_slope",
+        "pyramid_slope_inv",
+        "pyramid_stairs",
+        "pyramid_stairs_inv",
+        "maze",
+    )
+
+    def __init__(self, logger, usr_conf: dict):
+        self.logger = logger
+        self.conf = usr_conf.get("training_schedule", {})
+        self.enabled = bool(self.conf.get("enabled", False))
+        self.start_episode = int(self.conf.get("start_episode", 0))
+        self.end_episode = int(self.conf.get("end_episode", self.start_episode))
+        self.apply_interval = max(1, int(self.conf.get("apply_interval", 20)))
+        self._last_applied_episode = None
+        self._last_progress = None
+
+        self.terrain_initial = {}
+        self.terrain_target = {}
+        self.reward_initial = {}
+        self.reward_target = {}
+
+        if not self.enabled:
+            return
+
+        terrain_conf = self.conf.get("terrain", {})
+        self.terrain_initial = self._terrain_values(terrain_conf.get("initial"), usr_conf)
+        self.terrain_target = self._terrain_values(terrain_conf.get("target"), usr_conf)
+
+        reward_conf = self.conf.get("rewards", {})
+        self.reward_target = {
+            name: float(value)
+            for name, value in (reward_conf.get("target") or {}).items()
+        }
+        self.reward_initial = {
+            name: float((reward_conf.get("initial") or {}).get(
+                name,
+                usr_conf.get("rewards", {}).get(name, {}).get("weight", 0.0),
+            ))
+            for name in self.reward_target
+        }
+
+        self._validate_terrain_sum("initial", self.terrain_initial)
+        self._validate_terrain_sum("target", self.terrain_target)
+        logger.info(
+            "[TrainingSchedule] enabled: start=%s, end=%s, interval=%s, "
+            "terrain_initial=%s, terrain_target=%s, reward_target=%s",
+            self.start_episode,
+            self.end_episode,
+            self.apply_interval,
+            self.terrain_initial,
+            self.terrain_target,
+            self.reward_target,
+        )
+
+    def _terrain_values(self, values, usr_conf):
+        if values is not None:
+            return {key: float(values.get(key, 0.0)) for key in self.TERRAIN_KEYS}
+        standard = usr_conf.get("terrain", {}).get("standard", {})
+        return {
+            key: float(standard.get(key, {}).get("proportion", 0.0))
+            for key in self.TERRAIN_KEYS
+        }
+
+    def _validate_terrain_sum(self, label, values):
+        if not values:
+            return
+        total = sum(values.values())
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(
+                f"[TrainingSchedule] terrain {label} proportions sum to {total:.6f}, expected 1.0"
+            )
+
+    def _progress(self, episode):
+        if self.end_episode <= self.start_episode:
+            return 1.0 if episode >= self.end_episode else 0.0
+        raw = (episode - self.start_episode) / (self.end_episode - self.start_episode)
+        return max(0.0, min(1.0, raw))
+
+    @staticmethod
+    def _lerp_values(initial, target, progress):
+        return {
+            key: float(initial[key] + (target[key] - initial[key]) * progress)
+            for key in target
+        }
+
+    def _should_apply(self, episode, progress):
+        if self._last_applied_episode is None:
+            return True
+        if progress >= 1.0 and (self._last_progress or 0.0) < 1.0:
+            return True
+        return episode - self._last_applied_episode >= self.apply_interval
+
+    def check_and_update(self, episode, usr_conf, env, obs, critic_obs):
+        if not self.enabled:
+            return obs, critic_obs, False
+
+        progress = self._progress(episode)
+        if not self._should_apply(episode, progress):
+            return obs, critic_obs, False
+
+        terrain_values = self._lerp_values(self.terrain_initial, self.terrain_target, progress)
+        reward_values = self._lerp_values(self.reward_initial, self.reward_target, progress)
+        self._apply_to_usr_conf(usr_conf, terrain_values, reward_values)
+
+        self.logger.info(
+            "[TrainingSchedule] apply episode=%s progress=%.3f terrain=%s rewards=%s; calling env.reset",
+            episode,
+            progress,
+            {key: round(value, 4) for key, value in terrain_values.items()},
+            {key: round(value, 4) for key, value in reward_values.items()},
+        )
+
+        data = env.reset(usr_conf)
+        if data is None:
+            self.logger.error("[TrainingSchedule] env.reset failed after schedule update!")
+            raise RuntimeError("TrainingSchedule env.reset failed after schedule update")
+        _log_runtime_terrain_state(env, self.logger, "training_schedule_reset")
+
+        self._last_applied_episode = episode
+        self._last_progress = progress
+        new_obs, new_critic_obs = data
+        if new_critic_obs is None:
+            new_critic_obs = new_obs
+        return torch.clone(new_obs), torch.clone(new_critic_obs), True
+
+    def _apply_to_usr_conf(self, usr_conf, terrain_values, reward_values):
+        standard = usr_conf.setdefault("terrain", {}).setdefault("standard", {})
+        for key, value in terrain_values.items():
+            standard.setdefault(key, {})["proportion"] = value
+
+        rewards = usr_conf.setdefault("rewards", {})
+        for key, value in reward_values.items():
+            rewards.setdefault(key, {})["weight"] = value
 
 
 def _initialize_training_state(env, agent, logger):
@@ -419,6 +577,7 @@ def _initialize_training_state(env, agent, logger):
     obs = torch.clone(obs)
     critic_obs = torch.clone(critic_obs)
     logger.info(f"obs.shape:{obs.shape}, critic_obs.shape:{critic_obs.shape}")
+    _log_runtime_terrain_state(env, logger, "initial_reset")
 
     # Load reward keys from monitor config
     # 从 monitor 配置加载 reward_keys
@@ -474,11 +633,12 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     # 地形难度由 TOML difficulty_range=[0,1.0] + 10 个课程档位独立限制，
     # 初始放置等级上限为 0；速度范围由 VelocityCurriculum 逐阶扩大。
     vel_curriculum = VelocityCurriculum(logger, usr_conf)
+    training_schedule = TrainingScheduleController(logger, usr_conf)
 
     # Main Training Loop
     # 主训练循环
     while True:
-        logger.info(f"Episode {episode} start, usr_conf is {usr_conf}")
+        logger.info(f"Episode {episode} start, {_format_training_conf_summary(usr_conf)}")
         start_time = time.time()
 
         # Phase 1: Data Collection
@@ -511,6 +671,16 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         # 若阶段切换触发了 env.reset，必须清零未完成 episode 的累计统计，
         # 防止旧值在下次 dones 触发时污染 rewbuffer。
         if vel_reset:
+            cur_reward_sum.zero_()
+            cur_episode_length.zero_()
+
+        # Phase 1.6: episode-based soft schedules for terrain mix / reward weights.
+        # 阶段1.6：按 episode 线性软切换地形比例与 reward 权重。
+        last_obs, last_critic_obs, schedule_reset = training_schedule.check_and_update(
+            episode, usr_conf, env, last_obs, last_critic_obs
+        )
+        if schedule_reset:
+            vel_curriculum.refresh_tracking_reward_weight(usr_conf)
             cur_reward_sum.zero_()
             cur_episode_length.zero_()
 
@@ -587,6 +757,48 @@ def _collect_episode_metrics(ep_infos, reward_keys, device):
     return _aggregate_metrics(generic_metrics)
 
 
+def _format_training_conf_summary(usr_conf):
+    terrain = usr_conf.get("terrain", {})
+    standard = terrain.get("standard", {})
+    terrain_keys = (
+        "pyramid_slope",
+        "pyramid_slope_inv",
+        "pyramid_stairs",
+        "pyramid_stairs_inv",
+        "maze",
+    )
+    terrain_summary = {
+        key: round(float(standard.get(key, {}).get("proportion", 0.0)), 4)
+        for key in terrain_keys
+        if key in standard
+    }
+
+    rewards = usr_conf.get("rewards", {})
+    reward_keys = (
+        "track_lin_vel_xy",
+        "track_ang_vel_z",
+        "forward_velocity",
+        "obstacle_evasion",
+        "undesired_contacts",
+        "feet_stumble",
+    )
+    reward_summary = {
+        key: round(float(rewards.get(key, {}).get("weight", 0.0)), 6)
+        for key in reward_keys
+        if key in rewards
+    }
+
+    ranges = usr_conf.get("commands", {}).get("ranges", {})
+    return (
+        f"terrain_mode={terrain.get('mode')}, terrain={terrain_summary}, "
+        f"commands={ranges}, scheduled_rewards={reward_summary}"
+    )
+
+
+def _log_runtime_terrain_state(env, logger, context: str):
+    """Disabled: terrain inspection belongs in worker-side reward code."""
+    return
+
 def report_monitor_data(ep_infos, reward_keys, agent, monitor, episode, storage_stats=None,
                         vel_stage: int = 0, vel_tracking_ratio: float = 0.0,
                         vel_tracking_reward: float = 0.0, lenbuffer=None, rewbuffer=None):
@@ -630,7 +842,7 @@ def report_monitor_data(ep_infos, reward_keys, agent, monitor, episode, storage_
 
     logger = getattr(agent, "logger", None)
     if logger is not None:
-        logger.warning(
+        logger.info(
             "[MonitorDebug] reporting curriculum metrics: "
             f"episode={episode}, stage={monitor_data.get('vel_curriculum_stage')}, "
             f"tracking_ratio={monitor_data.get('vel_curriculum_tracking_ratio')}, "
@@ -785,7 +997,7 @@ def _sample_rollout_tracking_stats(storage, usr_conf, logger=None):
         weight = 1.0
     if std <= 1e-6:
         if logger is not None:
-            logger.warning(
+            logger.info(
                 "[VelocityCurriculumDebug] invalid track_lin_vel_xy std in TOML; "
                 f"std={std}, falling back to 0.25"
             )
@@ -958,7 +1170,7 @@ def _sample_physics_stats(env, logger=None, critic_obs=None):
         if isaac_env is None:
             if logger is not None and not getattr(env, "_physics_stats_error_logged", False):
                 env._physics_stats_error_logged = True
-                logger.warning(
+                logger.info(
                     "[PhysicsStats] Failed to unwrap Isaac Lab env; "
                     "falling back to critic_obs for partial physics metrics."
                 )
@@ -969,7 +1181,7 @@ def _sample_physics_stats(env, logger=None, critic_obs=None):
         if asset is None:
             if logger is not None and not getattr(env, "_physics_stats_error_logged", False):
                 env._physics_stats_error_logged = True
-                logger.warning(
+                logger.info(
                     "[PhysicsStats] Failed to locate robot asset in scene; "
                     "falling back to critic_obs for partial physics metrics."
                 )
@@ -991,7 +1203,7 @@ def _sample_physics_stats(env, logger=None, critic_obs=None):
     except Exception as exc:
         if logger is not None and not getattr(env, "_physics_stats_error_logged", False):
             env._physics_stats_error_logged = True
-            logger.warning(
+            logger.info(
                 f"[PhysicsStats] Failed to sample physics metrics from Isaac env: {exc}; "
                 "falling back to critic_obs for partial physics metrics."
             )
