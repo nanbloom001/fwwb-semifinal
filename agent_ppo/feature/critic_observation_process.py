@@ -16,13 +16,6 @@ with the policy on the task-information convention.
 critic 观测需保持与 policy 同步的任务信息约定。
 """
 
-import torch
-
-from agent_ppo.conf.conf import Config
-from agent_ppo.feature.track_observation_features import (
-    compact_scan_nav_features,
-    compact_track_goal_nav_features,
-)
 from tools.base_env.observation_process import ObservationProcess
 
 
@@ -32,31 +25,13 @@ class CriticObservationProcess(ObservationProcess):
 
     def process(self):
         obs = self.default_observation()
-        stage = Config.current_stage()
-        extra_obs = self._build_extra_obs(obs, stage)
-        if extra_obs is not None:
-            if hasattr(self, "concatenate_terms"):
-                obs = self.concatenate_terms(obs, extra_obs)
-            else:
-                obs = torch.cat((obs, extra_obs), dim=-1)
-
-        expected_dim = self._EXPECTED_OBS_DIM + int(getattr(stage, "num_extra_obs", 0))
-        if obs.shape[-1] != expected_dim:
+        if obs.shape[-1] != self._EXPECTED_OBS_DIM:
             raise ValueError(
-                f"Critic observation dim mismatch: expected {expected_dim}, got {obs.shape[-1]}. "
+                f"Critic observation dim mismatch: expected {self._EXPECTED_OBS_DIM}, got {obs.shape[-1]}. "
                 "This usually means height_scan or privileged observation layout changed unexpectedly."
             )
+        # TODO (track terrain): if the policy observation appends goal features,
+        # the critic observation must keep the same task-information convention.
+        # TODO (track 地形)：如果 policy 观测追加了 goal 特征，
+        # critic 观测也需保持同步的任务信息约定。
         return obs
-
-    def _build_extra_obs(self, obs, stage):
-        mode = getattr(stage, "extra_obs_mode", "none")
-        if mode == "none":
-            return None
-        if mode == "track_goal_nav":
-            return compact_track_goal_nav_features(self.env, obs[:, -256:])
-        if mode == "maze_scan":
-            return self._maze_scan_features(obs[:, -256:])
-        raise ValueError(f"Unsupported critic extra_obs_mode: {mode}")
-
-    def _maze_scan_features(self, scan_flat):
-        return compact_scan_nav_features(scan_flat)

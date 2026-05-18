@@ -50,11 +50,10 @@ class Agent(BaseAgent):
 
         num_proprio = stage.num_proprio_obs
         num_scan = stage.num_scan
-        num_extra = getattr(stage, "num_extra_obs", 0)
 
-        # policy obs = proprio + scan + optional task-specific features
-        # 策略观测 = 本体感知 + 扫描 + 可选任务特征
-        self.num_obs = num_proprio + num_scan + num_extra
+        # policy obs = proprio + scan
+        # 策略观测 = 本体感知 + 扫描
+        self.num_obs = num_proprio + num_scan
 
         self._init_flat(num_proprio, num_scan, stage)
 

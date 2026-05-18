@@ -8,9 +8,9 @@ Author: Tencent AI Arena Authors
 """
 
 
+from common_python.utils.common_func import Frame
 import os
 import time
-from common_python.utils.common_func import Frame
 from typing import List, Optional, Tuple
 from agent_ppo.conf.conf import Config
 from agent_ppo.feature.definition import RolloutStorage
@@ -43,6 +43,15 @@ class VelocityCurriculum:
     所有阈值和阶段定义均从 TOML [velocity_curriculum] 节读取。
     """
 
+    # Default stages used only when usr_conf has no [velocity_curriculum] section.
+    # 仅当 TOML 缺少 [velocity_curriculum] 节时作为退路默认值。
+    _DEFAULT_STAGES = [
+        {"lin_vel_x": [0.0,  0.5], "lin_vel_y": [-0.3,  0.3], "ang_vel_yaw": [-1.0,  1.0]},
+        {"lin_vel_x": [0.0,  1.0], "lin_vel_y": [-0.5,  0.5], "ang_vel_yaw": [-1.5,  1.5]},
+        {"lin_vel_x": [0.0,  1.5], "lin_vel_y": [-0.8,  0.8], "ang_vel_yaw": [-1.5,  1.5]},
+        {"lin_vel_x": [-0.5, 2.0], "lin_vel_y": [-1.0,  1.0], "ang_vel_yaw": [-1.5,  1.5]},
+    ]
+
     # ep_info key used as performance signal.  Different framework versions may
     # expose reward terms with slightly different names, so lookup is tolerant.
     # 用于速度课程的 episode 指标。不同框架版本可能使用略有差异的 reward key，
@@ -58,32 +67,24 @@ class VelocityCurriculum:
     def __init__(self, logger, usr_conf: dict):
         """Build curriculum from usr_conf["velocity_curriculum"] (TOML section).
 
-        Disabled when the TOML section is absent.
-        从 TOML 的 [velocity_curriculum] 节加载配置；节缺失时禁用。
+        Falls back to _DEFAULT_STAGES / hard-coded thresholds if the section is absent.
+        从 TOML 的 [velocity_curriculum] 节加载配置；节缺失时回退到默认值。
         """
         self.logger = logger
-        vc_conf = usr_conf.get("velocity_curriculum")
-        self.enabled = bool(vc_conf)
-        self._stage_idx = 0
-        self._promote_streak = 0
-        self._demote_streak = 0
-        self._last_mean_tracking_reward = 0.0
-        self._last_mean_tracking_ratio = 0.0
-        self._tracking_key_resolved = None
-        self._tracking_key_warning_logged = False
-        self._debug_check_count = 0
-        self._stage_check_count = 0
-        self.STAGES = []
-
-        if not self.enabled:
-            logger.info("[VelocityCurriculum] Disabled: no [velocity_curriculum] section in usr_conf.")
-            return
-
+        fine_tune_conf = usr_conf.get("fine_tune_schedule", {})
+        self._commands_owned_by_schedule = bool(
+            fine_tune_conf.get("enabled", False)
+            and (
+                fine_tune_conf.get("command_initial", {})
+                or fine_tune_conf.get("command_target", {})
+            )
+        )
+        vc_conf = usr_conf.get("velocity_curriculum", {})
         tracking_reward_conf = usr_conf.get("rewards", {}).get("track_lin_vel_xy", {})
 
         self._tracking_reward_weight = abs(float(tracking_reward_conf.get("weight", 1.0)))
         if self._tracking_reward_weight <= 1e-6:
-            logger.info(
+            logger.warning(
                 "[VelocityCurriculum] track_lin_vel_xy weight is non-positive; "
                 "falling back to 1.0 for curriculum normalization. "
                 "Please check [rewards.track_lin_vel_xy].weight in TOML."
@@ -98,20 +99,24 @@ class VelocityCurriculum:
         )
         self.promote_count:     int   = int(vc_conf.get("promote_count", 5))
         self.demote_count:      int   = int(vc_conf.get("demote_count",  3))
-        self.min_checks_per_stage: int = int(vc_conf.get("min_checks_per_stage", 0))
+        self.min_checks_per_stage: int = max(0, int(vc_conf.get("min_checks_per_stage", 0)))
 
         raw_stages = vc_conf.get("stages", None)
-        if not raw_stages:
-            raise ValueError("[VelocityCurriculum] enabled but no [[velocity_curriculum.stages]] found.")
-
-        self.STAGES = [
-            {
-                "lin_vel_x":   list(s["lin_vel_x"]),
-                "lin_vel_y":   list(s["lin_vel_y"]),
-                "ang_vel_yaw": list(s["ang_vel_yaw"]),
-            }
-            for s in raw_stages
-        ]
+        if raw_stages:
+            self.STAGES = [
+                {
+                    "lin_vel_x":   list(s["lin_vel_x"]),
+                    "lin_vel_y":   list(s["lin_vel_y"]),
+                    "ang_vel_yaw": list(s["ang_vel_yaw"]),
+                }
+                for s in raw_stages
+            ]
+        else:
+            self.STAGES = self._DEFAULT_STAGES
+            logger.warning(
+                "[VelocityCurriculum] No [velocity_curriculum.stages] found in usr_conf; "
+                "falling back to hard-coded default stages."
+            )
 
         command_ranges = usr_conf.get("commands", {}).get("ranges", {})
         stage0 = self.STAGES[0]
@@ -125,12 +130,22 @@ class VelocityCurriculum:
                 f"Got commands.ranges={command_ranges}, stage0={stage0}."
             )
 
+        self._stage_idx = 0
+        self._promote_streak = 0  # consecutive checks above promote_threshold
+        self._demote_streak = 0   # consecutive checks below demote_threshold
+        self._last_mean_tracking_reward = 0.0
+        self._last_mean_tracking_ratio = 0.0
+        self._tracking_key_resolved = None
+        self._tracking_key_warning_logged = False
+        self._debug_check_count = 0
+        self._stage_enter_check = 0
         logger.info(
             f"[VelocityCurriculum] Initialized: {len(self.STAGES)} stages, "
             f"tracking_weight={self._tracking_reward_weight}, "
             f"promote_threshold={self.promote_threshold}, demote_threshold={self.demote_threshold}, "
             f"promote_count={self.promote_count}, demote_count={self.demote_count}, "
-            f"min_checks_per_stage={self.min_checks_per_stage}"
+            f"min_checks_per_stage={self.min_checks_per_stage}, "
+            f"commands_owned_by_schedule={self._commands_owned_by_schedule}"
         )
 
     def _normalize_threshold(self, threshold_value: float, field_name: str) -> float:
@@ -147,7 +162,7 @@ class VelocityCurriculum:
             return threshold_value
 
         normalized = threshold_value / self._tracking_reward_weight
-        self.logger.info(
+        self.logger.warning(
             f"[VelocityCurriculum] {field_name}={threshold_value} detected as legacy absolute reward; "
             f"normalized to ratio {normalized:.3f} using tracking weight {self._tracking_reward_weight:.3f}."
         )
@@ -165,25 +180,14 @@ class VelocityCurriculum:
     def last_tracking_ratio(self) -> float:
         return self._last_mean_tracking_ratio
 
-    def refresh_tracking_reward_weight(self, usr_conf):
-        if not self.enabled:
-            return
-        tracking_reward_conf = usr_conf.get("rewards", {}).get("track_lin_vel_xy", {})
-        new_weight = abs(float(tracking_reward_conf.get("weight", self._tracking_reward_weight)))
-        if new_weight <= 1e-6:
-            self.logger.info(
-                "[VelocityCurriculum] track_lin_vel_xy weight became non-positive after schedule update; "
-                "keeping previous normalization weight %.6f.",
-                self._tracking_reward_weight,
-            )
-            return
-        if abs(new_weight - self._tracking_reward_weight) > 1e-9:
-            self.logger.info(
-                "[VelocityCurriculum] refresh tracking normalization weight %.6f -> %.6f",
-                self._tracking_reward_weight,
-                new_weight,
-            )
-            self._tracking_reward_weight = new_weight
+    def monitor_stats(self):
+        cfg = self.STAGES[self._stage_idx]
+        lin_y = cfg.get("lin_vel_y", [0.0, 0.0])
+        yaw = cfg.get("ang_vel_yaw", [0.0, 0.0])
+        return {
+            "vel_cmd_vy_abs_max": max(abs(float(lin_y[0])), abs(float(lin_y[1]))) if len(lin_y) >= 2 else 0.0,
+            "vel_cmd_wz_abs_max": max(abs(float(yaw[0])), abs(float(yaw[1]))) if len(yaw) >= 2 else 0.0,
+        }
 
     def _resolve_tracking_metric(self, ep_info):
         """Return the tracking metric value and the key used to find it.
@@ -221,7 +225,7 @@ class VelocityCurriculum:
         if not values:
             if ep_infos and not self._tracking_key_warning_logged:
                 sample_keys = list(ep_infos[0].keys())
-                self.logger.info(
+                self.logger.warning(
                     "[VelocityCurriculum] Cannot find tracking metric for velocity curriculum. "
                     f"Tried keys={self._TRACKING_KEY_CANDIDATES}; "
                     f"sample episode keys={sample_keys[:40]}"
@@ -268,9 +272,6 @@ class VelocityCurriculum:
         reset_happened=True 时调用方需清零 cur_reward_sum / cur_episode_length，
         避免 env.reset 后旧累计值污染 rewbuffer 统计。
         """
-        if not self.enabled:
-            return obs, critic_obs, False
-
         self._debug_check_count += 1
         rollout_stats = rollout_stats or {}
         mean_reward, mean_ratio = self._mean_tracking_reward(ep_infos)
@@ -286,7 +287,7 @@ class VelocityCurriculum:
         if mean_reward is None or mean_ratio is None:
             if self._debug_check_count <= 10 or self._debug_check_count % 20 == 0:
                 sample_keys = list(ep_infos[0].keys())[:40] if ep_infos else []
-                self.logger.info(
+                self.logger.warning(
                     "[VelocityCurriculumDebug] no tracking metric available; "
                     f"check={self._debug_check_count}, ep_infos={len(ep_infos)}, "
                     f"resolved_key={self._tracking_key_resolved}, sample_keys={sample_keys}, "
@@ -296,44 +297,56 @@ class VelocityCurriculum:
 
         self._last_mean_tracking_reward = mean_reward
         self._last_mean_tracking_ratio = mean_ratio
-        self._stage_check_count += 1
+
+        if self._commands_owned_by_schedule:
+            self._promote_streak = 0
+            self._demote_streak = 0
+            if self._debug_check_count <= 10 or self._debug_check_count % 20 == 0:
+                current_cfg = self.STAGES[self._stage_idx]
+                self.logger.warning(
+                    "[VelocityCurriculumDebug] "
+                    f"check={self._debug_check_count}, ep_infos={len(ep_infos)}, "
+                    f"source={metric_source}, key={self._tracking_key_resolved}, "
+                    f"reward={mean_reward:.4f}, "
+                    f"ratio={mean_ratio:.4f}, stage={self._stage_idx}->{self._stage_idx}, "
+                    "command_update=disabled_by_fine_tune_schedule, "
+                    f"ranges={current_cfg}"
+                )
+            return obs, critic_obs, False
 
         stage_changed = False
         old_stage = self._stage_idx
 
+        checks_in_stage = self._debug_check_count - self._stage_enter_check
+        stage_age_ready = checks_in_stage >= self.min_checks_per_stage
+
         if mean_ratio >= self.promote_threshold:
             self._promote_streak += 1
             self._demote_streak = 0
-            has_min_stage_checks = self._stage_check_count >= self.min_checks_per_stage
             if (
-                self._promote_streak >= self.promote_count
-                and has_min_stage_checks
+                stage_age_ready
+                and self._promote_streak >= self.promote_count
                 and self._stage_idx < len(self.STAGES) - 1
             ):
-                stage_checks_before_change = self._stage_check_count
                 self._stage_idx += 1
                 self._promote_streak = 0
-                self._demote_streak = 0
-                self._stage_check_count = 0
-                self.logger.info(
+                self._stage_enter_check = self._debug_check_count
+                self.logger.warning(
                     f"[VelocityCurriculum] PROMOTE ↑ stage {self._stage_idx} "
                     f"(tracking_ratio={mean_ratio:.3f} >= {self.promote_threshold:.3f}, "
                     f"tracking_reward={mean_reward:.3f}, "
                     f"for {self.promote_count} consecutive checks, "
-                    f"stage_checks={stage_checks_before_change}/{self.min_checks_per_stage})"
+                    f"stage_age={checks_in_stage}/{self.min_checks_per_stage})"
                 )
                 stage_changed = True
-            elif self._stage_idx >= len(self.STAGES) - 1:
-                self._promote_streak = min(self._promote_streak, self.promote_count)
         elif mean_ratio < self.demote_threshold:
             self._demote_streak += 1
             self._promote_streak = 0
             if self._demote_streak >= self.demote_count and self._stage_idx > 0:
                 self._stage_idx -= 1
                 self._demote_streak = 0
-                self._promote_streak = 0
-                self._stage_check_count = 0
-                self.logger.info(
+                self._stage_enter_check = self._debug_check_count
+                self.logger.warning(
                     f"[VelocityCurriculum] DEMOTE ↓ stage {self._stage_idx} "
                     f"(tracking_ratio={mean_ratio:.3f} < {self.demote_threshold:.3f}, "
                     f"tracking_reward={mean_reward:.3f}, "
@@ -348,7 +361,7 @@ class VelocityCurriculum:
 
         if self._debug_check_count <= 10 or self._debug_check_count % 20 == 0 or stage_changed:
             current_cfg = self.STAGES[self._stage_idx]
-            self.logger.info(
+            self.logger.warning(
                 "[VelocityCurriculumDebug] "
                 f"check={self._debug_check_count}, ep_infos={len(ep_infos)}, "
                 f"source={metric_source}, key={self._tracking_key_resolved}, "
@@ -358,7 +371,7 @@ class VelocityCurriculum:
                 f"@{self.promote_threshold:.3f}, "
                 f"demote={self._demote_streak}/{self.demote_count} "
                 f"@{self.demote_threshold:.3f}, "
-                f"stage_checks={self._stage_check_count}/{self.min_checks_per_stage}, "
+                f"stage_age={checks_in_stage}/{self.min_checks_per_stage}, "
                 f"ranges={current_cfg}"
             )
 
@@ -367,144 +380,418 @@ class VelocityCurriculum:
         return obs, critic_obs, False
 
 
-class TrainingScheduleController:
-    """Episode-based linear schedules for terrain proportions and reward weights."""
-
-    TERRAIN_KEYS = (
-        "pyramid_slope",
-        "pyramid_slope_inv",
-        "pyramid_stairs",
-        "pyramid_stairs_inv",
-        "maze",
-    )
+class FineTuneSchedule:
+    """Wall-clock-first linear schedule for conservative HJC fine-tuning."""
 
     def __init__(self, logger, usr_conf: dict):
         self.logger = logger
-        self.conf = usr_conf.get("training_schedule", {})
+        self.conf = usr_conf.get("fine_tune_schedule", {})
         self.enabled = bool(self.conf.get("enabled", False))
-        self.start_episode = int(self.conf.get("start_episode", 0))
-        self.end_episode = int(self.conf.get("end_episode", self.start_episode))
-        self.apply_interval = max(1, int(self.conf.get("apply_interval", 20)))
+        self.transition_seconds = float(self.conf.get("transition_seconds", 900.0))
+        self.transition_episodes = max(1, int(self.conf.get("fallback_transition_episodes", 200)))
+        self.update_interval_episodes = max(1, int(self.conf.get("update_interval_episodes", 10)))
+        self.log_interval_episodes = max(1, int(self.conf.get("log_interval_episodes", 10)))
+        self.start_time = time.time()
         self._last_applied_episode = None
-        self._last_progress = None
+        self._last_alpha = 0.0
+        self._last_reset_happened = False
+        self._runtime_reward_weights = {}
+        self._runtime_command_ranges = {}
+        self._runtime_command_limits = {}
 
-        self.terrain_initial = {}
-        self.terrain_target = {}
-        self.reward_initial = {}
-        self.reward_target = {}
+        self.reward_initial = dict(self.conf.get("reward_initial", {}))
+        self.reward_target = dict(self.conf.get("reward_target", {}))
+        self.command_initial = self._normalize_command_ranges(self.conf.get("command_initial", {}))
+        self.command_target = self._normalize_command_ranges(self.conf.get("command_target", {}))
+        self.terrain_phases = self._normalize_terrain_phases(self.conf.get("terrain_phases", []))
+        self._current_terrain_phase_idx = None
 
         if not self.enabled:
+            logger.warning("[FineTuneSchedule] disabled: no schedule will be applied.")
+            self._log_reward_registration(usr_conf)
             return
 
-        terrain_conf = self.conf.get("terrain", {})
-        self.terrain_initial = self._terrain_values(terrain_conf.get("initial"), usr_conf)
-        self.terrain_target = self._terrain_values(terrain_conf.get("target"), usr_conf)
-
-        reward_conf = self.conf.get("rewards", {})
-        self.reward_target = {
-            name: float(value)
-            for name, value in (reward_conf.get("target") or {}).items()
-        }
-        self.reward_initial = {
-            name: float((reward_conf.get("initial") or {}).get(
-                name,
-                usr_conf.get("rewards", {}).get(name, {}).get("weight", 0.0),
-            ))
-            for name in self.reward_target
-        }
-
-        self._validate_terrain_sum("initial", self.terrain_initial)
-        self._validate_terrain_sum("target", self.terrain_target)
-        logger.info(
-            "[TrainingSchedule] enabled: start=%s, end=%s, interval=%s, "
-            "terrain_initial=%s, terrain_target=%s, reward_target=%s",
-            self.start_episode,
-            self.end_episode,
-            self.apply_interval,
-            self.terrain_initial,
-            self.terrain_target,
-            self.reward_target,
+        self._log_initial_alignment(usr_conf)
+        self._apply_rewards(usr_conf, self.reward_initial)
+        self._apply_commands(usr_conf, self.command_initial)
+        self._apply_terrain_phase(usr_conf, self._terrain_phase_for_alpha(0.0))
+        self._current_command_ranges = dict(usr_conf.get("commands", {}).get("ranges", {}))
+        self._log_reward_registration(usr_conf)
+        logger.warning(
+            f"[FineTuneSchedule] initialized transition_seconds={self.transition_seconds:.1f} "
+            f"fallback_episodes={self.transition_episodes} "
+            f"update_interval={self.update_interval_episodes} "
+            f"reward_initial={self.reward_initial} reward_target={self.reward_target} "
+            f"command_initial={self.command_initial} command_target={self.command_target} "
+            f"terrain_phases={self.terrain_phases}"
         )
 
-    def _terrain_values(self, values, usr_conf):
-        if values is not None:
-            return {key: float(values.get(key, 0.0)) for key in self.TERRAIN_KEYS}
-        standard = usr_conf.get("terrain", {}).get("standard", {})
+    @property
+    def last_alpha(self) -> float:
+        return self._last_alpha
+
+    def monitor_stats(self):
+        ranges = self.command_target if self.command_target else {}
+        current = getattr(self, "_current_command_ranges", {})
+        lin_y = current.get("lin_vel_y", ranges.get("lin_vel_y", [0.0, 0.0]))
+        yaw = current.get("ang_vel_yaw", ranges.get("ang_vel_yaw", [0.0, 0.0]))
         return {
-            key: float(standard.get(key, {}).get("proportion", 0.0))
-            for key in self.TERRAIN_KEYS
+            "scheduled_alpha": self._last_alpha,
+            "scheduled_elapsed_seconds": max(0.0, time.time() - self.start_time),
+            "scheduled_cmd_vy_abs_max": max(abs(float(lin_y[0])), abs(float(lin_y[1]))) if len(lin_y) >= 2 else 0.0,
+            "scheduled_cmd_wz_abs_max": max(abs(float(yaw[0])), abs(float(yaw[1]))) if len(yaw) >= 2 else 0.0,
+            "sched_track_lin_w": self._reward_weight("track_lin_vel_xy"),
+            "sched_track_yaw_w": self._reward_weight("track_ang_vel_z"),
+            "sched_hs_clear_w": self._reward_weight("height_scan_feet_clearance"),
+            "sched_hs_wall_w": self._reward_weight("height_scan_wall_reject"),
+            "sched_relax_ang_w": self._reward_weight("stair_relax_ang_vel_xy"),
+            "sched_relax_height_w": self._reward_weight("stair_relax_base_height"),
+            "sched_relax_joint_w": self._reward_weight("stair_relax_joint_position"),
+            "sched_pivot_w": self._reward_weight("pivot_turning"),
+            "sched_flat_orient_w": self._reward_weight("flat_orientation"),
+            "sched_base_height_w": self._reward_weight("correct_base_height"),
+            "scheduled_terrain_phase": float(self._current_terrain_phase_idx or 0),
         }
 
-    def _validate_terrain_sum(self, label, values):
-        if not values:
-            return
-        total = sum(values.values())
-        if abs(total - 1.0) > 1e-6:
-            raise ValueError(
-                f"[TrainingSchedule] terrain {label} proportions sum to {total:.6f}, expected 1.0"
+    def check_and_update(self, usr_conf, env, obs, critic_obs, episode: int):
+        if not self.enabled:
+            return obs, critic_obs, False
+        if self._last_applied_episode is not None and episode - self._last_applied_episode < self.update_interval_episodes:
+            return obs, critic_obs, False
+
+        alpha = self._alpha(episode)
+        reward_values = self._interpolate_dict(self.reward_initial, self.reward_target, alpha)
+        command_values = self._interpolate_commands(self.command_initial, self.command_target, alpha)
+        terrain_phase = self._terrain_phase_for_alpha(alpha)
+        self._apply_rewards(usr_conf, reward_values)
+        command_changed = self._apply_commands(usr_conf, command_values)
+        terrain_changed = self._apply_terrain_phase(usr_conf, terrain_phase)
+        reward_runtime = self._apply_rewards_runtime(env, reward_values)
+        command_runtime = self._apply_commands_runtime(env, command_values)
+        self._last_alpha = alpha
+        self._last_applied_episode = episode
+
+        should_log = episode <= self.log_interval_episodes or episode % self.log_interval_episodes == 0 or command_changed
+        if should_log:
+            self.logger.warning(
+                f"[FineTuneSchedule] apply episode={episode} alpha={alpha:.3f} "
+                f"elapsed={time.time() - self.start_time:.1f}s rewards={reward_values} "
+                f"commands={command_values} command_changed={command_changed} "
+                f"terrain_changed={terrain_changed} terrain_phase={terrain_phase} "
+                f"runtime_rewards={reward_runtime} runtime_commands={command_runtime}"
             )
 
-    def _progress(self, episode):
-        if self.end_episode <= self.start_episode:
-            return 1.0 if episode >= self.end_episode else 0.0
-        raw = (episode - self.start_episode) / (self.end_episode - self.start_episode)
-        return max(0.0, min(1.0, raw))
+        needs_reset = self._needs_reset_for_schedule_apply(reward_runtime, command_runtime)
+        if needs_reset or terrain_changed:
+            data = env.reset(usr_conf)
+            if data is None:
+                self.logger.error("[FineTuneSchedule] env.reset failed after scheduled config update!")
+                raise RuntimeError("FineTuneSchedule env.reset failed after scheduled config update")
+            new_obs, new_critic_obs = data
+            if new_critic_obs is None:
+                new_critic_obs = new_obs
+            if should_log:
+                reset_reason = "terrain_phase_changed" if terrain_changed and not needs_reset else "runtime_manager_update_unavailable"
+                self.logger.warning(
+                    f"[FineTuneSchedule] applied_by=env_reset reason={reset_reason} "
+                    f"episode={episode} alpha={alpha:.3f} terrain_changed={terrain_changed}"
+                )
+            return torch.clone(new_obs), torch.clone(new_critic_obs), True
 
-    @staticmethod
-    def _lerp_values(initial, target, progress):
-        return {
-            key: float(initial[key] + (target[key] - initial[key]) * progress)
-            for key in target
-        }
+        if should_log:
+            self.logger.warning(
+                f"[FineTuneSchedule] applied_by=runtime_manager episode={episode} alpha={alpha:.3f}"
+            )
+        return obs, critic_obs, False
 
-    def _should_apply(self, episode, progress):
-        if self._last_applied_episode is None:
-            return True
-        if progress >= 1.0 and (self._last_progress or 0.0) < 1.0:
-            return True
-        return episode - self._last_applied_episode >= self.apply_interval
+    def _alpha(self, episode: int) -> float:
+        if self.transition_seconds > 0.0:
+            return max(0.0, min(1.0, (time.time() - self.start_time) / self.transition_seconds))
+        return max(0.0, min(1.0, float(episode) / float(self.transition_episodes)))
 
-    def check_and_update(self, episode, usr_conf, env, obs, critic_obs):
-        if not self.enabled:
-            return obs, critic_obs, False
+    def _reward_weight(self, name: str) -> float:
+        rewards = getattr(self, "_usr_conf_ref", {}).get("rewards", {})
+        return float(rewards.get(name, {}).get("weight", 0.0))
 
-        progress = self._progress(episode)
-        if not self._should_apply(episode, progress):
-            return obs, critic_obs, False
+    def _log_initial_alignment(self, usr_conf):
+        rewards = usr_conf.get("rewards", {})
+        mismatches = []
+        for name, initial_value in self.reward_initial.items():
+            reward_conf = rewards.get(name)
+            if not isinstance(reward_conf, dict) or "weight" not in reward_conf:
+                mismatches.append(f"{name}:missing_static->{float(initial_value):.6g}")
+                continue
+            static_value = float(reward_conf.get("weight", 0.0))
+            initial_value = float(initial_value)
+            if abs(static_value - initial_value) > 1.0e-9:
+                mismatches.append(f"{name}:{static_value:.6g}->{initial_value:.6g}")
+        if mismatches:
+            self.logger.warning(
+                "[FineTuneSchedule] static reward weights differ from reward_initial; "
+                f"startup reset will apply reward_initial. mismatches={mismatches}"
+            )
+        else:
+            self.logger.warning("[FineTuneSchedule] static reward weights match reward_initial.")
 
-        terrain_values = self._lerp_values(self.terrain_initial, self.terrain_target, progress)
-        reward_values = self._lerp_values(self.reward_initial, self.reward_target, progress)
-        self._apply_to_usr_conf(usr_conf, terrain_values, reward_values)
+    def _apply_rewards(self, usr_conf, values):
+        self._usr_conf_ref = usr_conf
+        rewards = usr_conf.setdefault("rewards", {})
+        for key, value in values.items():
+            rewards.setdefault(key, {})["weight"] = float(value)
 
-        self.logger.info(
-            "[TrainingSchedule] apply episode=%s progress=%.3f terrain=%s rewards=%s; calling env.reset",
-            episode,
-            progress,
-            {key: round(value, 4) for key, value in terrain_values.items()},
-            {key: round(value, 4) for key, value in reward_values.items()},
-        )
+    def _apply_commands(self, usr_conf, values):
+        if not values:
+            return False
+        ranges = usr_conf.setdefault("commands", {}).setdefault("ranges", {})
+        limits = usr_conf.setdefault("commands", {}).setdefault("limit", {})
+        changed = False
+        for key, value in values.items():
+            value = [float(value[0]), float(value[1])]
+            if list(ranges.get(key, [])) != value:
+                changed = True
+            ranges[key] = value
+            limit_key = "ang_vel_z" if key == "ang_vel_yaw" else key
+            if limit_key in limits:
+                limits[limit_key] = [float(value[0]), float(value[1])]
+        self._current_command_ranges = dict(ranges)
+        return changed
 
-        data = env.reset(usr_conf)
-        if data is None:
-            self.logger.error("[TrainingSchedule] env.reset failed after schedule update!")
-            raise RuntimeError("TrainingSchedule env.reset failed after schedule update")
-        _log_runtime_terrain_state(env, self.logger, "training_schedule_reset")
+    def _apply_terrain_phase(self, usr_conf, phase):
+        if not phase:
+            return False
+        terrain = usr_conf.setdefault("terrain", {})
+        standard = terrain.setdefault("standard", {})
+        changed = False
 
-        self._last_applied_episode = episode
-        self._last_progress = progress
-        new_obs, new_critic_obs = data
-        if new_critic_obs is None:
-            new_critic_obs = new_obs
-        return torch.clone(new_obs), torch.clone(new_critic_obs), True
+        if "difficulty_range" in phase:
+            value = [float(phase["difficulty_range"][0]), float(phase["difficulty_range"][1])]
+            if list(terrain.get("difficulty_range", [])) != value:
+                changed = True
+            terrain["difficulty_range"] = value
 
-    def _apply_to_usr_conf(self, usr_conf, terrain_values, reward_values):
-        standard = usr_conf.setdefault("terrain", {}).setdefault("standard", {})
-        for key, value in terrain_values.items():
+        if "max_init_terrain_level" in phase:
+            value = int(phase["max_init_terrain_level"])
+            if int(terrain.get("max_init_terrain_level", -1)) != value:
+                changed = True
+            terrain["max_init_terrain_level"] = value
+
+        for key in (
+            "pyramid_slope",
+            "pyramid_slope_inv",
+            "pyramid_stairs",
+            "pyramid_stairs_inv",
+            "maze",
+        ):
+            if key not in phase:
+                continue
+            value = float(phase[key])
+            current = float(standard.get(key, {}).get("proportion", -1.0))
+            if abs(current - value) > 1.0e-9:
+                changed = True
             standard.setdefault(key, {})["proportion"] = value
 
-        rewards = usr_conf.setdefault("rewards", {})
-        for key, value in reward_values.items():
-            rewards.setdefault(key, {})["weight"] = value
+        return changed
+
+    def _apply_rewards_runtime(self, env, values):
+        isaac_env = _get_isaac_env(env)
+        if isaac_env is None:
+            return {
+                "ok": False,
+                "reason": "isaac_env_unavailable",
+                "candidates": _describe_env_unwrap_candidates(env, max_items=8),
+            }
+        reward_manager = getattr(isaac_env, "reward_manager", None)
+        if reward_manager is None:
+            return {"ok": False, "reason": "reward_manager_unavailable"}
+
+        result = {}
+        for name, value in values.items():
+            try:
+                cfg = reward_manager.get_term_cfg(name)
+                if cfg is None:
+                    result[name] = {"ok": False, "reason": "term_missing"}
+                    continue
+                old_weight = float(getattr(cfg, "weight", 0.0))
+                cfg.weight = float(value)
+                set_term_cfg = getattr(reward_manager, "set_term_cfg", None)
+                if callable(set_term_cfg):
+                    set_term_cfg(name, cfg)
+                readback_cfg = reward_manager.get_term_cfg(name)
+                readback = float(getattr(readback_cfg, "weight", float(value)))
+                self._runtime_reward_weights[name] = readback
+                result[name] = {
+                    "ok": abs(readback - float(value)) <= 1.0e-6,
+                    "old": round(old_weight, 6),
+                    "target": round(float(value), 6),
+                    "readback": round(readback, 6),
+                }
+            except Exception as exc:
+                result[name] = {"ok": False, "reason": type(exc).__name__, "detail": str(exc)[:160]}
+        return result
+
+    @staticmethod
+    def _runtime_update_ok(result):
+        if not isinstance(result, dict):
+            return False
+        if result.get("ok") is False:
+            return False
+        if result.get("ok") is True:
+            return True
+        term_results = [value for value in result.values() if isinstance(value, dict)]
+        if not term_results:
+            return False
+        return all(bool(value.get("ok", False)) for value in term_results)
+
+    def _needs_reset_for_schedule_apply(self, reward_runtime, command_runtime):
+        return not (
+            self._runtime_update_ok(reward_runtime)
+            and self._runtime_update_ok(command_runtime)
+        )
+
+    def _apply_commands_runtime(self, env, values):
+        if not values:
+            return {"ok": True, "reason": "no_values"}
+        isaac_env = _get_isaac_env(env)
+        if isaac_env is None:
+            return {
+                "ok": False,
+                "reason": "isaac_env_unavailable",
+                "candidates": _describe_env_unwrap_candidates(env, max_items=8),
+            }
+        command_manager = getattr(isaac_env, "command_manager", None)
+        if command_manager is None:
+            return {"ok": False, "reason": "command_manager_unavailable"}
+        try:
+            command_term = command_manager.get_term("base_velocity")
+        except Exception as exc:
+            return {"ok": False, "reason": type(exc).__name__, "detail": str(exc)[:160]}
+        cfg = getattr(command_term, "cfg", None)
+        if cfg is None:
+            return {"ok": False, "reason": "command_cfg_unavailable"}
+
+        mapping = {"lin_vel_x": "lin_vel_x", "lin_vel_y": "lin_vel_y", "ang_vel_yaw": "ang_vel_z"}
+        applied_ranges = {}
+        applied_limits = {}
+        try:
+            ranges = getattr(cfg, "ranges", None)
+            limit_ranges = getattr(cfg, "limit_ranges", None)
+            for key, value in values.items():
+                attr = mapping.get(key)
+                if attr is None:
+                    continue
+                pair = (float(value[0]), float(value[1]))
+                if ranges is not None and hasattr(ranges, attr):
+                    setattr(ranges, attr, pair)
+                    applied_ranges[key] = list(pair)
+                if limit_ranges is not None and hasattr(limit_ranges, attr):
+                    setattr(limit_ranges, attr, pair)
+                    applied_limits[key] = list(pair)
+            self._runtime_command_ranges = applied_ranges
+            self._runtime_command_limits = applied_limits
+            return {"ok": True, "ranges": applied_ranges, "limits": applied_limits}
+        except Exception as exc:
+            return {"ok": False, "reason": type(exc).__name__, "detail": str(exc)[:160]}
+
+    def _normalize_command_ranges(self, values):
+        out = {}
+        for key, value in values.items():
+            if isinstance(value, (list, tuple)) and len(value) >= 2:
+                out[key] = [float(value[0]), float(value[1])]
+        return out
+
+    def _normalize_terrain_phases(self, phases):
+        out = []
+        if not isinstance(phases, list):
+            return out
+        terrain_keys = (
+            "pyramid_slope",
+            "pyramid_slope_inv",
+            "pyramid_stairs",
+            "pyramid_stairs_inv",
+            "maze",
+        )
+        for idx, phase in enumerate(phases):
+            if not isinstance(phase, dict):
+                continue
+            normalized = {"alpha": float(phase.get("alpha", 0.0 if idx == 0 else 1.0))}
+            if "difficulty_range" in phase and len(phase["difficulty_range"]) >= 2:
+                normalized["difficulty_range"] = [
+                    float(phase["difficulty_range"][0]),
+                    float(phase["difficulty_range"][1]),
+                ]
+            if "max_init_terrain_level" in phase:
+                normalized["max_init_terrain_level"] = int(phase["max_init_terrain_level"])
+            for key in terrain_keys:
+                if key in phase:
+                    normalized[key] = float(phase[key])
+            total = sum(float(normalized.get(key, 0.0)) for key in terrain_keys)
+            if any(key in normalized for key in terrain_keys) and abs(total - 1.0) > 1e-6:
+                self.logger.warning(
+                    f"[FineTuneSchedule] terrain phase idx={idx} proportion sum={total:.6f}, "
+                    "expected 1.0; phase will still be applied for debugging."
+                )
+            out.append(normalized)
+        out.sort(key=lambda item: item.get("alpha", 0.0))
+        return out
+
+    def _terrain_phase_for_alpha(self, alpha):
+        if not self.terrain_phases:
+            self._current_terrain_phase_idx = None
+            return {}
+        selected_idx = 0
+        for idx, phase in enumerate(self.terrain_phases):
+            if alpha + 1.0e-9 >= float(phase.get("alpha", 0.0)):
+                selected_idx = idx
+            else:
+                break
+        self._current_terrain_phase_idx = selected_idx
+        return dict(self.terrain_phases[selected_idx])
+
+    def _interpolate_dict(self, initial, target, alpha):
+        keys = set(initial) | set(target)
+        out = {}
+        for key in keys:
+            start = float(initial.get(key, target.get(key, 0.0)))
+            end = float(target.get(key, start))
+            out[key] = start + (end - start) * alpha
+        return out
+
+    def _interpolate_commands(self, initial, target, alpha):
+        keys = set(initial) | set(target)
+        out = {}
+        for key in keys:
+            start = initial.get(key, target.get(key, [0.0, 0.0]))
+            end = target.get(key, start)
+            out[key] = [
+                float(start[0]) + (float(end[0]) - float(start[0])) * alpha,
+                float(start[1]) + (float(end[1]) - float(start[1])) * alpha,
+            ]
+        return out
+
+    def _log_reward_registration(self, usr_conf):
+        rewards = usr_conf.get("rewards", {})
+        for name in (
+            "track_lin_vel_xy",
+            "track_ang_vel_z",
+            "height_scan_feet_clearance",
+            "height_scan_wall_reject",
+            "stair_relax_ang_vel_xy",
+            "stair_relax_base_height",
+            "stair_relax_joint_position",
+            "feet_air_time",
+            "air_time_variance_penalty",
+            "base_lateral_vel",
+            "pivot_turning",
+        ):
+            if name in rewards:
+                self.logger.warning(
+                    f"[RewardDebug] {name} configured weight={rewards[name].get('weight')} "
+                    f"params={rewards[name].get('params', {})}"
+                )
+            else:
+                self.logger.warning(
+                    f"[RewardDebug] {name} not configured in TOML; no reward will be computed."
+                )
 
 
 def _initialize_training_state(env, agent, logger):
@@ -576,7 +863,6 @@ def _initialize_training_state(env, agent, logger):
     obs = torch.clone(obs)
     critic_obs = torch.clone(critic_obs)
     logger.info(f"obs.shape:{obs.shape}, critic_obs.shape:{critic_obs.shape}")
-    _log_runtime_terrain_state(env, logger, "initial_reset")
 
     # Load reward keys from monitor config
     # 从 monitor 配置加载 reward_keys
@@ -632,12 +918,24 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     # 地形难度由 TOML difficulty_range=[0,1.0] + 10 个课程档位独立限制，
     # 初始放置等级上限为 0；速度范围由 VelocityCurriculum 逐阶扩大。
     vel_curriculum = VelocityCurriculum(logger, usr_conf)
-    training_schedule = TrainingScheduleController(logger, usr_conf)
+    fine_tune_schedule = FineTuneSchedule(logger, usr_conf)
+    if fine_tune_schedule.enabled:
+        data = env.reset(usr_conf)
+        if data is None:
+            logger.error("[FineTuneSchedule] initial env.reset failed after applying initial schedule config!")
+            raise RuntimeError("FineTuneSchedule initial env.reset failed")
+        obs, critic_obs = data
+        if critic_obs is None:
+            critic_obs = obs
+        last_obs, last_critic_obs = torch.clone(obs), torch.clone(critic_obs)
+        cur_reward_sum.zero_()
+        cur_episode_length.zero_()
+        logger.warning("[FineTuneSchedule] initial reward/command config applied by env.reset before rollout.")
 
     # Main Training Loop
     # 主训练循环
     while True:
-        logger.info(f"Episode {episode} start, {_format_training_conf_summary(usr_conf)}")
+        logger.info(f"Episode {episode} start, usr_conf is {usr_conf}")
         start_time = time.time()
 
         # Phase 1: Data Collection
@@ -673,13 +971,10 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             cur_reward_sum.zero_()
             cur_episode_length.zero_()
 
-        # Phase 1.6: episode-based soft schedules for terrain mix / reward weights.
-        # 阶段1.6：按 episode 线性软切换地形比例与 reward 权重。
-        last_obs, last_critic_obs, schedule_reset = training_schedule.check_and_update(
-            episode, usr_conf, env, last_obs, last_critic_obs
+        last_obs, last_critic_obs, schedule_reset = fine_tune_schedule.check_and_update(
+            usr_conf, env, last_obs, last_critic_obs, episode
         )
         if schedule_reset:
-            vel_curriculum.refresh_tracking_reward_weight(usr_conf)
             cur_reward_sum.zero_()
             cur_episode_length.zero_()
 
@@ -703,6 +998,10 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                                 vel_stage=vel_curriculum.stage,
                                 vel_tracking_ratio=vel_curriculum.last_tracking_ratio,
                                 vel_tracking_reward=vel_curriculum.last_tracking_reward,
+                                schedule_stats={
+                                    **fine_tune_schedule.monitor_stats(),
+                                    **vel_curriculum.monitor_stats(),
+                                },
                                 lenbuffer=lenbuffer, rewbuffer=rewbuffer)
             last_report_monitor_time = now
 
@@ -756,51 +1055,10 @@ def _collect_episode_metrics(ep_infos, reward_keys, device):
     return _aggregate_metrics(generic_metrics)
 
 
-def _format_training_conf_summary(usr_conf):
-    terrain = usr_conf.get("terrain", {})
-    standard = terrain.get("standard", {})
-    terrain_keys = (
-        "pyramid_slope",
-        "pyramid_slope_inv",
-        "pyramid_stairs",
-        "pyramid_stairs_inv",
-        "maze",
-    )
-    terrain_summary = {
-        key: round(float(standard.get(key, {}).get("proportion", 0.0)), 4)
-        for key in terrain_keys
-        if key in standard
-    }
-
-    rewards = usr_conf.get("rewards", {})
-    reward_keys = (
-        "track_lin_vel_xy",
-        "track_ang_vel_z",
-        "forward_velocity",
-        "obstacle_evasion",
-        "undesired_contacts",
-        "feet_stumble",
-    )
-    reward_summary = {
-        key: round(float(rewards.get(key, {}).get("weight", 0.0)), 6)
-        for key in reward_keys
-        if key in rewards
-    }
-
-    ranges = usr_conf.get("commands", {}).get("ranges", {})
-    return (
-        f"terrain_mode={terrain.get('mode')}, terrain={terrain_summary}, "
-        f"commands={ranges}, scheduled_rewards={reward_summary}"
-    )
-
-
-def _log_runtime_terrain_state(env, logger, context: str):
-    """Disabled: terrain inspection belongs in worker-side reward code."""
-    return
-
 def report_monitor_data(ep_infos, reward_keys, agent, monitor, episode, storage_stats=None,
                         vel_stage: int = 0, vel_tracking_ratio: float = 0.0,
-                        vel_tracking_reward: float = 0.0, lenbuffer=None, rewbuffer=None):
+                        vel_tracking_reward: float = 0.0, schedule_stats=None,
+                        lenbuffer=None, rewbuffer=None):
     """
     Report monitoring data to monitor system.
     上报监控数据到监控系统。
@@ -816,6 +1074,8 @@ def report_monitor_data(ep_infos, reward_keys, agent, monitor, episode, storage_
     # 将所有 storage_stats 合并写入，包含 reward 统计和物理量观测 obs_ 键。
     if storage_stats:
         monitor_data.update(storage_stats)
+    if schedule_stats:
+        monitor_data.update(schedule_stats)
 
     # Episode health metrics: episode length and cumulative reward per episode.
     # 训练进展指标：episode 存活步数和每 episode 累计奖励（与权重无关）。
@@ -841,13 +1101,28 @@ def report_monitor_data(ep_infos, reward_keys, agent, monitor, episode, storage_
 
     logger = getattr(agent, "logger", None)
     if logger is not None:
-        logger.info(
+        logger.warning(
             "[MonitorDebug] reporting curriculum metrics: "
             f"episode={episode}, stage={monitor_data.get('vel_curriculum_stage')}, "
             f"tracking_ratio={monitor_data.get('vel_curriculum_tracking_ratio')}, "
             f"tracking_reward={monitor_data.get('vel_curriculum_tracking_reward')}, "
             f"has_obs_lin_vel_x_error={'obs_lin_vel_x_error' in monitor_data}, "
             f"has_obs_base_height={'obs_base_height' in monitor_data}"
+        )
+        logger.warning(
+            "[LongTrainGate] "
+            f"episode={episode}, "
+            f"up={monitor_data.get('hs_up_ratio', 0.0):.4f}, "
+            f"down={monitor_data.get('hs_down_ratio', 0.0):.4f}, "
+            f"wall={monitor_data.get('hs_wall_ratio', 0.0):.4f}, "
+            f"flat={monitor_data.get('hs_flat_ratio', 0.0):.4f}, "
+            f"step_score={monitor_data.get('hs_step_score', 0.0):.4f}, "
+            f"wall_score={monitor_data.get('hs_wall_score', 0.0):.4f}, "
+            f"clear_active={monitor_data.get('hs_clear_active', 0.0):.4f}, "
+            f"wall_active={monitor_data.get('hs_wall_active', 0.0):.4f}, "
+            f"relax_ang_active={monitor_data.get('relax_ang_active', 0.0):.4f}, "
+            f"relax_height_active={monitor_data.get('relax_height_active', 0.0):.4f}, "
+            f"relax_joint_active={monitor_data.get('relax_joint_active', 0.0):.4f}"
         )
 
     monitor.put_data({os.getpid(): monitor_data})
@@ -937,9 +1212,6 @@ def _update_episode_statistics(
     rewbuffer,
     lenbuffer,
     ep_infos,
-    env=None,
-    logger=None,
-    usr_conf=None,
 ):
     """Update episode statistics and buffers.
 
@@ -952,89 +1224,11 @@ def _update_episode_statistics(
     cur_episode_length += 1
 
     new_ids = (dones > 0).nonzero(as_tuple=False)
-    _log_track_episode_diagnostics(new_ids, infos, cur_reward_sum, cur_episode_length, env, logger, usr_conf)
     rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
     lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
 
     cur_reward_sum[new_ids] = 0
     cur_episode_length[new_ids] = 0
-
-
-def _log_track_episode_diagnostics(new_ids, infos, cur_reward_sum, cur_episode_length, env, logger, usr_conf):
-    if logger is None or new_ids.numel() == 0:
-        return
-    if not isinstance(usr_conf, dict) or usr_conf.get("terrain", {}).get("mode") != "track":
-        return
-
-    isaac_env = _get_isaac_env(env)
-    if isaac_env is None or not hasattr(isaac_env, "goal_positions") or isaac_env.goal_positions is None:
-        return
-
-    asset = _get_robot_asset_from_env(isaac_env)
-    if asset is None:
-        return
-
-    env_ids = new_ids[:, 0].detach().to(device=cur_reward_sum.device, dtype=torch.long)
-    root_xy = asset.data.root_pos_w[:, :2].detach().to(cur_reward_sum.device)
-    goal_xy = isaac_env.goal_positions[:, :2].detach().to(cur_reward_sum.device)
-    final_goal_dist = torch.linalg.norm(goal_xy[env_ids] - root_xy[env_ids], dim=1)
-
-    episode_info = infos.get("episode") if isinstance(infos, dict) else {}
-    progress = _episode_metric_for_ids(episode_info, "reward_goal_progress", env_ids, cur_reward_sum.device)
-    reach_goal = _episode_metric_for_ids(episode_info, "reward_reach_goal", env_ids, cur_reward_sum.device)
-    reason_text = _done_reason_text(infos, env_ids, cur_reward_sum.device)
-
-    logger.info(
-        "[TrackDiag] "
-        f"done_envs={int(env_ids.numel())}, "
-        f"final_goal_dist_mean={float(final_goal_dist.mean().item()):.3f}, "
-        f"final_goal_dist_min={float(final_goal_dist.min().item()):.3f}, "
-        f"reward_goal_progress_mean={_mean_or_zero(progress):.5f}, "
-        f"reward_reach_goal_mean={_mean_or_zero(reach_goal):.5f}, "
-        f"done_reason={reason_text}"
-    )
-
-
-def _episode_metric_for_ids(episode_info, key, env_ids, device):
-    if not isinstance(episode_info, dict) or key not in episode_info:
-        return None
-    value = episode_info[key]
-    if not isinstance(value, torch.Tensor):
-        value = torch.tensor(value, device=device)
-    value = value.detach().to(device=device, dtype=torch.float32).reshape(-1)
-    if value.numel() == 1:
-        return value
-    if value.numel() == env_ids.numel():
-        return value
-    return value[env_ids]
-
-
-def _mean_or_zero(value):
-    if value is None:
-        return 0.0
-    return float(value.mean().item())
-
-
-def _done_reason_text(infos, env_ids, device):
-    if not isinstance(infos, dict):
-        return "unknown"
-    parts = []
-    for key in ("time_outs", "terminated", "truncated"):
-        value = infos.get(key)
-        if value is None:
-            continue
-        if not isinstance(value, torch.Tensor):
-            value = torch.tensor(value, device=device)
-        value = value.detach().to(device=device).reshape(-1)
-        if value.numel() == 1:
-            count = int((value > 0).sum().item())
-        elif value.numel() == env_ids.numel():
-            count = int((value > 0).sum().item())
-        else:
-            count = int((value[env_ids] > 0).sum().item())
-        if count > 0:
-            parts.append(f"{key}:{count}")
-    return ",".join(parts) or "unknown"
 
 
 def _compute_advantages_and_returns(storage, agent, critic_obs, logger):
@@ -1077,7 +1271,7 @@ def _sample_rollout_tracking_stats(storage, usr_conf, logger=None):
         weight = 1.0
     if std <= 1e-6:
         if logger is not None:
-            logger.info(
+            logger.warning(
                 "[VelocityCurriculumDebug] invalid track_lin_vel_xy std in TOML; "
                 f"std={std}, falling back to 0.25"
             )
@@ -1104,6 +1298,10 @@ def _get_isaac_env(env):
     or None if none is found.
     返回第一个带有 command_manager 属性的对象，找不到则返回 None。
     """
+    direct = _get_robot_gym_unwrapped(env)
+    if direct is not None:
+        return direct
+
     # Walk common wrapper chains recursively instead of assuming one fixed depth.
     # 递归遍历常见 wrapper 链，避免假设包装层只有固定一层。
     seen_ids = set()
@@ -1116,21 +1314,88 @@ def _get_isaac_env(env):
         if hasattr(candidate, "command_manager") and hasattr(candidate, "scene"):
             return candidate
         for attr_name in (
+            "env_object",
+            "_env_object",
             "env",
             "_env",
+            "gym_env",
+            "_gym_env",
+            "envs",
+            "_envs",
             "unwrapped",
             "wrapped_env",
             "_wrapped_env",
             "venv",
+            "_venv",
             "isaac_env",
             "_isaac_env",
             "sim_env",
             "_sim_env",
+            "base_env",
+            "_base_env",
+            "robot_env",
+            "_robot_env",
+            "rl_env",
+            "_rl_env",
+            "gym",
+            "_gym",
             "task",
             "_task",
         ):
-            pending.append(getattr(candidate, attr_name, None))
+            try:
+                child = getattr(candidate, attr_name, None)
+            except Exception:
+                child = None
+            if child is not None:
+                pending.append(child)
+        if hasattr(candidate, "__dict__"):
+            try:
+                for key, child in vars(candidate).items():
+                    if key.startswith("__"):
+                        continue
+                    if key in ("command_manager", "scene"):
+                        continue
+                    if child is not None and not isinstance(child, (str, bytes, int, float, bool, tuple, list, dict)):
+                        pending.append(child)
+            except Exception:
+                pass
     return None
+
+
+def _get_robot_gym_unwrapped(env):
+    """Fast path for tools.base_env.base_env.Robot: env._gym_env.unwrapped."""
+    try:
+        gym_env = getattr(env, "_gym_env", None)
+        unwrapped = getattr(gym_env, "unwrapped", None) if gym_env is not None else None
+        if unwrapped is not None and hasattr(unwrapped, "command_manager") and hasattr(unwrapped, "scene"):
+            return unwrapped
+    except Exception:
+        return None
+    return None
+
+
+def _describe_env_unwrap_candidates(env, max_items: int = 16) -> str:
+    parts = []
+    seen_ids = set()
+    pending = [("root", env)]
+    while pending and len(parts) < max_items:
+        path, candidate = pending.pop(0)
+        if candidate is None or id(candidate) in seen_ids:
+            continue
+        seen_ids.add(id(candidate))
+        try:
+            keys = list(vars(candidate).keys())[:12] if hasattr(candidate, "__dict__") else []
+        except Exception:
+            keys = []
+        parts.append(f"{path}:{type(candidate).__module__}.{type(candidate).__name__} keys={keys}")
+        for attr_name in ("env_object", "_env_object", "_gym_env", "env", "_env", "unwrapped", "venv", "_venv"):
+            try:
+                child = getattr(candidate, attr_name, None)
+            except Exception:
+                child = None
+            if child is not None:
+                pending.append((f"{path}.{attr_name}", child))
+    return " | ".join(parts)
 
 
 def _has_robot_state(asset) -> bool:
@@ -1250,9 +1515,10 @@ def _sample_physics_stats(env, logger=None, critic_obs=None):
         if isaac_env is None:
             if logger is not None and not getattr(env, "_physics_stats_error_logged", False):
                 env._physics_stats_error_logged = True
-                logger.info(
+                logger.warning(
                     "[PhysicsStats] Failed to unwrap Isaac Lab env; "
-                    "falling back to critic_obs for partial physics metrics."
+                    "falling back to critic_obs for partial physics metrics. "
+                    f"candidates={_describe_env_unwrap_candidates(env, max_items=8)}"
                 )
             return _sample_physics_stats_from_critic_obs(critic_obs)
 
@@ -1261,7 +1527,7 @@ def _sample_physics_stats(env, logger=None, critic_obs=None):
         if asset is None:
             if logger is not None and not getattr(env, "_physics_stats_error_logged", False):
                 env._physics_stats_error_logged = True
-                logger.info(
+                logger.warning(
                     "[PhysicsStats] Failed to locate robot asset in scene; "
                     "falling back to critic_obs for partial physics metrics."
                 )
@@ -1283,37 +1549,11 @@ def _sample_physics_stats(env, logger=None, critic_obs=None):
     except Exception as exc:
         if logger is not None and not getattr(env, "_physics_stats_error_logged", False):
             env._physics_stats_error_logged = True
-            logger.info(
+            logger.warning(
                 f"[PhysicsStats] Failed to sample physics metrics from Isaac env: {exc}; "
                 "falling back to critic_obs for partial physics metrics."
             )
         return _sample_physics_stats_from_critic_obs(critic_obs)
-
-
-def _sample_track_goal_stats(env, usr_conf, logger=None):
-    if not isinstance(usr_conf, dict) or usr_conf.get("terrain", {}).get("mode") != "track":
-        return {}
-    try:
-        isaac_env = _get_isaac_env(env)
-        if isaac_env is None or not hasattr(isaac_env, "goal_positions") or isaac_env.goal_positions is None:
-            return {}
-        asset = _get_robot_asset_from_env(isaac_env)
-        if asset is None:
-            return {}
-        goal_dist = torch.linalg.norm(
-            isaac_env.goal_positions[:, :2].to(asset.data.root_pos_w.device) - asset.data.root_pos_w[:, :2],
-            dim=1,
-        )
-        return {
-            "track_goal_dist_mean": goal_dist.mean().item(),
-            "track_goal_dist_min": goal_dist.min().item(),
-            "track_goal_dist_p25": torch.quantile(goal_dist, 0.25).item(),
-        }
-    except Exception as exc:
-        if logger is not None and not getattr(env, "_track_goal_stats_error_logged", False):
-            env._track_goal_stats_error_logged = True
-            logger.info(f"[TrackStats] Failed to sample Track goal metrics: {exc}")
-        return {}
 
 
 def run_episodes_(
@@ -1392,9 +1632,6 @@ def run_episodes_(
                 rewbuffer,
                 lenbuffer,
                 ep_infos,
-                env=env,
-                logger=logger,
-                usr_conf=usr_conf,
             )
 
             # Write transition to storage every step (flat PPO)
@@ -1432,6 +1669,106 @@ def run_episodes_(
     # 追加物理量快照（跨所有并行环境取均值）。
     # _sample_physics_stats 内部已有 try/except，调用总是安全的。
     storage_stats.update(_sample_physics_stats(env, logger, critic_obs=critic_obs))
-    storage_stats.update(_sample_track_goal_stats(env, usr_conf, logger))
+    storage_stats.update(_sample_stair_gate_debug_stats(env))
 
     return last_obs, critic_obs, storage_stats
+
+
+def _sample_stair_gate_debug_stats(env):
+    stats = {}
+    try:
+        for source in _iter_stair_gate_debug_sources(env):
+            if not isinstance(source, dict):
+                continue
+            for key, value in source.items():
+                try:
+                    stats[key] = float(value)
+                except (TypeError, ValueError):
+                    pass
+    except Exception:
+        return stats
+
+    # Stable short aliases for monitor panels. Keep the raw keys too.
+    aliases = {
+        "hs_up_ratio": "height_scan_up_step_mean",
+        "hs_down_ratio": "height_scan_down_step_mean",
+        "hs_wall_ratio": "height_scan_wall_mean",
+        "hs_flat_ratio": "height_scan_flat_mean",
+        "hs_step_delta": "height_scan_step_delta_mean",
+        "hs_step_score": "height_scan_step_score_mean",
+        "hs_wall_score": "height_scan_wall_score_mean",
+        "hs_clear_active": "height_scan_feet_clearance_active_ratio",
+        "hs_wall_active": "height_scan_wall_reject_active_ratio",
+        "relax_ang_active": "stair_relax_ang_vel_xy_active_ratio",
+        "relax_height_active": "stair_relax_base_height_active_ratio",
+        "relax_joint_active": "stair_relax_joint_position_active_ratio",
+        "relax_ang_value": "stair_relax_ang_vel_xy_reward_mean",
+        "relax_height_value": "stair_relax_base_height_reward_mean",
+        "relax_joint_value": "stair_relax_joint_position_reward_mean",
+    }
+    for alias, source_key in aliases.items():
+        stats[alias] = float(stats.get(source_key, 0.0))
+    step_active = max(float(stats.get("hs_up_ratio", 0.0)), float(stats.get("hs_down_ratio", 0.0)))
+    for alias in ("relax_ang_active", "relax_height_active", "relax_joint_active"):
+        if alias not in stats or stats[alias] == 0.0:
+            stats[alias] = step_active
+    return stats
+
+
+def _iter_stair_gate_debug_sources(env, max_items: int = 64):
+    """Yield every discovered _stair_gate_debug dict in wrapper/object chains."""
+    seen_ids = set()
+    pending = [env]
+    attr_names = (
+        "env_object",
+        "_env_object",
+        "env",
+        "_env",
+        "gym_env",
+        "_gym_env",
+        "envs",
+        "_envs",
+        "unwrapped",
+        "wrapped_env",
+        "_wrapped_env",
+        "venv",
+        "_venv",
+        "isaac_env",
+        "_isaac_env",
+        "sim_env",
+        "_sim_env",
+        "base_env",
+        "_base_env",
+        "robot_env",
+        "_robot_env",
+        "rl_env",
+        "_rl_env",
+        "gym",
+        "_gym",
+        "task",
+        "_task",
+    )
+    while pending and len(seen_ids) < max_items:
+        candidate = pending.pop(0)
+        if candidate is None or id(candidate) in seen_ids:
+            continue
+        seen_ids.add(id(candidate))
+        source = getattr(candidate, "_stair_gate_debug", None)
+        if isinstance(source, dict):
+            yield source
+        for attr_name in attr_names:
+            try:
+                child = getattr(candidate, attr_name, None)
+            except Exception:
+                child = None
+            if child is not None:
+                pending.append(child)
+        if hasattr(candidate, "__dict__"):
+            try:
+                for key, child in vars(candidate).items():
+                    if key.startswith("__"):
+                        continue
+                    if child is not None and not isinstance(child, (str, bytes, int, float, bool, tuple, list, dict)):
+                        pending.append(child)
+            except Exception:
+                pass

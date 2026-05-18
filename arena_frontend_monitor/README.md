@@ -33,6 +33,8 @@ build a TensorBoard-like workflow from frontend-visible data:
 
 - `frontend_monitor.py`: collector + HTML renderer + local server
 - `network_export.py`: structured exporter for `GetTrainLog` and `GetTrainMetricRange`
+- `collect_monitor_overview.py`: one-shot collector for lazy-loaded monitor
+  overview groups plus important training logs
 
 Runtime output is written to:
 
@@ -78,6 +80,142 @@ Key outputs:
 - `requests/*.request.json`
 - `requests/*.response.json`
 - `requests/*.meta.json`
+
+Collect lazy-loaded monitor overview groups and important training logs in one
+shot:
+
+```bash
+AGENT_BROWSER_SESSION=tencent-arena \
+AGENT_BROWSER_SESSION_NAME=tencent-arena \
+python3 arena_frontend_monitor/collect_monitor_overview.py
+```
+
+For a quick targeted probe, limit the scan to one or more group names:
+
+```bash
+AGENT_BROWSER_SESSION=tencent-arena \
+AGENT_BROWSER_SESSION_NAME=tencent-arena \
+python3 arena_frontend_monitor/collect_monitor_overview.py \
+  --group "地形-斜坡" \
+  --group "训练进展"
+```
+
+Recommended wrapper:
+
+```bash
+arena_frontend_monitor/collect_monitor.sh
+arena_frontend_monitor/collect_monitor.sh --group "步态质量" --group "地形高度剖面"
+```
+
+By default, the wrapper does not pass a monitor URL. It requires the currently
+active tab to already be the intended Tencent Arena monitor page. This avoids
+accidentally switching away from the task that the operator has selected.
+
+If the active tab is not a monitor page, the script stops with an error instead
+of guessing which open monitor tab is correct. For legacy behavior, pass
+`--allow-monitor-tab-fallback` to allow switching to another already open
+monitor tab.
+
+Only set an explicit target page when you intentionally want to switch tasks:
+
+```bash
+MONITOR_URL="<monitor-url>" arena_frontend_monitor/collect_monitor.sh
+```
+
+This collector:
+
+- reuses the existing monitor tab; it does not open a new health or IDE tab
+- applies CSS page zoom by default (`--page-zoom 0.75`) so more monitor cards
+  are exposed per viewport; pass `--page-zoom 0` only for debugging
+- switches to `监控总览`
+- enables `每 5 秒自动刷新`
+- uses Python sleeps instead of `agent-browser wait`, because short
+  `agent-browser wait` calls have been observed to hang the shared browser
+  session
+- reads the task status near the top of the page before capture; by default
+  `进行中` uses running timestamp freshness, while completed/stopped/failed
+  tasks use historical timestamp comparison
+- collapses all overview groups with DOM `aria-expanded=true` clicks and a
+  top-to-bottom scan; a single current-viewport snapshot is not enough on this
+  page
+- expands each group one by one
+- drags the page's right-side scrollbar downward after expanding each group;
+  this is necessary because `agent-browser scroll` and mouse wheel may not move
+  Tencent Arena's monitor panel, while dragging the scrollbar has been verified
+  by screenshot to reveal lower cards such as `斜坡-能耗分数` and `斜坡-步数`
+- checks filtered `GetTrainMetricRange` responses after each drag until the
+  effective card count reaches the number shown next to the group name
+- keeps scrolling a group until it is covered, or until the scroll container
+  reaches the bottom and no new metric cards appear for
+  `--no-new-data-patience` rounds
+- only waits for an extra fresh auto-refresh batch when `--confirm-refresh` is
+  passed; normal collection moves on after coverage and timestamp checks pass
+- reads each request with `agent-browser network request <id> --json`, because
+  HAR files can expose request metadata while omitting response text
+- switches to `训练日志`, reads `GetTrainLog`, and filters important entries by
+  keywords such as `ERROR`, `WARNING`, `MonitorDebug`,
+  `VelocityCurriculumDebug`, `EnvMonitor`, `Episode`, `terrain`, `reward`,
+  `tracking`, and `curriculum`
+
+Output is written under:
+
+```text
+arena_frontend_monitor_runtime/overview_capture/sessions/<timestamp>/
+```
+
+Key files:
+
+- `summary.json`: group-level coverage, important log count, and errors
+- `groups/*.json`: per-group metric requests, query names, and latest values
+- `training_logs.json`: parsed training logs plus important filtered entries
+- `capture.json`: full raw capture bundle
+
+Some cards legitimately stay at `暂无数据`; the script records the captured query
+coverage and continues. A group number such as `地形-斜坡( 8 )` is the number of
+cards, not necessarily the number of returned query series. Terrain cards often
+expand into l0-l9 query names.
+
+For each overview group, prefer `data_status` and `exact_coverage_ok` in
+`summary.json` or the group JSON:
+
+- `data_status=ok`: the group was covered and has fresh data
+- `data_status=empty`: the group was covered but every response had no points;
+  this is expected for configured-but-not-reported metric groups such as
+  `地形高度剖面`
+- `data_status=stale`: the group was covered but latest timestamps are older
+  than `--running-timestamp-max-age-ms`
+- `data_status=incomplete`: the visible cards or effective metric card count
+  did not reach the number next to the group name
+- `data_status=polluted`: more effective metric cards were captured than the
+  group declares, usually because adjacent lazy-loaded charts entered view
+
+The script records both `request_signature_count` and `effective_card_count`.
+Most groups use unique request signatures, but some groups have multiple curves
+inside one request; for example `Reward指标(4)` can be covered by two request
+signatures containing four returned result curves. Some groups are filtered by
+query allowlists derived from `agent_ppo/conf/monitor_builder.py` to avoid
+counting adjacent-group requests as current-group data.
+
+The group JSON also includes `view_refs`, `trigger_trace`,
+`filtered_out_request_signatures`, and `missing_allowlist_signatures`. If
+`data_status=incomplete`, increase `--max-scrollbar-drags-per-group`, adjust
+`--scrollbar-x`, or increase `--drag-wait-ms`. If `data_status=polluted`, lower
+`--small-group-scrollbar-drag-dy` or add/refine the group's query allowlist.
+
+After capture, the script returns to `监控总览` and performs a final collapse by
+default. If a run is interrupted externally, check for leftover processes:
+
+```bash
+ps -axo pid,etime,command | rg 'collect_monitor_overview.py|agent-browser mouse|agent-browser wait' | rg -v rg
+```
+
+By default `--task-state-mode auto` reads the page status before capture.
+Detected `进行中` tasks validate latest metric timestamps against wall-clock
+time and report `timestamp_ok`. Completed, stopped, failed, or otherwise
+non-running tasks are treated as historical records, so the script checks
+whether captured group timestamps are close to one another instead of expecting
+current wall-clock freshness. Use `--task-state-mode running` or
+`--task-state-mode history` to override detection.
 
 Recommended explicit capture command:
 

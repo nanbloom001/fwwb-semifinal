@@ -104,6 +104,149 @@ def build_monitor():
             .add_metric(metrics_name="vel_curriculum_stage",
                         expr="avg(vel_curriculum_stage{})")
             .end_panel()
+        .add_panel(name="线性调度进度", name_en="scheduled_alpha", type="line")
+            .add_metric(metrics_name="scheduled_alpha",
+                        expr="avg(scheduled_alpha{})")
+            .end_panel()
+        .add_panel(name="调度已运行秒数", name_en="scheduled_elapsed_seconds", type="line")
+            .add_metric(metrics_name="scheduled_elapsed_seconds",
+                        expr="avg(scheduled_elapsed_seconds{})")
+            .end_panel()
+        .add_panel(name="侧向指令上限", name_en="scheduled_cmd_vy_abs_max", type="line")
+            .add_metric(metrics_name="scheduled_cmd_vy_abs_max",
+                        expr="avg(scheduled_cmd_vy_abs_max{})")
+            .end_panel()
+        .add_panel(name="偏航指令上限", name_en="scheduled_cmd_wz_abs_max", type="line")
+            .add_metric(metrics_name="scheduled_cmd_wz_abs_max",
+                        expr="avg(scheduled_cmd_wz_abs_max{})")
+            .end_panel()
+        .add_panel(name="实际侧向指令上限", name_en="vel_cmd_vy_abs_max", type="line")
+            .add_metric(metrics_name="vel_cmd_vy_abs_max",
+                        expr="avg(vel_cmd_vy_abs_max{})")
+            .end_panel()
+        .add_panel(name="实际偏航指令上限", name_en="vel_cmd_wz_abs_max", type="line")
+            .add_metric(metrics_name="vel_cmd_wz_abs_max",
+                        expr="avg(vel_cmd_wz_abs_max{})")
+            .end_panel()
+        .add_panel(name="线速度跟踪调度权重", name_en="sched_track_lin_w", type="line")
+            .add_metric(metrics_name="sched_track_lin_w",
+                        expr="avg(sched_track_lin_w{})")
+            .end_panel()
+        .add_panel(name="偏航跟踪调度权重", name_en="sched_track_yaw_w", type="line")
+            .add_metric(metrics_name="sched_track_yaw_w",
+                        expr="avg(sched_track_yaw_w{})")
+            .end_panel()
+        .add_panel(name="高度计抬脚权重", name_en="sched_hs_clear_w", type="line")
+            .add_metric(metrics_name="sched_hs_clear_w",
+                        expr="avg(sched_hs_clear_w{})")
+            .end_panel()
+        .add_panel(name="高度计墙体惩罚权重", name_en="sched_hs_wall_w", type="line")
+            .add_metric(metrics_name="sched_hs_wall_w",
+                        expr="avg(sched_hs_wall_w{})")
+            .end_panel()
+        .add_panel(name="台阶角速度放松权重", name_en="sched_relax_ang_w", type="line")
+            .add_metric(metrics_name="sched_relax_ang_w",
+                        expr="avg(sched_relax_ang_w{})")
+            .end_panel()
+        .add_panel(name="台阶高度放松权重", name_en="sched_relax_height_w", type="line")
+            .add_metric(metrics_name="sched_relax_height_w",
+                        expr="avg(sched_relax_height_w{})")
+            .end_panel()
+        .add_panel(name="台阶关节放松权重", name_en="sched_relax_joint_w", type="line")
+            .add_metric(metrics_name="sched_relax_joint_w",
+                        expr="avg(sched_relax_joint_w{})")
+            .end_panel()
+        .add_panel(name="原地转向惩罚权重", name_en="sched_pivot_w", type="line")
+            .add_metric(metrics_name="sched_pivot_w",
+                        expr="avg(sched_pivot_w{})")
+            .end_panel()
+        .add_panel(name="地形调度阶段", name_en="scheduled_terrain_phase", type="line")
+            .add_metric(metrics_name="scheduled_terrain_phase",
+                        expr="avg(scheduled_terrain_phase{})")
+            .end_panel()
+        .add_panel(name="长训上台阶门控", name_en="hs_up_ratio", type="line")
+            .add_metric(metrics_name="hs_up_ratio",
+                        expr="avg(hs_up_ratio{})")
+            .end_panel()
+        .add_panel(name="长训下台阶门控", name_en="hs_down_ratio", type="line")
+            .add_metric(metrics_name="hs_down_ratio",
+                        expr="avg(hs_down_ratio{})")
+            .end_panel()
+        .add_panel(name="长训墙体门控", name_en="hs_wall_ratio", type="line")
+            .add_metric(metrics_name="hs_wall_ratio",
+                        expr="avg(hs_wall_ratio{})")
+            .end_panel()
+        .add_panel(name="长训抬脚激活", name_en="hs_clear_active", type="line")
+            .add_metric(metrics_name="hs_clear_active",
+                        expr="avg(hs_clear_active{})")
+            .end_panel()
+        .add_panel(name="长训角速度放松激活", name_en="relax_ang_active", type="line")
+            .add_metric(metrics_name="relax_ang_active",
+                        expr="avg(relax_ang_active{})")
+            .end_panel()
+        .add_panel(name="长训高度放松激活", name_en="relax_height_active", type="line")
+            .add_metric(metrics_name="relax_height_active",
+                        expr="avg(relax_height_active{})")
+            .end_panel()
+        .add_panel(name="长训关节放松激活", name_en="relax_joint_active", type="line")
+            .add_metric(metrics_name="relax_joint_active",
+                        expr="avg(relax_joint_active{})")
+            .end_panel()
+        .end_group()
+
+        # ==============================================================
+        # Group 2b: Height-scan semantic gate validation
+        # Group 2b: 高度计语义门控验证
+        # ==============================================================
+        .add_group(group_name="高度计门控验证", group_name_en="height_scan_gate")
+        .add_panel(name="高度计抬脚奖励", name_en="reward_hs_clearance", type="line")
+            .add_metric(metrics_name="reward_hs_clearance",
+                        expr="avg(reward_height_scan_feet_clearance{})")
+            .end_panel()
+        .add_panel(name="高度计墙体惩罚", name_en="reward_hs_wall_reject", type="line")
+            .add_metric(metrics_name="reward_hs_wall_reject",
+                        expr="avg(reward_height_scan_wall_reject{})")
+            .end_panel()
+        .add_panel(name="台阶角速度放松", name_en="reward_relax_ang", type="line")
+            .add_metric(metrics_name="reward_relax_ang",
+                        expr="avg(relax_ang_value{})")
+            .end_panel()
+        .add_panel(name="台阶高度放松", name_en="reward_relax_height", type="line")
+            .add_metric(metrics_name="reward_relax_height",
+                        expr="avg(relax_height_value{})")
+            .end_panel()
+        .add_panel(name="台阶关节放松", name_en="reward_relax_joint", type="line")
+            .add_metric(metrics_name="reward_relax_joint",
+                        expr="avg(relax_joint_value{})")
+            .end_panel()
+        .add_panel(name="上台阶门控比例", name_en="hs_up_step_ratio", type="line")
+            .add_metric(metrics_name="hs_up_step_ratio",
+                        expr="avg(hs_up_ratio{})")
+            .end_panel()
+        .add_panel(name="下台阶门控比例", name_en="hs_down_step_ratio", type="line")
+            .add_metric(metrics_name="hs_down_step_ratio",
+                        expr="avg(hs_down_ratio{})")
+            .end_panel()
+        .add_panel(name="墙体门控比例", name_en="hs_wall_ratio", type="line")
+            .add_metric(metrics_name="hs_wall_ratio",
+                        expr="avg(hs_wall_ratio{})")
+            .end_panel()
+        .add_panel(name="平地门控比例", name_en="hs_flat_ratio", type="line")
+            .add_metric(metrics_name="hs_flat_ratio",
+                        expr="avg(hs_flat_ratio{})")
+            .end_panel()
+        .add_panel(name="前方高度差", name_en="hs_step_delta", type="line")
+            .add_metric(metrics_name="hs_step_delta",
+                        expr="avg(hs_step_delta{})")
+            .end_panel()
+        .add_panel(name="台阶分数", name_en="hs_step_score", type="line")
+            .add_metric(metrics_name="hs_step_score",
+                        expr="avg(hs_step_score{})")
+            .end_panel()
+        .add_panel(name="墙体分数", name_en="hs_wall_score", type="line")
+            .add_metric(metrics_name="hs_wall_score",
+                        expr="avg(hs_wall_score{})")
+            .end_panel()
         .end_group()
 
         # ==============================================================

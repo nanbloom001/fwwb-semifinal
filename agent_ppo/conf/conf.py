@@ -10,7 +10,10 @@ Author: Tencent AI Arena Authors
 
 import os
 
-import toml
+try:
+    import tomllib as _toml_loader
+except ModuleNotFoundError:
+    import toml as _toml_loader
 
 
 # Valid task types (Isaac Lab native config format)
@@ -40,8 +43,6 @@ class StageConfig:
     num_actions = 12  # Go2 joint action dim / Go2 关节动作维度
     num_proprio_obs = 45  # proprioceptive obs dim / 本体感知观测维度
     num_scan = 256  # 16x16 height-scan dim / 16x16 高度扫描维度
-    num_extra_obs = 0  # optional task-specific features appended to policy obs
-    extra_obs_mode = "none"  # none | maze_scan | track_goal_nav
     num_critic_observations = 316  # proprio(45) + scan(256) + privileged(15)
 
     # --- Model architecture
@@ -104,72 +105,48 @@ class LocomotionConfig(StageConfig):
     task_type = "standard"
 
 
-class StairsConfig(StageConfig):
+class StairConservativeConfig(StageConfig):
     """
-    Stage: stairs — stair-focused Standard training with constrained commands.
-    阶段：stairs —— Standard 楼梯专项训练，限制横移和转向指令。
+    Stage: stair_conservative ? fine-tune stairs while replaying slopes.
+    ???stair_conservative ?? ??????????????????????????
     """
 
-    name = "stairs"
+    name = "stair_conservative"
     task_type = "standard"
+    lr = 1e-4
+    num_learning_epochs = 3
+    num_mini_batches = 4
+    num_steps_per_env = 48
+    model_save_interval = 100
 
 
 class StairInvFineTuneConfig(StageConfig):
     """
-    Stage: stair_inv_finetune — conservative fine-tune for inverse stairs.
-    阶段：stair_inv_finetune —— 反楼梯专项保守微调。
+    Conservative fine-tune for high-level stairs, especially inverse stairs.
+    Keeps the same 301/316 observation dimensions so pretrained Standard models
+    can be loaded without shape mismatch.
     """
 
     name = "stair_inv_finetune"
     task_type = "standard"
-    lr = 1e-4
-    num_learning_epochs = 3
+    lr = 1e-5
+    num_learning_epochs = 2
     num_mini_batches = 4
     num_steps_per_env = 48
-    model_save_interval = 100
+    model_save_interval = 50
 
 
-class StandardReplayConfig(StageConfig):
+class Nan10StairBridgeConfig(StageConfig):
     """
-    Stage: standard_replay — balanced Standard replay after stair specialists.
-    阶段：standard_replay —— 楼梯专项后的四类地形均衡回放。
+    Conservative stair bridge stage starting from the nan10-8750 checkpoint.
+    It keeps the nan10 locomotion behavior as the anchor and only adds mild,
+    command-centric stair acquisition shaping.
     """
 
-    name = "standard_replay"
+    name = "nan10_stair_bridge"
     task_type = "standard"
-
-
-class StandardMazeConfig(StageConfig):
-    """
-    Stage: maze — Standard-mode maze pretraining with compact obstacle features.
-    阶段：maze —— Standard 迷宫预训练，拼接紧凑障碍特征。
-    """
-
-    name = "maze"
-    task_type = "standard"
-    num_extra_obs = 6
-    extra_obs_mode = "maze_scan"
-    num_critic_observations = 322
-    lr = 1e-4
-    num_learning_epochs = 3
-    num_mini_batches = 4
-    num_steps_per_env = 48
-    model_save_interval = 100
-
-
-class TrackNavConfig(StageConfig):
-    """
-    Stage: nav — Track navigation with compact goal and local obstacle observations.
-    阶段：nav —— Track 导航训练，拼接紧凑目标与局部障碍特征。
-    """
-
-    name = "nav"
-    task_type = "track"
-    num_extra_obs = 10
-    extra_obs_mode = "track_goal_nav"
-    num_critic_observations = 326
-    lr = 1e-4
-    num_learning_epochs = 3
+    lr = 1e-5
+    num_learning_epochs = 2
     num_mini_batches = 4
     num_steps_per_env = 48
     model_save_interval = 100
@@ -187,28 +164,9 @@ class Config:
     ``Config.CURRENT.lr``、``Config.CURRENT.num_mini_batches`` 等读取超参数。
     """
 
-    STAGES = {
-        "locomotion": LocomotionConfig,
-        "stairs": StairsConfig,
-        "stair_inv_finetune": StairInvFineTuneConfig,
-        "standard_replay": StandardReplayConfig,
-        "maze": StandardMazeConfig,
-        "nav": TrackNavConfig,
-        "track_nav": TrackNavConfig,
-    }
-
-    # Default stage. Override with FWWB_STAGE at runtime when needed.
-    # 默认阶段。需要时可通过 FWWB_STAGE 在运行时切换。
-    CURRENT = StandardMazeConfig
-
-    @staticmethod
-    def current_stage():
-        stage_name = os.environ.get("FWWB_STAGE", "").strip()
-        if not stage_name:
-            return Config.CURRENT
-        if stage_name not in Config.STAGES:
-            raise ValueError(f"Invalid FWWB_STAGE='{stage_name}'. Available stages: {sorted(Config.STAGES)}")
-        return Config.STAGES[stage_name]
+    # Switch stage by changing CURRENT
+    # 通过修改 CURRENT 切换阶段
+    CURRENT = Nan10StairBridgeConfig
 
     @staticmethod
     def load_conf(logger):
@@ -225,8 +183,7 @@ class Config:
         from common_python.config.config_control import CONFIG
         from kaiwudrl.common.utils.kaiwudrl_define import KaiwuDRLDefine
 
-        requested_stage_name = os.environ.get("FWWB_STAGE", "").strip()
-        stage = Config.current_stage()
+        stage = Config.CURRENT
         task_type = stage.task_type
 
         if task_type not in _VALID_TASKS:
@@ -254,13 +211,6 @@ class Config:
             error_msg = f"usr_conf is None, please check {usr_conf_file}"
             logger.error(error_msg)
             raise Exception(error_msg)
-
-        if is_eval and not requested_stage_name and usr_conf.get("terrain", {}).get("mode") == "track":
-            stage = TrackNavConfig
-            task_type = stage.task_type
-
-        usr_conf.setdefault("env", {})
-        usr_conf["env"]["num_goal_obs"] = getattr(stage, "num_extra_obs", 0)
 
         logger.info(f"Stage: {stage.name}, task_type: {task_type}, model: {stage.model_class}")
 
@@ -318,8 +268,8 @@ def _load_conf(conf_file, logger):
     base_config = {}
     if os.path.exists(base_file):
         try:
-            with open(base_file, "r", encoding="utf-8") as f:
-                base_config = toml.load(f)
+            with open(base_file, "rb") as f:
+                base_config = _toml_loader.load(f)
             logger.info(f"Loaded base config: {base_file}")
         except Exception as e:
             logger.warning(f"Cannot load base config: {base_file}. Error: {e}")
@@ -327,8 +277,8 @@ def _load_conf(conf_file, logger):
     # Load user config
     # 加载用户配置
     try:
-        with open(conf_file, "r", encoding="utf-8") as f:
-            user_config = toml.load(f)
+        with open(conf_file, "rb") as f:
+            user_config = _toml_loader.load(f)
         logger.info(f"Loaded user config: {conf_file}")
     except Exception as e:
         logger.error(f"Cannot load config file: {conf_file}. Error: {e}")

@@ -263,10 +263,10 @@ Recommended flow:
 Default sync command:
 
 ```bash
-bash agent_diy/codex_rpc_bridge/sync_repo_to_container.sh --dry-run
+bash agent_diy/codex_rpc_bridge/sync_repo_to_container.sh --dest /workspace/code --dry-run
 CODEX_RPC_TOKEN="<normal token>" \
 CODEX_RPC_ADMIN_TOKEN="<admin token>" \
-bash agent_diy/codex_rpc_bridge/sync_repo_to_container.sh --apply --py-compile
+bash agent_diy/codex_rpc_bridge/sync_repo_to_container.sh --dest /workspace/code --apply --py-compile
 ```
 
 AI agent operating rule:
@@ -276,6 +276,28 @@ AI agent operating rule:
   editing files directly in the container.
 - Always run `--dry-run` first and inspect the file count/sample list before
   `--apply`.
+- For normal project code sync, always set `--dest /workspace/code`. The RPC
+  bridge root may be `/data/projects/legged_robot_competition_26`, where top-level
+  project directories such as `agent_ppo` or `agent_diy` can be symlinks or
+  platform-mounted entries into `/workspace/code`. Remote apply intentionally
+  refuses to write through symlink directories, producing errors like
+  `refusing to write through symlink directory: agent_ppo/__init__.py`. This is a
+  safety check, not a missing-file problem.
+- The sync package must not include `agent_diy` during normal project-code sync.
+  The container may have `agent_diy` as a symlink/mapped directory, and writing
+  through it can fail. Maintain the local packaging blacklist and remote apply
+  blacklist together so dry-run cannot select paths the container will refuse.
+- Runtime upload archives must not accumulate in the container. The sync script
+  deletes `agent_diy/codex_rpc_bridge_runtime/uploads` after successful apply and
+  uses split retention under `agent_diy/codex_rpc_bridge_runtime/backups`:
+  keep only the newest 1 directory under `backups/sync` for one-click sync
+  backups, and only the newest 3 directories under `backups/rpc` for direct RPC
+  write backups. `codex_file_rpc.log` is capped to 512KB by default. If a sync
+  is interrupted before cleanup, remove stale upload/backup directories before
+  packaging or starting a platform submission.
+- Do not upload repository notes/docs or local metadata as part of routine code
+  sync: `.gitignore`, `AGENTS.md`, `CLAUDE.md`, `CHANGES.md`, and `README.md`
+  are intentionally excluded by the sync script.
 - `--dry-run` is local-only and does not require `agent-browser`, RPC tokens, or
   an active container.
 - `--apply` requires a logged-in Tencent Arena browser context plus
