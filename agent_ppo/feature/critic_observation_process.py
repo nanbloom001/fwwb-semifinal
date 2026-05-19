@@ -17,6 +17,7 @@ critic 观测需保持与 policy 同步的任务信息约定。
 """
 
 from tools.base_env.observation_process import ObservationProcess
+from agent_ppo.feature.command_mix import apply_command_mix_to_observation
 
 
 class CriticObservationProcess(ObservationProcess):
@@ -30,6 +31,13 @@ class CriticObservationProcess(ObservationProcess):
                 f"Critic observation dim mismatch: expected {self._EXPECTED_OBS_DIM}, got {obs.shape[-1]}. "
                 "This usually means height_scan or privileged observation layout changed unexpectedly."
             )
+        obs = apply_command_mix_to_observation(
+            self.env,
+            obs,
+            slice(9, 12),
+            command_name="base_velocity",
+            site="critic_obs",
+        )
         # TODO (track terrain): if the policy observation appends goal features,
         # the critic observation must keep the same task-information convention.
         # TODO (track 地形)：如果 policy 观测追加了 goal 特征，

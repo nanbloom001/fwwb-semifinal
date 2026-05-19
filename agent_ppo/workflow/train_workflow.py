@@ -14,6 +14,7 @@ import time
 from typing import List, Optional, Tuple
 from agent_ppo.conf.conf import Config
 from agent_ppo.feature.definition import RolloutStorage
+from agent_ppo.feature.command_mix import apply_command_mix_to_obs_pair
 from tools.utils import load_reward_keys_from_monitor_config
 import torch
 from collections import deque, defaultdict
@@ -100,6 +101,7 @@ class VelocityCurriculum:
         self.promote_count:     int   = int(vc_conf.get("promote_count", 5))
         self.demote_count:      int   = int(vc_conf.get("demote_count",  3))
         self.min_checks_per_stage: int = max(0, int(vc_conf.get("min_checks_per_stage", 0)))
+        self.min_seconds_per_stage: float = max(0.0, float(vc_conf.get("min_seconds_per_stage", 0.0)))
 
         raw_stages = vc_conf.get("stages", None)
         if raw_stages:
@@ -139,12 +141,14 @@ class VelocityCurriculum:
         self._tracking_key_warning_logged = False
         self._debug_check_count = 0
         self._stage_enter_check = 0
+        self._stage_enter_time = time.time()
         logger.info(
             f"[VelocityCurriculum] Initialized: {len(self.STAGES)} stages, "
             f"tracking_weight={self._tracking_reward_weight}, "
             f"promote_threshold={self.promote_threshold}, demote_threshold={self.demote_threshold}, "
             f"promote_count={self.promote_count}, demote_count={self.demote_count}, "
             f"min_checks_per_stage={self.min_checks_per_stage}, "
+            f"min_seconds_per_stage={self.min_seconds_per_stage}, "
             f"commands_owned_by_schedule={self._commands_owned_by_schedule}"
         )
 
@@ -258,6 +262,9 @@ class VelocityCurriculum:
         new_obs, new_critic_obs = data
         if new_critic_obs is None:
             new_critic_obs = new_obs
+        new_obs, new_critic_obs = apply_command_mix_to_obs_pair(
+            env, new_obs, new_critic_obs, usr_conf, site="velocity_reset"
+        )
         return torch.clone(new_obs), torch.clone(new_critic_obs), True
 
     def check_and_update(self, ep_infos, usr_conf, env, obs, critic_obs, rollout_stats=None):
@@ -318,7 +325,11 @@ class VelocityCurriculum:
         old_stage = self._stage_idx
 
         checks_in_stage = self._debug_check_count - self._stage_enter_check
-        stage_age_ready = checks_in_stage >= self.min_checks_per_stage
+        seconds_in_stage = time.time() - self._stage_enter_time
+        stage_age_ready = (
+            checks_in_stage >= self.min_checks_per_stage
+            and seconds_in_stage >= self.min_seconds_per_stage
+        )
 
         if mean_ratio >= self.promote_threshold:
             self._promote_streak += 1
@@ -331,12 +342,14 @@ class VelocityCurriculum:
                 self._stage_idx += 1
                 self._promote_streak = 0
                 self._stage_enter_check = self._debug_check_count
+                self._stage_enter_time = time.time()
                 self.logger.warning(
                     f"[VelocityCurriculum] PROMOTE ↑ stage {self._stage_idx} "
                     f"(tracking_ratio={mean_ratio:.3f} >= {self.promote_threshold:.3f}, "
                     f"tracking_reward={mean_reward:.3f}, "
                     f"for {self.promote_count} consecutive checks, "
-                    f"stage_age={checks_in_stage}/{self.min_checks_per_stage})"
+                    f"stage_age={checks_in_stage}/{self.min_checks_per_stage} checks, "
+                    f"{seconds_in_stage:.1f}/{self.min_seconds_per_stage:.1f}s)"
                 )
                 stage_changed = True
         elif mean_ratio < self.demote_threshold:
@@ -346,6 +359,7 @@ class VelocityCurriculum:
                 self._stage_idx -= 1
                 self._demote_streak = 0
                 self._stage_enter_check = self._debug_check_count
+                self._stage_enter_time = time.time()
                 self.logger.warning(
                     f"[VelocityCurriculum] DEMOTE ↓ stage {self._stage_idx} "
                     f"(tracking_ratio={mean_ratio:.3f} < {self.demote_threshold:.3f}, "
@@ -371,7 +385,8 @@ class VelocityCurriculum:
                 f"@{self.promote_threshold:.3f}, "
                 f"demote={self._demote_streak}/{self.demote_count} "
                 f"@{self.demote_threshold:.3f}, "
-                f"stage_age={checks_in_stage}/{self.min_checks_per_stage}, "
+                f"stage_age={checks_in_stage}/{self.min_checks_per_stage} checks, "
+                f"{seconds_in_stage:.1f}/{self.min_seconds_per_stage:.1f}s, "
                 f"ranges={current_cfg}"
             )
 
@@ -443,11 +458,6 @@ class FineTuneSchedule:
             "sched_track_lin_w": self._reward_weight("track_lin_vel_xy"),
             "sched_track_yaw_w": self._reward_weight("track_ang_vel_z"),
             "sched_hs_clear_w": self._reward_weight("height_scan_feet_clearance"),
-            "sched_hs_wall_w": self._reward_weight("height_scan_wall_reject"),
-            "sched_hs_probe_w": self._reward_weight("height_scan_gate_probe"),
-            "sched_relax_ang_w": self._reward_weight("stair_relax_ang_vel_xy"),
-            "sched_relax_height_w": self._reward_weight("stair_relax_base_height"),
-            "sched_relax_joint_w": self._reward_weight("stair_relax_joint_position"),
             "sched_pivot_w": self._reward_weight("pivot_turning"),
             "sched_flat_orient_w": self._reward_weight("flat_orientation"),
             "sched_base_height_w": self._reward_weight("correct_base_height"),
@@ -491,6 +501,9 @@ class FineTuneSchedule:
             new_obs, new_critic_obs = data
             if new_critic_obs is None:
                 new_critic_obs = new_obs
+            new_obs, new_critic_obs = apply_command_mix_to_obs_pair(
+                env, new_obs, new_critic_obs, usr_conf, site="fine_tune_reset"
+            )
             if should_log:
                 reset_reason = "terrain_phase_changed" if terrain_changed and not needs_reset else "runtime_manager_update_unavailable"
                 self.logger.warning(
@@ -775,11 +788,6 @@ class FineTuneSchedule:
             "track_lin_vel_xy",
             "track_ang_vel_z",
             "height_scan_feet_clearance",
-            "height_scan_wall_reject",
-            "height_scan_gate_probe",
-            "stair_relax_ang_vel_xy",
-            "stair_relax_base_height",
-            "stair_relax_joint_position",
             "feet_air_time",
             "air_time_variance_penalty",
             "base_lateral_vel",
@@ -862,6 +870,7 @@ def _initialize_training_state(env, agent, logger):
     obs, critic_obs = data
     if critic_obs is None:
         critic_obs = obs
+    obs, critic_obs = apply_command_mix_to_obs_pair(env, obs, critic_obs, usr_conf, site="reset")
     obs = torch.clone(obs)
     critic_obs = torch.clone(critic_obs)
     logger.info(f"obs.shape:{obs.shape}, critic_obs.shape:{critic_obs.shape}")
@@ -929,6 +938,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         obs, critic_obs = data
         if critic_obs is None:
             critic_obs = obs
+        obs, critic_obs = apply_command_mix_to_obs_pair(env, obs, critic_obs, usr_conf, site="schedule_reset")
         last_obs, last_critic_obs = torch.clone(obs), torch.clone(critic_obs)
         cur_reward_sum.zero_()
         cur_episode_length.zero_()
@@ -1120,13 +1130,26 @@ def report_monitor_data(ep_infos, reward_keys, agent, monitor, episode, storage_
             f"flat={monitor_data.get('hs_flat_ratio', 0.0):.4f}, "
             f"step_score={monitor_data.get('hs_step_score', 0.0):.4f}, "
             f"wall_score={monitor_data.get('hs_wall_score', 0.0):.4f}, "
-            f"probe_available={monitor_data.get('g_probe_available', 0.0):.4f}, "
-            f"probe_reason={monitor_data.get('g_probe_reason_code', 0.0):.0f}, "
-            f"clear_active={monitor_data.get('hs_clear_active', 0.0):.4f}, "
-            f"wall_active={monitor_data.get('hs_wall_active', 0.0):.4f}, "
-            f"relax_ang_active={monitor_data.get('relax_ang_active', 0.0):.4f}, "
-            f"relax_height_active={monitor_data.get('relax_height_active', 0.0):.4f}, "
-            f"relax_joint_active={monitor_data.get('relax_joint_active', 0.0):.4f}"
+            f"probe_available={monitor_data.get('hs_probe_available', 0.0):.4f}, "
+            f"probe_reason={monitor_data.get('hs_probe_reason_code', 0.0):.0f}, "
+            f"clear_active={monitor_data.get('hs_clear_active', 0.0):.4f}"
+        )
+        logger.warning(
+            "[CommandMixMonitor] "
+            f"episode={episode}, "
+            f"enabled={monitor_data.get('command_mix_enabled', 0.0):.0f}, "
+            f"runtime_seen={monitor_data.get('command_mix_runtime_seen', 0.0):.0f}, "
+            f"reason={_command_mix_reason_name(monitor_data.get('command_mix_reason_code', -1.0))}, "
+            f"target=({monitor_data.get('command_mix_target_spin', 0.0):.3f}, "
+            f"{monitor_data.get('command_mix_target_vx_only', 0.0):.3f}, "
+            f"{monitor_data.get('command_mix_target_vx_vy', 0.0):.3f}, "
+            f"{monitor_data.get('command_mix_target_full', 0.0):.3f}), "
+            f"spin={monitor_data.get('command_mix_spin_ratio', 0.0):.3f}, "
+            f"vx_only={monitor_data.get('command_mix_vx_only_ratio', 0.0):.3f}, "
+            f"vx_vy={monitor_data.get('command_mix_vx_vy_ratio', 0.0):.3f}, "
+            f"full={monitor_data.get('command_mix_full_ratio', 0.0):.3f}, "
+            f"abs_vy={monitor_data.get('command_mix_cmd_vy_abs_mean', 0.0):.3f}, "
+            f"abs_wz={monitor_data.get('command_mix_cmd_wz_abs_mean', 0.0):.3f}"
         )
 
     monitor.put_data({os.getpid(): monitor_data})
@@ -1490,12 +1513,32 @@ def _sample_physics_stats_from_critic_obs(critic_obs):
     actual_vy = critic_obs[:, 1]
     cmd_vx = critic_obs[:, 9]
     cmd_vy = critic_obs[:, 10]
+    cmd_wz = critic_obs[:, 11]
+    eps = 1.0e-4
+    vx_active = torch.abs(cmd_vx) > eps
+    vy_active = torch.abs(cmd_vy) > eps
+    wz_active = torch.abs(cmd_wz) > eps
+    spin_like = (~vx_active) & (~vy_active) & wz_active
+    vx_only_like = vx_active & (~vy_active) & (~wz_active)
+    vx_vy_like = vx_active & vy_active & (~wz_active)
+    full_like = vx_active & vy_active & wz_active
 
     return {
         "obs_lin_vel_x_error": torch.abs(actual_vx - cmd_vx).mean().item(),
         "obs_lin_vel_y_error": torch.abs(actual_vy - cmd_vy).mean().item(),
         "obs_actual_vel_x": actual_vx.mean().item(),
         "obs_ang_vel_xy": torch.norm(critic_obs[:, 3:5], dim=1).mean().item(),
+        "command_mix_enabled": float(
+            (spin_like | vx_only_like | vx_vy_like | full_like).float().mean().item() > 0.0
+        ),
+        "command_mix_spin_ratio": spin_like.float().mean().item(),
+        "command_mix_vx_only_ratio": vx_only_like.float().mean().item(),
+        "command_mix_vx_vy_ratio": vx_vy_like.float().mean().item(),
+        "command_mix_full_ratio": full_like.float().mean().item(),
+        "command_mix_only_vx_like": vx_only_like.float().mean().item(),
+        "command_mix_spin_like": spin_like.float().mean().item(),
+        "command_mix_cmd_vy_abs_mean": torch.abs(cmd_vy).mean().item(),
+        "command_mix_cmd_wz_abs_mean": torch.abs(cmd_wz).mean().item(),
     }
 
 
@@ -1526,6 +1569,7 @@ def _sample_physics_stats(env, logger=None, critic_obs=None):
                 )
             return _sample_physics_stats_from_critic_obs(critic_obs)
 
+        critic_stats = _sample_physics_stats_from_critic_obs(critic_obs)
         cmd = isaac_env.command_manager.get_command("base_velocity")  # (N, 3)
         asset = _get_robot_asset_from_env(isaac_env)
         if asset is None:
@@ -1535,14 +1579,14 @@ def _sample_physics_stats(env, logger=None, critic_obs=None):
                     "[PhysicsStats] Failed to locate robot asset in scene; "
                     "falling back to critic_obs for partial physics metrics."
                 )
-            return _sample_physics_stats_from_critic_obs(critic_obs)
+            return critic_stats
 
         actual_vx = asset.data.root_lin_vel_b[:, 0]
         actual_vy = asset.data.root_lin_vel_b[:, 1]
         cmd_vx    = cmd[:, 0]
         cmd_vy    = cmd[:, 1]
 
-        return {
+        stats = {
             "obs_lin_vel_x_error": torch.abs(actual_vx - cmd_vx).mean().item(),
             "obs_lin_vel_y_error": torch.abs(actual_vy - cmd_vy).mean().item(),
             "obs_actual_vel_x":    actual_vx.mean().item(),
@@ -1550,6 +1594,11 @@ def _sample_physics_stats(env, logger=None, critic_obs=None):
             "obs_ang_vel_xy":      torch.norm(
                 asset.data.root_ang_vel_b[:, :2], dim=1).mean().item(),
         }
+        if critic_stats:
+            base_height = stats.get("obs_base_height")
+            stats.update(critic_stats)
+            stats["obs_base_height"] = base_height
+        return stats
     except Exception as exc:
         if logger is not None and not getattr(env, "_physics_stats_error_logged", False):
             env._physics_stats_error_logged = True
@@ -1624,6 +1673,9 @@ def run_episodes_(
             # Move tensors to device
             # 将张量移动到设备
             obs, critic_obs, rewards, dones = _move_tensors_to_device(obs, critic_obs, rewards, dones, agent.device)
+            obs, critic_obs = apply_command_mix_to_obs_pair(
+                env, obs, critic_obs, usr_conf, site="rollout_step"
+            )
 
             # Update episode statistics (always, regardless of decimation)
             # 更新 episode 统计（始终执行，不受降频影响）
@@ -1673,10 +1725,143 @@ def run_episodes_(
     # 追加物理量快照（跨所有并行环境取均值）。
     # _sample_physics_stats 内部已有 try/except，调用总是安全的。
     storage_stats.update(_sample_physics_stats(env, logger, critic_obs=critic_obs))
+    storage_stats.update(_sample_command_mix_config_stats(usr_conf))
+    storage_stats.update(_sample_command_mix_runtime_stats(env))
     storage_stats.update(_sample_stair_gate_debug_stats(env))
     storage_stats.update(_sample_rollout_height_scan_probe_stats(critic_obs, logger))
 
     return last_obs, critic_obs, storage_stats
+
+
+def _sample_command_mix_config_stats(usr_conf):
+    conf = usr_conf.get("command_mix", {}) if isinstance(usr_conf, dict) else {}
+    if not isinstance(conf, dict):
+        conf = {}
+    enabled = bool(conf.get("enabled", False))
+    return {
+        "command_mix_enabled": 1.0 if enabled else 0.0,
+        "command_mix_target_spin": float(conf.get("spin_only_ratio", 0.0) or 0.0),
+        "command_mix_target_vx_only": float(conf.get("vx_only_ratio", 0.0) or 0.0),
+        "command_mix_target_vx_vy": float(conf.get("vx_vy_only_ratio", 0.0) or 0.0),
+        "command_mix_target_full": float(conf.get("full_ratio", 0.0) or 0.0),
+    }
+
+
+def _sample_command_mix_runtime_stats(env):
+    debug = _find_command_mix_debug(env)
+    if not isinstance(debug, dict):
+        return {
+            "command_mix_runtime_seen": 0.0,
+            "command_mix_reason_code": _command_mix_reason_code("debug_missing"),
+        }
+
+    reason = str(debug.get("reason", "unknown"))
+    return {
+        "command_mix_runtime_seen": 1.0,
+        "command_mix_enabled": float(debug.get("enabled", 0.0) or 0.0),
+        "command_mix_reason_code": _command_mix_reason_code(reason),
+        "command_mix_target_spin": float(debug.get("target_spin_ratio", 0.0) or 0.0),
+        "command_mix_target_vx_only": float(debug.get("target_vx_only_ratio", 0.0) or 0.0),
+        "command_mix_target_vx_vy": float(debug.get("target_vx_vy_ratio", 0.0) or 0.0),
+        "command_mix_target_full": float(debug.get("target_full_ratio", 0.0) or 0.0),
+        "command_mix_spin_ratio": float(debug.get("spin_ratio", 0.0) or 0.0),
+        "command_mix_vx_only_ratio": float(debug.get("vx_only_ratio", 0.0) or 0.0),
+        "command_mix_vx_vy_ratio": float(debug.get("vx_vy_ratio", 0.0) or 0.0),
+        "command_mix_full_ratio": float(debug.get("full_ratio", 0.0) or 0.0),
+        "command_mix_only_vx_like": float(debug.get("vx_only_ratio", 0.0) or 0.0),
+        "command_mix_spin_like": float(debug.get("spin_ratio", 0.0) or 0.0),
+        "command_mix_cmd_vy_abs_mean": float(debug.get("mixed_cmd_vy_abs_mean", 0.0) or 0.0),
+        "command_mix_cmd_wz_abs_mean": float(debug.get("mixed_cmd_wz_abs_mean", 0.0) or 0.0),
+    }
+
+
+def _command_mix_reason_code(reason: str) -> float:
+    mapping = {
+        "ok": 0,
+        "disabled": 1,
+        "invalid_command": 2,
+        "debug_missing": 3,
+        "unknown": 9,
+    }
+    return float(mapping.get(str(reason), 9))
+
+
+def _command_mix_reason_name(code) -> str:
+    try:
+        code_int = int(float(code))
+    except (TypeError, ValueError):
+        code_int = 9
+    mapping = {
+        0: "ok",
+        1: "disabled",
+        2: "invalid_command",
+        3: "debug_missing",
+        9: "unknown",
+    }
+    return mapping.get(code_int, "unknown")
+
+
+def _find_command_mix_debug(env):
+    """Find runtime debug emitted by agent_ppo.feature.command_mix.
+
+    Kaiwu wrappers can hold the observation-process env at a different wrapper
+    level than the workflow env, so scan common child attributes and object
+    fields instead of assuming one fixed owner.
+    """
+    seen_ids = set()
+    pending = [env]
+    while pending:
+        candidate = pending.pop(0)
+        if candidate is None or id(candidate) in seen_ids:
+            continue
+        seen_ids.add(id(candidate))
+
+        try:
+            debug = getattr(candidate, "_command_mix_debug", None)
+        except Exception:
+            debug = None
+        if isinstance(debug, dict):
+            return debug
+
+        for attr_name in (
+            "env_object",
+            "_env_object",
+            "env",
+            "_env",
+            "gym_env",
+            "_gym_env",
+            "envs",
+            "_envs",
+            "unwrapped",
+            "wrapped_env",
+            "_wrapped_env",
+            "venv",
+            "_venv",
+            "isaac_env",
+            "_isaac_env",
+            "sim_env",
+            "_sim_env",
+            "base_env",
+            "_base_env",
+        ):
+            try:
+                child = getattr(candidate, attr_name, None)
+            except Exception:
+                child = None
+            if child is not None:
+                pending.append(child)
+
+        if hasattr(candidate, "__dict__"):
+            try:
+                for key, child in vars(candidate).items():
+                    if key.startswith("__") or child is None:
+                        continue
+                    if isinstance(child, (str, bytes, int, float, bool, tuple, list, dict)):
+                        continue
+                    pending.append(child)
+            except Exception:
+                pass
+    return None
 
 
 def _sample_rollout_height_scan_probe_stats(critic_obs, logger=None):
@@ -1696,15 +1881,15 @@ def _sample_rollout_height_scan_probe_stats(critic_obs, logger=None):
     zero_stats = _empty_height_scan_probe_stats()
     try:
         if critic_obs is None or not isinstance(critic_obs, torch.Tensor):
-            zero_stats["g_probe_reason_code"] = 91.0
+            zero_stats["hs_probe_reason_code"] = 91.0
             return zero_stats
         if critic_obs.dim() != 2 or critic_obs.shape[1] < 316:
-            zero_stats["g_probe_reason_code"] = 92.0
+            zero_stats["hs_probe_reason_code"] = 92.0
             return zero_stats
 
         height_scan = critic_obs[:, 60:316].detach().float()
         if height_scan.shape[1] < 256:
-            zero_stats["g_probe_reason_code"] = 92.0
+            zero_stats["hs_probe_reason_code"] = 92.0
             return zero_stats
 
         # Observation height scan uses distance-to-ground.  Local ground-height
@@ -1713,10 +1898,7 @@ def _sample_rollout_height_scan_probe_stats(critic_obs, logger=None):
         grid = torch.nan_to_num(grid, nan=0.0, posinf=0.0, neginf=0.0)
 
         threshold_sets = {
-            "loose": (0.010, 0.280, 0.320, 0.002, 0.250),
-            "mild": (0.015, 0.260, 0.300, 0.005, 0.200),
             "current": (0.025, 0.200, 0.240, 0.020, 0.080),
-            "strict": (0.030, 0.180, 0.220, 0.030, 0.060),
         }
         methods = {
             "mean_x": (0.0, grid, "mean"),
@@ -1725,27 +1907,7 @@ def _sample_rollout_height_scan_probe_stats(critic_obs, logger=None):
             "edge_y": (3.0, grid.transpose(1, 2), "edge"),
         }
 
-        method_outputs = {
-            name: _height_scan_probe_method_from_grid(
-                method_grid,
-                mode=mode,
-                thresholds=threshold_sets["mild"],
-            )
-            for name, (_method_id, method_grid, mode) in methods.items()
-        }
-        stacked_scores = torch.stack(
-            [method_outputs[name]["step_score"] for name in methods],
-            dim=1,
-        )
-        best_indices = torch.argmax(stacked_scores, dim=1).float()
-        best_score = torch.amax(stacked_scores, dim=1)
-
         stats = dict(zero_stats)
-        for method_name, output in method_outputs.items():
-            stats[f"gx_{method_name}"] = _tensor_mean(output["step_score"])
-        stats["g_best_axis"] = _tensor_mean(best_indices)
-        stats["g_best_score"] = _tensor_mean(best_score)
-
         threshold_outputs = {}
         for name, thresholds in threshold_sets.items():
             outputs = [
@@ -1768,11 +1930,10 @@ def _sample_rollout_height_scan_probe_stats(critic_obs, logger=None):
             }
 
         current_probe = threshold_outputs["current"]
-        mild_probe = threshold_outputs["mild"]
         stats.update(
             {
-                "g_probe_available": 1.0,
-                "g_probe_reason_code": 10.0,
+                "hs_probe_available": 1.0,
+                "hs_probe_reason_code": 10.0,
                 "hs_up_ratio": _tensor_ratio(current_probe["up"]),
                 "hs_down_ratio": _tensor_ratio(current_probe["down"]),
                 "hs_wall_ratio": _tensor_ratio(current_probe["wall"]),
@@ -1782,19 +1943,11 @@ def _sample_rollout_height_scan_probe_stats(critic_obs, logger=None):
                 "hs_step_delta": _tensor_mean(current_probe["step_delta"]),
                 "hs_step_score": _tensor_mean(current_probe["step_score"]),
                 "hs_wall_score": _tensor_mean(current_probe["wall_score"]),
-                "g_step_delta": _tensor_mean(mild_probe["step_delta"]),
-                "g_edge_pos": _tensor_mean(mild_probe["up_evidence"]),
-                "g_edge_neg": _tensor_mean(mild_probe["down_evidence"]),
-                "g_wall_score": _tensor_mean(mild_probe["wall_score"]),
             }
         )
-        for name, output in threshold_outputs.items():
-            stats[f"g_{name}_up"] = _tensor_ratio(output["up"])
-            stats[f"g_{name}_down"] = _tensor_ratio(output["down"])
-            stats[f"g_{name}_wall"] = _tensor_ratio(output["wall"])
         return stats
     except Exception as exc:
-        zero_stats["g_probe_reason_code"] = 93.0
+        zero_stats["hs_probe_reason_code"] = 93.0
         if logger is not None:
             logger.warning(f"[HeightScanRolloutProbe] failed: {exc}")
         return zero_stats
@@ -1802,8 +1955,8 @@ def _sample_rollout_height_scan_probe_stats(critic_obs, logger=None):
 
 def _empty_height_scan_probe_stats():
     keys = (
-        "g_probe_available",
-        "g_probe_reason_code",
+        "hs_probe_available",
+        "hs_probe_reason_code",
         "hs_up_ratio",
         "hs_down_ratio",
         "hs_wall_ratio",
@@ -1811,32 +1964,142 @@ def _empty_height_scan_probe_stats():
         "hs_step_delta",
         "hs_step_score",
         "hs_wall_score",
-        "gx_mean_x",
-        "gx_mean_y",
-        "gx_edge_x",
-        "gx_edge_y",
-        "g_best_axis",
-        "g_best_score",
-        "g_step_delta",
-        "g_edge_pos",
-        "g_edge_neg",
-        "g_wall_score",
-        "g_loose_up",
-        "g_loose_down",
-        "g_loose_wall",
-        "g_mild_up",
-        "g_mild_down",
-        "g_mild_wall",
-        "g_current_up",
-        "g_current_down",
-        "g_current_wall",
-        "g_strict_up",
-        "g_strict_down",
-        "g_strict_wall",
     )
     stats = {key: 0.0 for key in keys}
-    stats["g_probe_reason_code"] = 90.0
+    stats["hs_probe_reason_code"] = 90.0
     return stats
+
+
+def _height_scan_dominant_direction_stats(probe, min_step_score: float, max_wall_score: float):
+    """Return monitor-only mutually-exclusive up/down direction probes.
+
+    The broad threshold probes intentionally answer "can any method see a stair
+    edge?".  These probes answer the stricter reward-gate question: whether the
+    up or down evidence dominates enough that both directions should not be
+    considered active at the same time.
+    """
+    up_evidence = probe["up_evidence"].float()
+    down_evidence = probe["down_evidence"].float()
+    step_score = probe["step_score"].float()
+    wall_score = probe["wall_score"].float()
+    wall = probe["wall"].bool()
+    base = (step_score > float(min_step_score)) & (wall_score < float(max_wall_score)) & (~wall)
+    diff = up_evidence - down_evidence
+    abs_diff = torch.abs(diff)
+    stats = {}
+    for label, margin in (("02", 0.02), ("05", 0.05), ("08", 0.08)):
+        dominant_up = base & (diff > margin)
+        dominant_down = base & (diff < -margin)
+        ambiguous_both = base & (up_evidence > float(min_step_score)) & (down_evidence > float(min_step_score)) & (abs_diff <= margin)
+        no_direction = (~dominant_up) & (~dominant_down) & (~wall)
+        conf = torch.where(
+            base,
+            torch.clamp((abs_diff - margin) / max(1.0 - margin, 1e-6), min=0.0, max=1.0),
+            torch.zeros_like(abs_diff),
+        )
+        stats[f"g_dom_up_{label}"] = _tensor_ratio(dominant_up)
+        stats[f"g_dom_down_{label}"] = _tensor_ratio(dominant_down)
+        stats[f"g_dom_conf_{label}"] = _tensor_mean(conf)
+        stats[f"g_dom_both_{label}"] = _tensor_ratio(ambiguous_both)
+        stats[f"g_dom_none_{label}"] = _tensor_ratio(no_direction)
+    return stats
+
+
+def _height_scan_stair_slope_structure_stats(grid):
+    """Return monitor-only probes that separate discrete stairs from smooth slopes.
+
+    A slope and a stair can both produce a positive/negative height trend.  The
+    useful distinction is distribution: a stair concentrates height change in a
+    small number of neighboring scan columns, while a slope spreads smaller
+    changes across many columns.
+    """
+    num_envs = grid.shape[0]
+    window = grid[:, 5:11, 0:10]
+    if window.shape[1] < 2 or window.shape[2] < 2:
+        return _height_scan_empty_structure_stats()
+
+    dx = window[:, :, 1:] - window[:, :, :-1]
+    dy = window[:, 1:, :] - window[:, :-1, :]
+    abs_edges = torch.cat(
+        [torch.abs(dx).reshape(num_envs, -1), torch.abs(dy).reshape(num_envs, -1)],
+        dim=1,
+    )
+    if abs_edges.numel() == 0:
+        return _height_scan_empty_structure_stats()
+
+    edge_sharpness = abs_edges.amax(dim=1)
+    edge_mean = abs_edges.mean(dim=1)
+    slope_smoothness = torch.clamp(edge_mean / (edge_sharpness + 1e-6), min=0.0, max=1.0)
+    edge_locality = torch.clamp(1.0 - slope_smoothness, min=0.0, max=1.0)
+    wall_like = edge_sharpness > 0.30
+
+    stats = {
+        "g_step_edge_sharpness": _tensor_mean(edge_sharpness),
+        "g_step_edge_locality": _tensor_mean(edge_locality),
+        "g_slope_smoothness": _tensor_mean(slope_smoothness),
+        "g_struct_wall": _tensor_ratio(wall_like),
+    }
+    threshold_sets = {
+        "l": {
+            "edge_min": 0.025,
+            "local_min": 0.20,
+            "smooth_max": 0.55,
+            "slope_mean_min": 0.004,
+            "slope_smooth_min": 0.50,
+            "slope_sharp_max": 0.080,
+        },
+        "m": {
+            "edge_min": 0.040,
+            "local_min": 0.30,
+            "smooth_max": 0.45,
+            "slope_mean_min": 0.006,
+            "slope_smooth_min": 0.60,
+            "slope_sharp_max": 0.070,
+        },
+        "s": {
+            "edge_min": 0.060,
+            "local_min": 0.40,
+            "smooth_max": 0.35,
+            "slope_mean_min": 0.008,
+            "slope_smooth_min": 0.70,
+            "slope_sharp_max": 0.060,
+        },
+    }
+    for label, thresholds in threshold_sets.items():
+        stair_like = (
+            (edge_sharpness >= thresholds["edge_min"])
+            & (edge_locality >= thresholds["local_min"])
+            & (slope_smoothness <= thresholds["smooth_max"])
+            & (~wall_like)
+        )
+        slope_like = (
+            (edge_mean >= thresholds["slope_mean_min"])
+            & (slope_smoothness >= thresholds["slope_smooth_min"])
+            & (edge_sharpness <= thresholds["slope_sharp_max"])
+            & (~wall_like)
+        )
+        stats[f"g_stair_{label}"] = _tensor_ratio(stair_like)
+        stats[f"g_slope_{label}"] = _tensor_ratio(slope_like)
+        stats[f"g_stair_noslope_{label}"] = _tensor_ratio(stair_like & (~slope_like))
+    return stats
+
+
+def _height_scan_empty_structure_stats():
+    return {
+        "g_step_edge_sharpness": 0.0,
+        "g_step_edge_locality": 0.0,
+        "g_slope_smoothness": 0.0,
+        "g_struct_wall": 0.0,
+        "g_stair_l": 0.0,
+        "g_stair_m": 0.0,
+        "g_stair_s": 0.0,
+        "g_slope_l": 0.0,
+        "g_slope_m": 0.0,
+        "g_slope_s": 0.0,
+        "g_stair_noslope_l": 0.0,
+        "g_stair_noslope_m": 0.0,
+        "g_stair_noslope_s": 0.0,
+    }
 
 
 def _height_scan_probe_method_from_grid(
@@ -1936,8 +2199,6 @@ def _sample_stair_gate_debug_stats(env):
     except Exception:
         return stats
 
-    has_probe_debug = "g_probe_available" in stats
-
     # Stable short aliases for monitor panels. Keep the raw keys too.
     aliases = {
         "hs_up_ratio": "height_scan_up_step_mean",
@@ -1948,25 +2209,11 @@ def _sample_stair_gate_debug_stats(env):
         "hs_step_score": "height_scan_step_score_mean",
         "hs_wall_score": "height_scan_wall_score_mean",
         "hs_clear_active": "height_scan_feet_clearance_active_ratio",
-        "hs_wall_active": "height_scan_wall_reject_active_ratio",
-        "relax_ang_active": "stair_relax_ang_vel_xy_active_ratio",
-        "relax_height_active": "stair_relax_base_height_active_ratio",
-        "relax_joint_active": "stair_relax_joint_position_active_ratio",
-        "relax_ang_value": "stair_relax_ang_vel_xy_reward_mean",
-        "relax_height_value": "stair_relax_base_height_reward_mean",
-        "relax_joint_value": "stair_relax_joint_position_reward_mean",
-        "g_probe_available": "g_probe_available",
-        "g_probe_reason_code": "g_probe_reason_code",
+        "hs_probe_available": "hs_probe_available",
+        "hs_probe_reason_code": "hs_probe_reason_code",
     }
     for alias, source_key in aliases.items():
         stats[alias] = float(stats.get(source_key, 0.0))
-    if not has_probe_debug:
-        stats["g_probe_available"] = 0.0
-        stats["g_probe_reason_code"] = 98.0
-    step_active = max(float(stats.get("hs_up_ratio", 0.0)), float(stats.get("hs_down_ratio", 0.0)))
-    for alias in ("relax_ang_active", "relax_height_active", "relax_joint_active"):
-        if alias not in stats or stats[alias] == 0.0:
-            stats[alias] = step_active
     return stats
 
 

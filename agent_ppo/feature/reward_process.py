@@ -28,10 +28,14 @@ import math
 
 import torch
 
+from agent_ppo.feature.command_mix import get_mixed_command
 from tools.base_env.base_reward import RewardProcessBase
 
 
 class RewardProcess(RewardProcessBase):
+
+    def _get_velocity_command(self, command_name: str = "base_velocity"):
+        return get_mixed_command(self.env, command_name=command_name, site="reward")
 
     # -----------------------------------------------------------------------
     # Locomotion quality rewards
@@ -46,12 +50,19 @@ class RewardProcess(RewardProcessBase):
     ):
         """Track XY velocity while optionally lifting low vx commands."""
         asset = self._get_robot_asset()
-        command = self.env.command_manager.get_command(command_name)
+        command = self._get_velocity_command(command_name)
         effective_command_xy = command[:, :2].clone()
         if min_tracking_vx > 0.0:
             effective_command_xy[:, 0] = torch.clamp(effective_command_xy[:, 0], min=min_tracking_vx)
         lin_vel_error = torch.sum(torch.square(effective_command_xy - asset.data.root_lin_vel_b[:, :2]), dim=1)
         return torch.exp(-lin_vel_error / max(std * std, 1.0e-6))
+
+    def _reward_track_ang_vel_z(self, std: float = 0.25, command_name: str = "base_velocity"):
+        """Track yaw-rate against the same mixed command that the policy sees."""
+        asset = self._get_robot_asset()
+        command = self._get_velocity_command(command_name)
+        ang_vel_error = torch.square(command[:, 2] - asset.data.root_ang_vel_b[:, 2])
+        return torch.exp(-ang_vel_error / max(std * std, 1.0e-6))
 
     def _reward_feet_air_time(self, command_name: str = "base_velocity", threshold: float = 0.5):
         """Reward long steps (feet air time above threshold when moving).
@@ -66,7 +77,7 @@ class RewardProcess(RewardProcessBase):
         first_contact = contact_sensor.data.current_air_time[:, sensor_cfg.body_ids] == 0.0
         last_air_time = contact_sensor.data.last_air_time[:, sensor_cfg.body_ids]
         reward = torch.sum((last_air_time - threshold) * first_contact, dim=1)
-        is_moving = torch.norm(self.env.command_manager.get_command(command_name)[:, :2], dim=1) > 0.1
+        is_moving = torch.norm(self._get_velocity_command(command_name)[:, :2], dim=1) > 0.1
         return reward * is_moving.float()
 
     def _reward_feet_clearance(
@@ -105,7 +116,7 @@ class RewardProcess(RewardProcessBase):
         )
         swing = contact_forces <= 1.0
         foot_height = asset.data.body_pos_w[:, asset_cfg.body_ids, 2] - asset.data.root_pos_w[:, 2].unsqueeze(1)
-        command = self.env.command_manager.get_command(command_name)
+        command = self._get_velocity_command(command_name)
         command_speed = torch.norm(command[:, :2], dim=1)
 
         terrain_extra = torch.zeros(self.env.num_envs, device=self.env.device)
@@ -158,7 +169,7 @@ class RewardProcess(RewardProcessBase):
         foot_rel_xy = asset.data.body_pos_w[:, asset_cfg.body_ids, :2] - asset.data.root_pos_w[:, :2].unsqueeze(1)
         foot_forward, foot_lateral = self._project_world_xy_to_body_xy(asset, foot_rel_xy)
 
-        command = self.env.command_manager.get_command(command_name)
+        command = self._get_velocity_command(command_name)
         command_xy = command[:, :2]
         command_speed = torch.linalg.norm(command_xy, dim=1)
         command_dir = command_xy / command_speed.unsqueeze(1).clamp_min(1.0e-6)
@@ -230,7 +241,7 @@ class RewardProcess(RewardProcessBase):
         )
         swing = contact_forces <= 1.0
         foot_height = asset.data.body_pos_w[:, asset_cfg.body_ids, 2] - asset.data.root_pos_w[:, 2].unsqueeze(1)
-        command = self.env.command_manager.get_command(command_name)
+        command = self._get_velocity_command(command_name)
         command_speed = torch.linalg.norm(command[:, :2], dim=1)
 
         up_gate = gate["up_step"].float()
@@ -248,184 +259,6 @@ class RewardProcess(RewardProcessBase):
         debug["height_scan_feet_clearance_active_ratio"] = float((active.detach().float() > 0.0).float().mean().item()) if active.numel() else 0.0
         self.env._stair_gate_debug = debug
         return value
-
-    def _reward_height_scan_wall_reject(
-        self,
-        command_name: str = "base_velocity",
-        min_forward_speed: float = 0.05,
-        body_y_start: int = 5,
-        body_y_end: int = 11,
-        near_x_start: int = 0,
-        near_x_end: int = 4,
-        front_x_start: int = 4,
-        front_x_end: int = 10,
-        wall_min_height: float = 0.24,
-        min_step_score: float = 0.02,
-        max_wall_score: float = 0.08,
-        log_interval: int = 50,
-    ):
-        """Penalty magnitude for driving forward into too-tall scan obstacles."""
-        asset = self._get_robot_asset()
-        gate = self._height_scan_semantic_gate(
-            body_y_start=body_y_start,
-            body_y_end=body_y_end,
-            near_x_start=near_x_start,
-            near_x_end=near_x_end,
-            front_x_start=front_x_start,
-            front_x_end=front_x_end,
-            wall_min_height=wall_min_height,
-            min_step_score=min_step_score,
-            max_wall_score=max_wall_score,
-            log_interval=log_interval,
-        )
-        command = self.env.command_manager.get_command(command_name)
-        commanded_forward = torch.clamp(command[:, 0], min=0.0)
-        actual_forward = torch.clamp(asset.data.root_lin_vel_b[:, 0], min=0.0)
-        pushing_forward = torch.maximum(commanded_forward, actual_forward)
-        value = gate["wall"].float() * torch.clamp(pushing_forward - min_forward_speed, min=0.0)
-
-        debug = getattr(self.env, "_stair_gate_debug", {})
-        debug["height_scan_wall_reject_reward_mean"] = float(value.detach().float().mean().item()) if value.numel() else 0.0
-        debug["height_scan_wall_reject_active_ratio"] = float((value.detach().float() > 0.0).float().mean().item()) if value.numel() else 0.0
-        self.env._stair_gate_debug = debug
-        return value
-
-    def _reward_height_scan_gate_probe(
-        self,
-        body_y_start: int = 5,
-        body_y_end: int = 11,
-        near_x_start: int = 0,
-        near_x_end: int = 4,
-        front_x_start: int = 4,
-        front_x_end: int = 10,
-        log_interval: int = 50,
-    ):
-        """Diagnostic-only height-scan gate probe.
-
-        Returns zero so it cannot shape policy behavior. The tiny TOML weight is
-        used only to make the RewardManager call this term and emit monitor data.
-        """
-        self._height_scan_semantic_gate(
-            body_y_start=body_y_start,
-            body_y_end=body_y_end,
-            near_x_start=near_x_start,
-            near_x_end=near_x_end,
-            front_x_start=front_x_start,
-            front_x_end=front_x_end,
-            log_interval=log_interval,
-        )
-        return torch.zeros(self.env.num_envs, device=self.env.device)
-
-    def _reward_stair_relax_ang_vel_xy(
-        self,
-        body_y_start: int = 5,
-        body_y_end: int = 11,
-        near_x_start: int = 0,
-        near_x_end: int = 4,
-        front_x_start: int = 4,
-        front_x_end: int = 10,
-        log_interval: int = 50,
-    ):
-        """Positive compensation for pitch/roll angular-velocity penalty on steps."""
-        asset = self._get_robot_asset()
-        gate = self._height_scan_semantic_gate(
-            body_y_start=body_y_start,
-            body_y_end=body_y_end,
-            near_x_start=near_x_start,
-            near_x_end=near_x_end,
-            front_x_start=front_x_start,
-            front_x_end=front_x_end,
-            log_interval=log_interval,
-        )
-        active = (gate["up_step"] | gate["down_step"]).float()
-        value = torch.sum(torch.square(asset.data.root_ang_vel_b[:, :2]), dim=1) * active
-        self._set_stair_relax_debug("stair_relax_ang_vel_xy", value, active)
-        return value
-
-    def _reward_stair_relax_base_height(
-        self,
-        target_height: float = 0.38,
-        use_height_scan: bool = False,
-        body_y_start: int = 5,
-        body_y_end: int = 11,
-        near_x_start: int = 0,
-        near_x_end: int = 4,
-        front_x_start: int = 4,
-        front_x_end: int = 10,
-        log_interval: int = 50,
-    ):
-        """Positive compensation for base-height penalty on up/down steps."""
-        asset = self._get_robot_asset()
-        gate = self._height_scan_semantic_gate(
-            body_y_start=body_y_start,
-            body_y_end=body_y_end,
-            near_x_start=near_x_start,
-            near_x_end=near_x_end,
-            front_x_start=front_x_start,
-            front_x_end=front_x_end,
-            log_interval=log_interval,
-        )
-        base_height = asset.data.root_pos_w[:, 2]
-        if use_height_scan:
-            scan_height = self._estimate_base_height_from_scan(
-                asset,
-                body_y_start=body_y_start,
-                body_y_end=body_y_end,
-                near_x_end=near_x_end,
-            )
-            if scan_height is not None:
-                base_height = scan_height
-        active = (gate["up_step"] | gate["down_step"]).float()
-        value = torch.square(base_height - target_height) * active
-        self._set_stair_relax_debug("stair_relax_base_height", value, active)
-        return value
-
-    def _reward_stair_relax_joint_position(
-        self,
-        command_name: str = "base_velocity",
-        stand_still_scale: float = 2.0,
-        velocity_threshold: float = 0.1,
-        cmd_threshold: float = 0.1,
-        ang_cmd_threshold: float = 0.2,
-        body_y_start: int = 5,
-        body_y_end: int = 11,
-        near_x_start: int = 0,
-        near_x_end: int = 4,
-        front_x_start: int = 4,
-        front_x_end: int = 10,
-        log_interval: int = 50,
-    ):
-        """Positive compensation for default-joint-pose penalty on steps."""
-        asset = self._get_robot_asset()
-        gate = self._height_scan_semantic_gate(
-            body_y_start=body_y_start,
-            body_y_end=body_y_end,
-            near_x_start=near_x_start,
-            near_x_end=near_x_end,
-            front_x_start=front_x_start,
-            front_x_end=front_x_end,
-            log_interval=log_interval,
-        )
-        cmd = self.env.command_manager.get_command(command_name)
-        cmd_xy = torch.linalg.norm(cmd[:, :2], dim=1)
-        cmd_yaw = torch.abs(cmd[:, 2])
-        body_vel = torch.linalg.norm(asset.data.root_lin_vel_b[:, :2], dim=1)
-        deviation = torch.linalg.norm(asset.data.joint_pos - asset.data.default_joint_pos, dim=1)
-        is_moving = torch.logical_or(
-            torch.logical_or(cmd_xy > cmd_threshold, cmd_yaw > ang_cmd_threshold),
-            body_vel > velocity_threshold,
-        )
-        raw_penalty = torch.where(is_moving, deviation, stand_still_scale * deviation)
-        active = (gate["up_step"] | gate["down_step"]).float()
-        value = raw_penalty * active
-        self._set_stair_relax_debug("stair_relax_joint_position", value, active)
-        return value
-
-    def _set_stair_relax_debug(self, name: str, value, active):
-        debug = getattr(self.env, "_stair_gate_debug", {})
-        debug[f"{name}_reward_mean"] = float(value.detach().float().mean().item()) if value.numel() else 0.0
-        debug[f"{name}_active_ratio"] = float((active.detach().float() > 0.0).float().mean().item()) if active.numel() else 0.0
-        self.env._stair_gate_debug = debug
 
     def _reward_feet_slide(self):
         """Penalize feet sliding on the ground (velocity while in contact).
@@ -478,7 +311,7 @@ class RewardProcess(RewardProcessBase):
                                偏航角速度指令阈值，低于此值视为未被要求转向。
         """
         asset = self._get_robot_asset()
-        cmd = self.env.command_manager.get_command("base_velocity")
+        cmd = self._get_velocity_command("base_velocity")
         cmd_xy = torch.linalg.norm(cmd[:, :2], dim=1)
         cmd_yaw = torch.abs(cmd[:, 2])
         body_vel = torch.linalg.norm(asset.data.root_lin_vel_b[:, :2], dim=1)
@@ -516,7 +349,7 @@ class RewardProcess(RewardProcessBase):
             joint_vel_scale: Weight for mean absolute joint velocity in the penalty.
         """
         asset = self._get_robot_asset()
-        cmd = self.env.command_manager.get_command(command_name)
+        cmd = self._get_velocity_command(command_name)
 
         near_zero_cmd = (
             torch.linalg.norm(cmd[:, :2], dim=1) < lin_cmd_threshold
@@ -544,7 +377,7 @@ class RewardProcess(RewardProcessBase):
     ):
         """Penalize staying nearly still when an XY velocity command is present."""
         asset = self._get_robot_asset()
-        command = self.env.command_manager.get_command(command_name)
+        command = self._get_velocity_command(command_name)
         command_speed = torch.linalg.norm(command[:, :2], dim=1)
         body_speed = torch.linalg.norm(asset.data.root_lin_vel_b[:, :2], dim=1)
 
@@ -985,6 +818,15 @@ class RewardProcess(RewardProcessBase):
         compare grid-axis assumptions and mean-window vs local-edge gates in a
         single short run.
         """
+        # Historical versions wrote many g_* probe metrics for threshold tests.
+        # The active training monitor is now intentionally compact, so keep this
+        # hook silent unless a future experiment explicitly re-enables it.
+        debug = getattr(self.env, "_stair_gate_debug", {})
+        debug.setdefault("hs_probe_available", 0.0)
+        debug.setdefault("hs_probe_reason_code", 0.0)
+        self.env._stair_gate_debug = debug
+        return
+
         hit_grid = self._height_scan_hit_grid()
         if hit_grid is None:
             self._set_empty_height_scan_probe_debug(reason="hit_grid_unavailable")
@@ -1495,7 +1337,7 @@ class RewardProcess(RewardProcessBase):
         return torch.logical_or(terminated.bool(), time_outs.bool())
 
     def _command_xy_speed_dir(self, command_name: str = "base_velocity"):
-        command = self.env.command_manager.get_command(command_name)
+        command = self._get_velocity_command(command_name)
         command_xy = command[:, :2]
         command_speed = torch.linalg.norm(command_xy, dim=1)
         command_dir = command_xy / command_speed.unsqueeze(1).clamp_min(1.0e-6)
@@ -1619,7 +1461,7 @@ class RewardProcess(RewardProcessBase):
         if direction_source == "goal":
             goal_dir, goal_distance = self._goal_direction_w(asset)
             if goal_dir is not None:
-                command = self.env.command_manager.get_command(command_name)
+                command = self._get_velocity_command(command_name)
                 command_speed = torch.linalg.norm(command[:, :2], dim=1)
                 return goal_dir, None, command, command_speed, goal_distance
         anchor_dir, anchor_heading, command, command_speed = self._command_anchor_direction_w(
@@ -1802,7 +1644,7 @@ class RewardProcess(RewardProcessBase):
         Ref: custom_rewards.py penalize_base_lat_vel_l2 (error-based variant)
         """
         asset = self._get_robot_asset()
-        cmd_vy = self.env.command_manager.get_command(command_name)[:, 1]
+        cmd_vy = self._get_velocity_command(command_name)[:, 1]
         actual_vy = asset.data.root_lin_vel_b[:, 1]
         return torch.square(actual_vy - cmd_vy)
 
@@ -1814,7 +1656,7 @@ class RewardProcess(RewardProcessBase):
     ):
         """Penalize very low forward speed when a forward command is active."""
         asset = self._get_robot_asset()
-        cmd_vx = self.env.command_manager.get_command(command_name)[:, 0]
+        cmd_vx = self._get_velocity_command(command_name)[:, 0]
         actual_vx = asset.data.root_lin_vel_b[:, 0]
         active_forward = cmd_vx > cmd_threshold
         min_expected_vx = progress_ratio * cmd_vx
@@ -1830,7 +1672,7 @@ class RewardProcess(RewardProcessBase):
     ):
         """Penalize unintended yaw while the command asks for straight climbing."""
         asset = self._get_robot_asset()
-        cmd = self.env.command_manager.get_command(command_name)
+        cmd = self._get_velocity_command(command_name)
         straight_forward_cmd = (cmd[:, 0] > lin_cmd_threshold) & (torch.abs(cmd[:, 2]) < ang_cmd_threshold)
         yaw_excess = torch.clamp(torch.abs(asset.data.root_ang_vel_b[:, 2]) - deadzone, min=0.0)
         return torch.square(yaw_excess) * straight_forward_cmd.float()
@@ -1873,7 +1715,7 @@ class RewardProcess(RewardProcessBase):
         stair_gate = forward_delta > min_step_delta
 
         asset = self._get_robot_asset()
-        cmd = self.env.command_manager.get_command(command_name)
+        cmd = self._get_velocity_command(command_name)
         vel = asset.data.root_lin_vel_b
         forward_gate = (cmd[:, 0] > min_forward_speed) & (torch.abs(cmd[:, 2]) < yaw_cmd_threshold)
 
@@ -2132,7 +1974,7 @@ class RewardProcess(RewardProcessBase):
         stair_gate = forward_delta > min_step_delta
 
         asset = self._get_robot_asset()
-        cmd = self.env.command_manager.get_command(command_name)
+        cmd = self._get_velocity_command(command_name)
         command_gate = (cmd[:, 0] > min_forward_cmd) & (torch.abs(cmd[:, 2]) < yaw_cmd_threshold)
 
         forward = torch.zeros((self.env.num_envs, 2), device=self.env.device)
@@ -2216,7 +2058,7 @@ class RewardProcess(RewardProcessBase):
         drop_gate = torch.clamp(drop_ahead / max(max_drop_for_gate, 1.0e-6), 0.0, 1.0)
 
         asset = self._get_robot_asset()
-        cmd = self.env.command_manager.get_command(command_name)
+        cmd = self._get_velocity_command(command_name)
         command_gate = (cmd[:, 0] > min_forward_cmd) & (torch.abs(cmd[:, 2]) < yaw_cmd_threshold)
 
         base_lin_vel = asset.data.root_lin_vel_b

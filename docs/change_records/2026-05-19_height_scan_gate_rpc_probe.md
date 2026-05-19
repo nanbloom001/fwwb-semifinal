@@ -271,3 +271,220 @@ external/
 external/container_src/
 ```
 
+## 后续修复与门控实验最终结论
+
+在后续修复中，训练 workflow 改为直接从 rollout `critic_obs[:, 60:316]`
+计算 height scan probe，而不是依赖 reward 侧 `_stair_gate_debug`。这样绕过了
+Kaiwu/Isaac wrapper 下 reward debug dict 难以稳定暴露的问题。
+
+当前可靠 probe 链路：
+
+- `g_probe_available = 1`
+- `g_probe_reason_code = 10`
+- `hs_probe_available = 1`
+- `hs_probe_reason = 10`
+
+其中 `reason_code = 10` 表示 rollout height scan probe 成功执行。
+
+新增并验证的监控指标包括：
+
+- 方向互斥门控：
+  - `g_dom_up_02`
+  - `g_dom_down_02`
+  - `g_dom_both_02`
+  - `g_dom_none_02`
+  - 以及 margin 0.05 / 0.08 对照版本。
+- 台阶/缓坡/墙体结构门控：
+  - `g_step_edge_sharpness`
+  - `g_step_edge_locality`
+  - `g_slope_smoothness`
+  - `g_struct_wall`
+  - `g_stair_l/m/s`
+  - `g_slope_l/m/s`
+  - `g_stair_noslope_l/m/s`
+
+### 单项地形测试结果
+
+#### 纯台阶 + 反台阶
+
+配置：
+
+```toml
+pyramid_slope = 0.0
+pyramid_slope_inv = 0.0
+pyramid_stairs = 0.50
+pyramid_stairs_inv = 0.50
+maze = 0.0
+```
+
+稳定段结果：
+
+```text
+g_stair_m          ≈ 0.65
+g_stair_noslope_m  ≈ 0.65
+g_step_edge_sharpness ≈ 0.054
+g_dom_both_02      ≈ 0.04
+```
+
+结论：台阶结构可以被 `g_stair_noslope_m` 稳定识别；上/下方向互斥门控
+没有明显双向冲突。
+
+#### 纯缓坡 + 反缓坡
+
+配置：
+
+```toml
+pyramid_slope = 0.50
+pyramid_slope_inv = 0.50
+pyramid_stairs = 0.0
+pyramid_stairs_inv = 0.0
+maze = 0.0
+```
+
+结果：
+
+```text
+g_stair_l/m/s         = 0
+g_stair_noslope_l/m/s = 0
+g_step_edge_sharpness ≈ 0.0026
+g_slope_l             ≈ 0.012
+g_slope_m             ≈ 0
+```
+
+结论：当前台阶 gate 不会在缓坡上误触发。`g_slope_*` 对缓坡的正向识别
+偏弱，暂时不应作为可靠的缓坡分类器；但这不影响用
+`g_stair_noslope_m` 作为台阶奖励 gate 的安全性判断。
+
+#### 全迷宫
+
+配置：
+
+```toml
+pyramid_slope = 0.0
+pyramid_slope_inv = 0.0
+pyramid_stairs = 0.0
+pyramid_stairs_inv = 0.0
+maze = 1.0
+```
+
+结果：
+
+```text
+hs_wall_ratio       ≈ 0.55
+hs_wall_score       ≈ 0.10
+g_struct_wall       ≈ 0.68
+g_step_edge_sharpness ≈ 0.34
+g_stair_l/m/s       = 0
+g_stair_noslope_l/m/s = 0
+g_dom_up/down/both_02 = 0
+```
+
+结论：迷宫/墙体能被 wall 相关指标识别；强高度突变没有污染台阶 gate。
+这是 `g_stair_noslope_m` 可以继续作为候选 gate 的关键证据。
+
+### 混合地形测试结果
+
+#### 无迷宫四类混合
+
+配置：
+
+```toml
+pyramid_slope = 0.25
+pyramid_slope_inv = 0.25
+pyramid_stairs = 0.25
+pyramid_stairs_inv = 0.25
+maze = 0.0
+```
+
+稳定段结果：
+
+```text
+g_stair_noslope_m ≈ 0.33
+g_dom_up_02       ≈ 0.17
+g_dom_down_02     ≈ 0.18
+g_dom_both_02     ≈ 0.017
+g_struct_wall     = 0
+```
+
+结论：在真实的 slope + stairs 混合分布中，台阶 gate 有稳定非零激活；
+激活率低于纯台阶且高于纯缓坡，符合预期。
+
+#### 含迷宫混合
+
+配置：
+
+```toml
+pyramid_slope = 0.15
+pyramid_slope_inv = 0.15
+pyramid_stairs = 0.25
+pyramid_stairs_inv = 0.25
+maze = 0.20
+```
+
+记录点较少，当前结果：
+
+```text
+hs_wall_ratio       ≈ 0.11
+hs_wall_score       ≈ 0.020
+g_struct_wall       ≈ 0.13
+g_stair_noslope_m   ≈ 0.20 mean, latest ≈ 0.35
+g_dom_both_02       ≈ 0.012
+```
+
+结论：加入 20% maze 后，wall 指标有反应，台阶 gate 没有表现出明显
+maze 污染。由于记录点偏少且 `g_stair_noslope_m` 仍在上升，建议后续
+再补一段更稳定的采样，但当前结果没有发现阻断性问题。
+
+### 最终判断
+
+当前最可信的台阶奖励候选 gate 是：
+
+```text
+g_stair_noslope_m
+```
+
+方向判断可以优先使用：
+
+```text
+g_dom_up_02
+g_dom_down_02
+```
+
+暂时不建议依赖：
+
+```text
+g_slope_l/m/s
+```
+
+原因是纯缓坡测试中 `g_slope_m` 基本为 0，说明当前 slope-like 正向分类
+不够敏感。
+
+### 对后续奖励设计的建议
+
+可以进入“小权重台阶辅助奖励”阶段，但不要大幅塑形。
+
+建议只把 `g_stair_noslope_m` 用作 gate，先接入低权重、容易监控的
+height-scan 抬脚/台阶辅助奖励，例如：
+
+```text
+height_scan_stair_clearance: 0.03 -> 0.08
+```
+
+或等价的小权重台阶抬脚奖励。初始阶段应继续保留清晰监控：
+
+```text
+g_stair_noslope_m
+g_dom_up_02
+g_dom_down_02
+g_dom_both_02
+reward_height_scan_feet_clearance
+```
+
+若接入奖励后出现台阶前转向、内八/外八步态、姿态退化或缓坡异常抬腿，
+应立即回退 reward 权重，而不是继续提高 stair reward。
+
+### 仍需注意
+
+这些 gate 目前是基于 rollout critic observation 的监控 probe。若未来要在
+reward 函数中实际使用，应保证 reward 侧计算使用同一套 height scan 语义和
+阈值，不能重新回到早期 `_stair_gate_debug` / reward-side raw hit z 的不稳定路径。
