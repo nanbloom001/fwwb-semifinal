@@ -444,6 +444,7 @@ class FineTuneSchedule:
             "sched_track_yaw_w": self._reward_weight("track_ang_vel_z"),
             "sched_hs_clear_w": self._reward_weight("height_scan_feet_clearance"),
             "sched_hs_wall_w": self._reward_weight("height_scan_wall_reject"),
+            "sched_hs_probe_w": self._reward_weight("height_scan_gate_probe"),
             "sched_relax_ang_w": self._reward_weight("stair_relax_ang_vel_xy"),
             "sched_relax_height_w": self._reward_weight("stair_relax_base_height"),
             "sched_relax_joint_w": self._reward_weight("stair_relax_joint_position"),
@@ -775,6 +776,7 @@ class FineTuneSchedule:
             "track_ang_vel_z",
             "height_scan_feet_clearance",
             "height_scan_wall_reject",
+            "height_scan_gate_probe",
             "stair_relax_ang_vel_xy",
             "stair_relax_base_height",
             "stair_relax_joint_position",
@@ -1118,6 +1120,8 @@ def report_monitor_data(ep_infos, reward_keys, agent, monitor, episode, storage_
             f"flat={monitor_data.get('hs_flat_ratio', 0.0):.4f}, "
             f"step_score={monitor_data.get('hs_step_score', 0.0):.4f}, "
             f"wall_score={monitor_data.get('hs_wall_score', 0.0):.4f}, "
+            f"probe_available={monitor_data.get('g_probe_available', 0.0):.4f}, "
+            f"probe_reason={monitor_data.get('g_probe_reason_code', 0.0):.0f}, "
             f"clear_active={monitor_data.get('hs_clear_active', 0.0):.4f}, "
             f"wall_active={monitor_data.get('hs_wall_active', 0.0):.4f}, "
             f"relax_ang_active={monitor_data.get('relax_ang_active', 0.0):.4f}, "
@@ -1670,8 +1674,252 @@ def run_episodes_(
     # _sample_physics_stats 内部已有 try/except，调用总是安全的。
     storage_stats.update(_sample_physics_stats(env, logger, critic_obs=critic_obs))
     storage_stats.update(_sample_stair_gate_debug_stats(env))
+    storage_stats.update(_sample_rollout_height_scan_probe_stats(critic_obs, logger))
 
     return last_obs, critic_obs, storage_stats
+
+
+def _sample_rollout_height_scan_probe_stats(critic_obs, logger=None):
+    """Compute stair-gate probe metrics directly from rollout critic observations.
+
+    Reward-side debug attributes can be hidden behind Kaiwu/Isaac wrappers or
+    process boundaries.  The critic observation is already available in the PPO
+    workflow, so these metrics are used as the reliable monitor source for
+    height-scan gate validation.  Critic layout is:
+
+        [critic_proprio(60) | height_scan(256)]
+
+    The height scan is a scaled distance-to-ground signal.  For local geometry
+    deltas we convert it to a ground-height proxy by negating and unscaling it,
+    so positive front-minus-near deltas mean higher terrain ahead.
+    """
+    zero_stats = _empty_height_scan_probe_stats()
+    try:
+        if critic_obs is None or not isinstance(critic_obs, torch.Tensor):
+            zero_stats["g_probe_reason_code"] = 91.0
+            return zero_stats
+        if critic_obs.dim() != 2 or critic_obs.shape[1] < 316:
+            zero_stats["g_probe_reason_code"] = 92.0
+            return zero_stats
+
+        height_scan = critic_obs[:, 60:316].detach().float()
+        if height_scan.shape[1] < 256:
+            zero_stats["g_probe_reason_code"] = 92.0
+            return zero_stats
+
+        # Observation height scan uses distance-to-ground.  Local ground-height
+        # proxy is enough for step detection because only deltas are used.
+        grid = (-height_scan[:, :256] / 2.5).view(height_scan.shape[0], 16, 16)
+        grid = torch.nan_to_num(grid, nan=0.0, posinf=0.0, neginf=0.0)
+
+        threshold_sets = {
+            "loose": (0.010, 0.280, 0.320, 0.002, 0.250),
+            "mild": (0.015, 0.260, 0.300, 0.005, 0.200),
+            "current": (0.025, 0.200, 0.240, 0.020, 0.080),
+            "strict": (0.030, 0.180, 0.220, 0.030, 0.060),
+        }
+        methods = {
+            "mean_x": (0.0, grid, "mean"),
+            "mean_y": (1.0, grid.transpose(1, 2), "mean"),
+            "edge_x": (2.0, grid, "edge"),
+            "edge_y": (3.0, grid.transpose(1, 2), "edge"),
+        }
+
+        method_outputs = {
+            name: _height_scan_probe_method_from_grid(
+                method_grid,
+                mode=mode,
+                thresholds=threshold_sets["mild"],
+            )
+            for name, (_method_id, method_grid, mode) in methods.items()
+        }
+        stacked_scores = torch.stack(
+            [method_outputs[name]["step_score"] for name in methods],
+            dim=1,
+        )
+        best_indices = torch.argmax(stacked_scores, dim=1).float()
+        best_score = torch.amax(stacked_scores, dim=1)
+
+        stats = dict(zero_stats)
+        for method_name, output in method_outputs.items():
+            stats[f"gx_{method_name}"] = _tensor_mean(output["step_score"])
+        stats["g_best_axis"] = _tensor_mean(best_indices)
+        stats["g_best_score"] = _tensor_mean(best_score)
+
+        threshold_outputs = {}
+        for name, thresholds in threshold_sets.items():
+            outputs = [
+                _height_scan_probe_method_from_grid(
+                    method_grid,
+                    mode=mode,
+                    thresholds=thresholds,
+                )
+                for _method_id, method_grid, mode in methods.values()
+            ]
+            threshold_outputs[name] = {
+                "up": torch.stack([out["up"].float() for out in outputs], dim=1).amax(dim=1),
+                "down": torch.stack([out["down"].float() for out in outputs], dim=1).amax(dim=1),
+                "wall": torch.stack([out["wall"].float() for out in outputs], dim=1).amax(dim=1),
+                "step_delta": torch.stack([out["step_delta"] for out in outputs], dim=1).mean(dim=1),
+                "step_score": torch.stack([out["step_score"] for out in outputs], dim=1).amax(dim=1),
+                "wall_score": torch.stack([out["wall_score"] for out in outputs], dim=1).amax(dim=1),
+                "up_evidence": torch.stack([out["up_evidence"] for out in outputs], dim=1).amax(dim=1),
+                "down_evidence": torch.stack([out["down_evidence"] for out in outputs], dim=1).amax(dim=1),
+            }
+
+        current_probe = threshold_outputs["current"]
+        mild_probe = threshold_outputs["mild"]
+        stats.update(
+            {
+                "g_probe_available": 1.0,
+                "g_probe_reason_code": 10.0,
+                "hs_up_ratio": _tensor_ratio(current_probe["up"]),
+                "hs_down_ratio": _tensor_ratio(current_probe["down"]),
+                "hs_wall_ratio": _tensor_ratio(current_probe["wall"]),
+                "hs_flat_ratio": _tensor_ratio(
+                    ~(current_probe["up"].bool() | current_probe["down"].bool() | current_probe["wall"].bool())
+                ),
+                "hs_step_delta": _tensor_mean(current_probe["step_delta"]),
+                "hs_step_score": _tensor_mean(current_probe["step_score"]),
+                "hs_wall_score": _tensor_mean(current_probe["wall_score"]),
+                "g_step_delta": _tensor_mean(mild_probe["step_delta"]),
+                "g_edge_pos": _tensor_mean(mild_probe["up_evidence"]),
+                "g_edge_neg": _tensor_mean(mild_probe["down_evidence"]),
+                "g_wall_score": _tensor_mean(mild_probe["wall_score"]),
+            }
+        )
+        for name, output in threshold_outputs.items():
+            stats[f"g_{name}_up"] = _tensor_ratio(output["up"])
+            stats[f"g_{name}_down"] = _tensor_ratio(output["down"])
+            stats[f"g_{name}_wall"] = _tensor_ratio(output["wall"])
+        return stats
+    except Exception as exc:
+        zero_stats["g_probe_reason_code"] = 93.0
+        if logger is not None:
+            logger.warning(f"[HeightScanRolloutProbe] failed: {exc}")
+        return zero_stats
+
+
+def _empty_height_scan_probe_stats():
+    keys = (
+        "g_probe_available",
+        "g_probe_reason_code",
+        "hs_up_ratio",
+        "hs_down_ratio",
+        "hs_wall_ratio",
+        "hs_flat_ratio",
+        "hs_step_delta",
+        "hs_step_score",
+        "hs_wall_score",
+        "gx_mean_x",
+        "gx_mean_y",
+        "gx_edge_x",
+        "gx_edge_y",
+        "g_best_axis",
+        "g_best_score",
+        "g_step_delta",
+        "g_edge_pos",
+        "g_edge_neg",
+        "g_wall_score",
+        "g_loose_up",
+        "g_loose_down",
+        "g_loose_wall",
+        "g_mild_up",
+        "g_mild_down",
+        "g_mild_wall",
+        "g_current_up",
+        "g_current_down",
+        "g_current_wall",
+        "g_strict_up",
+        "g_strict_down",
+        "g_strict_wall",
+    )
+    stats = {key: 0.0 for key in keys}
+    stats["g_probe_reason_code"] = 90.0
+    return stats
+
+
+def _height_scan_probe_method_from_grid(
+    grid,
+    *,
+    mode: str,
+    thresholds,
+    body_y_start: int = 5,
+    body_y_end: int = 11,
+    near_x_start: int = 0,
+    near_x_end: int = 4,
+    front_x_start: int = 4,
+    front_x_end: int = 10,
+):
+    min_h, max_h, wall_h, min_score, max_wall = thresholds
+    num_envs = grid.shape[0]
+    zeros = torch.zeros(num_envs, device=grid.device, dtype=grid.dtype)
+    y0 = max(0, min(int(body_y_start), 15))
+    y1 = max(y0 + 1, min(int(body_y_end), 16))
+    x0 = max(0, min(int(near_x_start), 15))
+    x_near = max(x0 + 1, min(int(near_x_end), 16))
+    x_front0 = max(0, min(int(front_x_start), 15))
+    x_front1 = max(x_front0 + 1, min(int(front_x_end), 16))
+    x1 = max(x0 + 2, min(int(front_x_end), 16))
+
+    window = grid[:, y0:y1, x0:x1]
+    if window.shape[1] < 1 or window.shape[2] < 2:
+        return {
+            "up": zeros.bool(),
+            "down": zeros.bool(),
+            "wall": zeros.bool(),
+            "step_delta": zeros,
+            "step_score": zeros,
+            "wall_score": zeros,
+            "up_evidence": zeros,
+            "down_evidence": zeros,
+        }
+
+    deltas = window[:, :, 1:] - window[:, :, :-1]
+    abs_delta = torch.abs(deltas)
+    pos_like = (deltas >= min_h) & (deltas <= max_h)
+    neg_like = (deltas <= -min_h) & (deltas >= -max_h)
+    wall_like = abs_delta >= wall_h
+    up_evidence = pos_like.float().mean(dim=(1, 2))
+    down_evidence = neg_like.float().mean(dim=(1, 2))
+    step_score = (pos_like | neg_like).float().mean(dim=(1, 2))
+    wall_score = wall_like.float().mean(dim=(1, 2))
+
+    if mode == "mean":
+        near = grid[:, y0:y1, x0:x_near].mean(dim=(1, 2))
+        front = grid[:, y0:y1, x_front0:x_front1].mean(dim=(1, 2))
+        step_delta = front - near
+        up = (step_score > min_score) & (wall_score < max_wall) & (step_delta >= min_h) & (step_delta <= max_h)
+        down = (step_score > min_score) & (wall_score < max_wall) & (step_delta <= -min_h) & (step_delta >= -max_h)
+    else:
+        positive_edge = torch.where(pos_like, deltas, torch.zeros_like(deltas)).amax(dim=(1, 2))
+        negative_edge = torch.where(neg_like, -deltas, torch.zeros_like(deltas)).amax(dim=(1, 2))
+        step_delta = positive_edge - negative_edge
+        up = (up_evidence > min_score) & (wall_score < max_wall) & (positive_edge >= min_h)
+        down = (down_evidence > min_score) & (wall_score < max_wall) & (negative_edge >= min_h)
+    wall = wall_score >= max_wall
+    return {
+        "up": up,
+        "down": down,
+        "wall": wall,
+        "step_delta": step_delta,
+        "step_score": step_score,
+        "wall_score": wall_score,
+        "up_evidence": up_evidence,
+        "down_evidence": down_evidence,
+    }
+
+
+def _tensor_mean(value):
+    if not isinstance(value, torch.Tensor) or value.numel() == 0:
+        return 0.0
+    return float(value.detach().float().mean().item())
+
+
+def _tensor_ratio(value):
+    if not isinstance(value, torch.Tensor) or value.numel() == 0:
+        return 0.0
+    return float(value.detach().float().mean().item())
 
 
 def _sample_stair_gate_debug_stats(env):
@@ -1687,6 +1935,8 @@ def _sample_stair_gate_debug_stats(env):
                     pass
     except Exception:
         return stats
+
+    has_probe_debug = "g_probe_available" in stats
 
     # Stable short aliases for monitor panels. Keep the raw keys too.
     aliases = {
@@ -1705,9 +1955,14 @@ def _sample_stair_gate_debug_stats(env):
         "relax_ang_value": "stair_relax_ang_vel_xy_reward_mean",
         "relax_height_value": "stair_relax_base_height_reward_mean",
         "relax_joint_value": "stair_relax_joint_position_reward_mean",
+        "g_probe_available": "g_probe_available",
+        "g_probe_reason_code": "g_probe_reason_code",
     }
     for alias, source_key in aliases.items():
         stats[alias] = float(stats.get(source_key, 0.0))
+    if not has_probe_debug:
+        stats["g_probe_available"] = 0.0
+        stats["g_probe_reason_code"] = 98.0
     step_active = max(float(stats.get("hs_up_ratio", 0.0)), float(stats.get("hs_down_ratio", 0.0)))
     for alias in ("relax_ang_active", "relax_height_active", "relax_joint_active"):
         if alias not in stats or stats[alias] == 0.0:

@@ -144,6 +144,10 @@ def build_monitor():
             .add_metric(metrics_name="sched_hs_wall_w",
                         expr="avg(sched_hs_wall_w{})")
             .end_panel()
+        .add_panel(name="高度计探针权重", name_en="sched_hs_probe_w", type="line")
+            .add_metric(metrics_name="sched_hs_probe_w",
+                        expr="avg(sched_hs_probe_w{})")
+            .end_panel()
         .add_panel(name="台阶角速度放松权重", name_en="sched_relax_ang_w", type="line")
             .add_metric(metrics_name="sched_relax_ang_w",
                         expr="avg(sched_relax_ang_w{})")
@@ -155,6 +159,14 @@ def build_monitor():
         .add_panel(name="台阶关节放松权重", name_en="sched_relax_joint_w", type="line")
             .add_metric(metrics_name="sched_relax_joint_w",
                         expr="avg(sched_relax_joint_w{})")
+            .end_panel()
+        .add_panel(name="高度计探针可用", name_en="g_probe_available", type="line")
+            .add_metric(metrics_name="g_probe_available",
+                        expr="avg(g_probe_available{})")
+            .end_panel()
+        .add_panel(name="高度计探针原因码", name_en="g_probe_reason_code", type="line")
+            .add_metric(metrics_name="g_probe_reason_code",
+                        expr="avg(g_probe_reason_code{})")
             .end_panel()
         .add_panel(name="原地转向惩罚权重", name_en="sched_pivot_w", type="line")
             .add_metric(metrics_name="sched_pivot_w",
@@ -219,6 +231,18 @@ def build_monitor():
             .add_metric(metrics_name="reward_relax_joint",
                         expr="avg(relax_joint_value{})")
             .end_panel()
+        .add_panel(name="高度计探针奖励", name_en="reward_hs_probe", type="line")
+            .add_metric(metrics_name="reward_hs_probe",
+                        expr="avg(reward_height_scan_gate_probe{})")
+            .end_panel()
+        .add_panel(name="高度计探针可用", name_en="hs_probe_available", type="line")
+            .add_metric(metrics_name="hs_probe_available",
+                        expr="avg(g_probe_available{})")
+            .end_panel()
+        .add_panel(name="高度计探针原因码", name_en="hs_probe_reason", type="line")
+            .add_metric(metrics_name="hs_probe_reason",
+                        expr="avg(g_probe_reason_code{})")
+            .end_panel()
         .add_panel(name="上台阶门控比例", name_en="hs_up_step_ratio", type="line")
             .add_metric(metrics_name="hs_up_step_ratio",
                         expr="avg(hs_up_ratio{})")
@@ -246,6 +270,101 @@ def build_monitor():
         .add_panel(name="墙体分数", name_en="hs_wall_score", type="line")
             .add_metric(metrics_name="hs_wall_score",
                         expr="avg(hs_wall_score{})")
+            .end_panel()
+        .end_group()
+
+        # ==============================================================
+        # Group 2c: Height-scan gate threshold probes
+        # Group 2c: 高度计门控多阈值探针
+        # ==============================================================
+        .add_group(group_name="门控阈值测试", group_name_en="gate_threshold_probe")
+        .add_panel(name="均值X证据", name_en="gx_mean_x", type="line")
+            .add_metric(metrics_name="gx_mean_x",
+                        expr="avg(gx_mean_x{})")
+            .end_panel()
+        .add_panel(name="均值Y证据", name_en="gx_mean_y", type="line")
+            .add_metric(metrics_name="gx_mean_y",
+                        expr="avg(gx_mean_y{})")
+            .end_panel()
+        .add_panel(name="边缘X证据", name_en="gx_edge_x", type="line")
+            .add_metric(metrics_name="gx_edge_x",
+                        expr="avg(gx_edge_x{})")
+            .end_panel()
+        .add_panel(name="边缘Y证据", name_en="gx_edge_y", type="line")
+            .add_metric(metrics_name="gx_edge_y",
+                        expr="avg(gx_edge_y{})")
+            .end_panel()
+        .add_panel(name="最佳轴", name_en="g_best_axis", type="line")
+            .add_metric(metrics_name="g_best_axis",
+                        expr="avg(g_best_axis{})")
+            .end_panel()
+        .add_panel(name="最佳分数", name_en="g_best_score", type="line")
+            .add_metric(metrics_name="g_best_score",
+                        expr="avg(g_best_score{})")
+            .end_panel()
+        .add_panel(name="宽松上台阶", name_en="g_loose_up", type="line")
+            .add_metric(metrics_name="g_loose_up",
+                        expr="avg(g_loose_up{})")
+            .end_panel()
+        .add_panel(name="宽松下台阶", name_en="g_loose_down", type="line")
+            .add_metric(metrics_name="g_loose_down",
+                        expr="avg(g_loose_down{})")
+            .end_panel()
+        .add_panel(name="宽松墙体", name_en="g_loose_wall", type="line")
+            .add_metric(metrics_name="g_loose_wall",
+                        expr="avg(g_loose_wall{})")
+            .end_panel()
+        .add_panel(name="温和上台阶", name_en="g_mild_up", type="line")
+            .add_metric(metrics_name="g_mild_up",
+                        expr="avg(g_mild_up{})")
+            .end_panel()
+        .add_panel(name="温和下台阶", name_en="g_mild_down", type="line")
+            .add_metric(metrics_name="g_mild_down",
+                        expr="avg(g_mild_down{})")
+            .end_panel()
+        .add_panel(name="温和墙体", name_en="g_mild_wall", type="line")
+            .add_metric(metrics_name="g_mild_wall",
+                        expr="avg(g_mild_wall{})")
+            .end_panel()
+        .add_panel(name="当前上台阶", name_en="g_current_up", type="line")
+            .add_metric(metrics_name="g_current_up",
+                        expr="avg(g_current_up{})")
+            .end_panel()
+        .add_panel(name="当前下台阶", name_en="g_current_down", type="line")
+            .add_metric(metrics_name="g_current_down",
+                        expr="avg(g_current_down{})")
+            .end_panel()
+        .add_panel(name="当前墙体", name_en="g_current_wall", type="line")
+            .add_metric(metrics_name="g_current_wall",
+                        expr="avg(g_current_wall{})")
+            .end_panel()
+        .add_panel(name="严格上台阶", name_en="g_strict_up", type="line")
+            .add_metric(metrics_name="g_strict_up",
+                        expr="avg(g_strict_up{})")
+            .end_panel()
+        .add_panel(name="严格下台阶", name_en="g_strict_down", type="line")
+            .add_metric(metrics_name="g_strict_down",
+                        expr="avg(g_strict_down{})")
+            .end_panel()
+        .add_panel(name="严格墙体", name_en="g_strict_wall", type="line")
+            .add_metric(metrics_name="g_strict_wall",
+                        expr="avg(g_strict_wall{})")
+            .end_panel()
+        .add_panel(name="探针高度差", name_en="g_step_delta", type="line")
+            .add_metric(metrics_name="g_step_delta",
+                        expr="avg(g_step_delta{})")
+            .end_panel()
+        .add_panel(name="正边缘密度", name_en="g_edge_pos", type="line")
+            .add_metric(metrics_name="g_edge_pos",
+                        expr="avg(g_edge_pos{})")
+            .end_panel()
+        .add_panel(name="负边缘密度", name_en="g_edge_neg", type="line")
+            .add_metric(metrics_name="g_edge_neg",
+                        expr="avg(g_edge_neg{})")
+            .end_panel()
+        .add_panel(name="探针墙体分数", name_en="g_wall_score", type="line")
+            .add_metric(metrics_name="g_wall_score",
+                        expr="avg(g_wall_score{})")
             .end_panel()
         .end_group()
 

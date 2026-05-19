@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Build compact, analysis-friendly views from a monitor overview capture.
+"""Build compact, analysis-friendly views from a monitor capture.
 
 The collector stores full frontend responses so no information is lost, but the
 raw capture is too large for routine comparison. This postprocessor extracts all
 metric series, keeps a full normalized copy, and adds shape-preserving downsampled
 and rolling-smoothed views.
+
+Supported inputs:
+- overview_capture/sessions/<timestamp>, with groups/*.json
+- manual_metric_recorder/sessions/<timestamp>, with points/*.jsonl
 """
 
 from __future__ import annotations
@@ -20,7 +24,7 @@ from typing import Any
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("capture_dir", type=Path, help="overview_capture/sessions/<timestamp> directory")
+    parser.add_argument("capture_dir", type=Path, help="monitor capture session directory")
     parser.add_argument("--downsample-points", type=int, default=80)
     parser.add_argument("--smooth-window", type=int, default=9)
     parser.add_argument(
@@ -41,6 +45,88 @@ def _metric_name(result_id: str | None) -> str:
 
 
 def extract_series(capture_dir: Path) -> tuple[dict[str, list[tuple[int, float]]], dict[str, dict[str, Any]]]:
+    if (capture_dir / "points").is_dir() or (capture_dir / "metric_requests.jsonl").is_file():
+        return extract_manual_series(capture_dir)
+    return extract_overview_series(capture_dir)
+
+
+def label_key(labels: dict[str, Any]) -> str:
+    return json.dumps(labels, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def extract_manual_series(capture_dir: Path) -> tuple[dict[str, list[tuple[int, float]]], dict[str, dict[str, Any]]]:
+    points_dir = capture_dir / "points"
+    if not points_dir.is_dir():
+        return {}, {}
+
+    buckets: dict[str, dict[int, list[float]]] = {}
+    label_buckets: dict[str, dict[str, dict[int, list[float]]]] = {}
+    labels_by_key: dict[str, dict[str, Any]] = {}
+    meta: dict[str, dict[str, Any]] = {}
+    label_signatures: dict[str, set[str]] = {}
+
+    for point_file in sorted(points_dir.glob("*.jsonl")):
+        for line in point_file.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+                name = str(item["name"])
+                timestamp = int(item["timestamp"])
+                value = float(item["value"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+
+            buckets.setdefault(name, {}).setdefault(timestamp, []).append(value)
+            labels = item.get("labels") if isinstance(item.get("labels"), dict) else {}
+            label_signature = label_key(labels)
+            labels_by_key[label_signature] = labels
+            label_buckets.setdefault(name, {}).setdefault(label_signature, {}).setdefault(timestamp, []).append(value)
+            label_signatures.setdefault(name, set()).add(label_signature)
+            meta.setdefault(
+                name,
+                {
+                    "group": "manual_metric_recorder",
+                    "expr": "",
+                    "result_ids": [],
+                    "source": "points_jsonl",
+                },
+            )
+
+    series: dict[str, list[tuple[int, float]]] = {}
+    for name, timestamp_values in buckets.items():
+        series[name] = sorted(
+            (timestamp, statistics.fmean(values))
+            for timestamp, values in timestamp_values.items()
+        )
+        meta[name]["label_series_count"] = len(label_signatures.get(name, set()))
+        meta[name]["label_series"] = build_label_series_summary(
+            label_buckets.get(name, {}),
+            labels_by_key,
+        )
+    return series, meta
+
+
+def build_label_series_summary(
+    label_bucket: dict[str, dict[int, list[float]]],
+    labels_by_key: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    summaries = []
+    for signature, timestamp_values in sorted(label_bucket.items()):
+        points = sorted(
+            (timestamp, statistics.fmean(values))
+            for timestamp, values in timestamp_values.items()
+        )
+        if not points:
+            continue
+        item = summarize(points, {"group": "label_series", "source": "points_jsonl"})
+        item["labels"] = labels_by_key.get(signature, {})
+        item["label_signature"] = signature
+        summaries.append(item)
+    return summaries
+
+
+def extract_overview_series(capture_dir: Path) -> tuple[dict[str, list[tuple[int, float]]], dict[str, dict[str, Any]]]:
     groups_dir = capture_dir / "groups"
     if not groups_dir.is_dir():
         raise FileNotFoundError(f"missing groups directory: {groups_dir}")
@@ -175,6 +261,8 @@ def summarize(points: list[tuple[int, float]], meta: dict[str, Any]) -> dict[str
     return {
         "group": meta.get("group", ""),
         "expr": meta.get("expr", ""),
+        "source": meta.get("source", "overview_groups"),
+        "label_series_count": meta.get("label_series_count"),
         "count": len(points),
         "start_time": ts_text(points[0][0]),
         "end_time": ts_text(points[-1][0]),
@@ -187,13 +275,234 @@ def summarize(points: list[tuple[int, float]], meta: dict[str, Any]) -> dict[str
         "first20_avg": statistics.fmean(first20),
         "last20_avg": statistics.fmean(last20),
         "delta": values[-1] - values[0],
+        "last20_delta": last20[-1] - last20[0] if len(last20) > 1 else 0.0,
         "max_time": ts_text(points[max_idx][0]),
         "min_time": ts_text(points[min_idx][0]),
     }
 
 
+def empty_summary(name: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
+    meta = meta or {}
+    return {
+        "group": meta.get("group", ""),
+        "expr": meta.get("expr", ""),
+        "source": meta.get("source", "missing_points"),
+        "label_series_count": meta.get("label_series_count", 0),
+        "status": "empty",
+        "count": 0,
+        "start_time": None,
+        "end_time": None,
+        "first": None,
+        "mid": None,
+        "last": None,
+        "min": None,
+        "max": None,
+        "mean": None,
+        "first20_avg": None,
+        "last20_avg": None,
+        "delta": None,
+        "last20_delta": None,
+        "max_time": None,
+        "min_time": None,
+    }
+
+
 def encode_points(points: list[tuple[int, float]]) -> list[dict[str, float | int]]:
     return [{"ts": timestamp, "value": value} for timestamp, value in points]
+
+
+def recorder_metric_names(capture_dir: Path) -> list[str]:
+    summary_path = capture_dir / "summary.json"
+    if not summary_path.is_file():
+        return []
+    try:
+        data = json.loads(summary_path.read_text())
+    except json.JSONDecodeError:
+        return []
+    names = data.get("metric_names")
+    if not isinstance(names, list):
+        return []
+    return sorted(str(name) for name in names if name)
+
+
+def build_metric_inventory(
+    metric_names: list[str],
+    summary: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    all_names = sorted(set(metric_names) | set(summary))
+    metrics = {}
+    for name in all_names:
+        item = summary.get(name)
+        count = int(item.get("count") or 0) if item else 0
+        metrics[name] = {
+            "status": "has_points" if count > 0 else "empty",
+            "count": count,
+            "start_time": item.get("start_time") if item else None,
+            "end_time": item.get("end_time") if item else None,
+            "label_series_count": item.get("label_series_count") if item else 0,
+        }
+    return {
+        "metric_count": len(all_names),
+        "has_points_count": sum(1 for item in metrics.values() if item["status"] == "has_points"),
+        "empty_count": sum(1 for item in metrics.values() if item["status"] == "empty"),
+        "metrics": metrics,
+    }
+
+
+def build_ai_readable_metrics(summary: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    metrics = {}
+    for name, item in sorted(summary.items()):
+        metrics[name] = {
+            "metric_name": name,
+            "status": item.get("status", "has_points" if item.get("count", 0) > 0 else "empty"),
+            "count": item.get("count", 0),
+            "start_time": item.get("start_time"),
+            "end_time": item.get("end_time"),
+            "first": item.get("first"),
+            "last": item.get("last"),
+            "min": item.get("min"),
+            "max": item.get("max"),
+            "mean": item.get("mean"),
+            "delta": item.get("delta"),
+            "recent_delta": item.get("last20_delta"),
+            "first20_avg": item.get("first20_avg"),
+            "last20_avg": item.get("last20_avg"),
+            "label_series_count": item.get("label_series_count"),
+        }
+    return {
+        "format": "fact_table",
+        "metric_count": len(metrics),
+        "metrics": metrics,
+    }
+
+
+def build_label_series_output(meta: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    metrics = {}
+    for name, item in sorted(meta.items()):
+        label_series = item.get("label_series") or []
+        if label_series:
+            metrics[name] = {
+                "label_series_count": len(label_series),
+                "series": label_series,
+            }
+    return {
+        "metric_count": len(metrics),
+        "metrics": metrics,
+    }
+
+
+def _fmt(value: Any) -> str:
+    if value is None:
+        return "n/a"
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return f"{value:.6g}"
+        return str(value)
+    return str(value)
+
+
+def build_markdown_report(capture_dir: Path, summary: dict[str, dict[str, Any]], overview: dict[str, Any]) -> str:
+    non_empty = {name: item for name, item in summary.items() if item.get("count", 0) > 0}
+    zero_metrics = sorted(name for name, item in summary.items() if item.get("count", 0) == 0)
+    recent_delta = sorted(non_empty.items(), key=lambda kv: abs(float(kv[1].get("last20_delta") or 0.0)), reverse=True)[:12]
+    latest = sorted(non_empty.items(), key=lambda kv: str(kv[1].get("end_time", "")), reverse=True)[:12]
+
+    focus_prefixes = (
+        "total_score",
+        "time_score",
+        "pose_score",
+        "energy_score",
+        "completed_count",
+        "timeout_count",
+        "abnormal_count",
+        "reward_",
+        "vel_curriculum",
+        "levelmix",
+        "obs_",
+        "mean_episode",
+        "train_global_step",
+    )
+    focus = [
+        (name, item)
+        for name, item in non_empty.items()
+        if name.startswith(focus_prefixes)
+    ]
+    focus = sorted(focus, key=lambda kv: kv[0])
+
+    lines = [
+        "# Preprocessed Metrics Summary",
+        "",
+        f"- capture_dir: `{capture_dir}`",
+        f"- series_count: {overview['series_count']}",
+        f"- source: {overview.get('source')}",
+        f"- outputs: `{overview['outputs']['ai_readable']}`, `{overview['outputs']['inventory']}`, `{overview['outputs']['summary']}`, `{overview['outputs']['lttb']}`, `{overview['outputs']['smoothed']}`",
+        "",
+        "This report is a factual preprocessing view only. It does not classify training quality or make optimization recommendations.",
+        "",
+        "## Latest Samples",
+        "",
+        "| metric | count | last | delta | end_time |",
+        "|---|---:|---:|---:|---|",
+    ]
+    for name, item in latest:
+        lines.append(
+            f"| `{name}` | {item['count']} | {_fmt(item['last'])} | {_fmt(item['delta'])} | {item['end_time']} |"
+        )
+
+    lines += [
+        "",
+        "## Largest Absolute Recent Delta",
+        "",
+        "| metric | recent_delta | last | min | max |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for name, item in recent_delta:
+        lines.append(
+            f"| `{name}` | {_fmt(item['last20_delta'])} | {_fmt(item['last'])} | {_fmt(item['min'])} | {_fmt(item['max'])} |"
+        )
+
+    lines += [
+        "",
+        "## Focus Metrics",
+        "",
+        "| metric | count | first | last | delta | last20_avg |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for name, item in focus[:80]:
+        lines.append(
+            f"| `{name}` | {item['count']} | {_fmt(item['first'])} | {_fmt(item['last'])} | "
+            f"{_fmt(item['delta'])} | {_fmt(item['last20_avg'])} |"
+        )
+
+    if zero_metrics:
+        lines += [
+            "",
+            "## Empty Metrics",
+            "",
+            ", ".join(f"`{name}`" for name in zero_metrics),
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def print_terminal_summary(summary: dict[str, dict[str, Any]], overview: dict[str, Any]) -> None:
+    non_empty = {name: item for name, item in summary.items() if item.get("count", 0) > 0}
+    zero_count = len(summary) - len(non_empty)
+    print("\n[postprocess] preprocessing outputs generated")
+    print(f"[postprocess] series={len(summary)} non_empty={len(non_empty)} empty={zero_count}")
+    for name in ("train_global_step", "total_score", "completed_count", "timeout_count", "abnormal_count"):
+        item = summary.get(name)
+        if item:
+            print(
+                f"[postprocess] {name}: count={item['count']} "
+                f"first={_fmt(item['first'])} last={_fmt(item['last'])} delta={_fmt(item['delta'])}"
+            )
+    deltas = sorted(non_empty.items(), key=lambda kv: abs(float(kv[1].get("last20_delta") or 0.0)), reverse=True)[:8]
+    print("[postprocess] largest absolute recent_delta:")
+    for name, item in deltas:
+        print(f"  {name}: recent_delta={_fmt(item['last20_delta'])} last={_fmt(item['last'])}")
+    print(f"[postprocess] ai_readable={overview['outputs']['ai_readable']}")
+    print(f"[postprocess] inventory={overview['outputs']['inventory']}")
+    print(f"[postprocess] report={overview['outputs']['report']}")
 
 
 def main() -> None:
@@ -205,6 +514,20 @@ def main() -> None:
         name: summarize(points, meta.get(name, {}))
         for name, points in sorted(series.items())
     }
+    for item in summary.values():
+        item["status"] = "has_points"
+    for name in recorder_metric_names(capture_dir):
+        summary.setdefault(
+            name,
+            empty_summary(
+                name,
+                meta.get(name) or {"group": "manual_metric_recorder", "source": "recorder_summary"},
+            ),
+        )
+
+    inventory = build_metric_inventory(recorder_metric_names(capture_dir), summary)
+    ai_readable = build_ai_readable_metrics(summary)
+    label_series_output = build_label_series_output(meta)
     downsampled = {
         name: encode_points(lttb_downsample(points, args.downsample_points))
         for name, points in sorted(series.items())
@@ -216,6 +539,15 @@ def main() -> None:
 
     (capture_dir / "all_metric_series_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2)
+    )
+    (capture_dir / "ai_readable_metrics.json").write_text(
+        json.dumps(ai_readable, ensure_ascii=False, indent=2)
+    )
+    (capture_dir / "metric_inventory.json").write_text(
+        json.dumps(inventory, ensure_ascii=False, indent=2)
+    )
+    (capture_dir / "label_series_summary.json").write_text(
+        json.dumps(label_series_output, ensure_ascii=False, indent=2)
     )
     (capture_dir / "all_metric_series_lttb.json").write_text(
         json.dumps(downsampled, ensure_ascii=False)
@@ -236,21 +568,31 @@ def main() -> None:
         group_counts[item["group"]] = group_counts.get(item["group"], 0) + 1
     overview = {
         "capture_dir": str(capture_dir),
+        "source": "manual_points" if (capture_dir / "metric_requests.jsonl").is_file() else "overview_groups",
         "series_count": len(series),
+        "metric_count": len(summary),
+        "empty_metric_count": sum(1 for item in summary.values() if item.get("count", 0) == 0),
         "downsample_points": args.downsample_points,
         "smooth_window": args.smooth_window,
         "group_counts": dict(sorted(group_counts.items())),
         "outputs": {
+            "ai_readable": "ai_readable_metrics.json",
+            "inventory": "metric_inventory.json",
+            "label_series": "label_series_summary.json",
             "summary": "all_metric_series_summary.json",
             "full_series": None if args.no_full_series else "all_metric_series.json",
             "lttb": "all_metric_series_lttb.json",
             "smoothed": "all_metric_series_smoothed.json",
+            "report": "analysis_report.md",
         },
     }
+    report = build_markdown_report(capture_dir, summary, overview)
+    (capture_dir / "analysis_report.md").write_text(report, encoding="utf-8")
     (capture_dir / "postprocess_summary.json").write_text(
         json.dumps(overview, ensure_ascii=False, indent=2)
     )
     print(json.dumps(overview, ensure_ascii=False, indent=2))
+    print_terminal_summary(summary, overview)
 
 
 if __name__ == "__main__":

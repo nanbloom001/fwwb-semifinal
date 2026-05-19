@@ -290,6 +290,32 @@ class RewardProcess(RewardProcessBase):
         self.env._stair_gate_debug = debug
         return value
 
+    def _reward_height_scan_gate_probe(
+        self,
+        body_y_start: int = 5,
+        body_y_end: int = 11,
+        near_x_start: int = 0,
+        near_x_end: int = 4,
+        front_x_start: int = 4,
+        front_x_end: int = 10,
+        log_interval: int = 50,
+    ):
+        """Diagnostic-only height-scan gate probe.
+
+        Returns zero so it cannot shape policy behavior. The tiny TOML weight is
+        used only to make the RewardManager call this term and emit monitor data.
+        """
+        self._height_scan_semantic_gate(
+            body_y_start=body_y_start,
+            body_y_end=body_y_end,
+            near_x_start=near_x_start,
+            near_x_end=near_x_end,
+            front_x_start=front_x_start,
+            front_x_end=front_x_end,
+            log_interval=log_interval,
+        )
+        return torch.zeros(self.env.num_envs, device=self.env.device)
+
     def _reward_stair_relax_ang_vel_xy(
         self,
         body_y_start: int = 5,
@@ -899,6 +925,14 @@ class RewardProcess(RewardProcessBase):
             step_score=step_score,
             wall_score=wall_score,
         )
+        self._probe_height_scan_gate_variants(
+            body_y_start=body_y_start,
+            body_y_end=body_y_end,
+            near_x_start=near_x_start,
+            near_x_end=near_x_end,
+            front_x_start=front_x_start,
+            front_x_end=front_x_end,
+        )
         self._log_height_scan_gate_status(
             available=available,
             up_step=up_step.float(),
@@ -921,6 +955,286 @@ class RewardProcess(RewardProcessBase):
             "step_score": step_score,
             "wall_score": wall_score,
         }
+
+    def _height_scan_hit_grid(self):
+        if not hasattr(self.env, "scene") or not hasattr(self.env.scene, "sensors"):
+            return None
+        sensor = self.env.scene.sensors.get("height_scanner")
+        if sensor is None or not hasattr(sensor, "data"):
+            return None
+        ray_hits = getattr(sensor.data, "ray_hits_w", None)
+        if ray_hits is None or ray_hits.shape[-2] < 256:
+            return None
+        hits_z = ray_hits[..., 2]
+        if hits_z.dim() != 2:
+            hits_z = hits_z.view(self.env.num_envs, -1)
+        return hits_z[:, :256].view(self.env.num_envs, 16, 16)
+
+    def _probe_height_scan_gate_variants(
+        self,
+        body_y_start: int = 5,
+        body_y_end: int = 11,
+        near_x_start: int = 0,
+        near_x_end: int = 4,
+        front_x_start: int = 4,
+        front_x_end: int = 10,
+    ):
+        """Record multiple height-scan gate variants for diagnosis only.
+
+        These metrics intentionally do not feed back into any reward.  They
+        compare grid-axis assumptions and mean-window vs local-edge gates in a
+        single short run.
+        """
+        hit_grid = self._height_scan_hit_grid()
+        if hit_grid is None:
+            self._set_empty_height_scan_probe_debug(reason="hit_grid_unavailable")
+            self._log_height_scan_probe_status(reason="hit_grid_unavailable")
+            return
+
+        threshold_sets = {
+            "loose": (0.010, 0.280, 0.320, 0.002, 0.250),
+            "mild": (0.015, 0.260, 0.300, 0.005, 0.200),
+            "current": (0.025, 0.200, 0.240, 0.020, 0.080),
+            "strict": (0.030, 0.180, 0.220, 0.030, 0.060),
+        }
+        methods = {
+            "mean_x": (0.0, hit_grid, "mean"),
+            "mean_y": (1.0, hit_grid.transpose(1, 2), "mean"),
+            "edge_x": (2.0, hit_grid, "edge"),
+            "edge_y": (3.0, hit_grid.transpose(1, 2), "edge"),
+        }
+
+        method_scores = {}
+        method_outputs = {}
+        for method_name, (_method_id, grid, mode) in methods.items():
+            output = self._height_scan_probe_method(
+                grid,
+                mode=mode,
+                thresholds=threshold_sets["mild"],
+                body_y_start=body_y_start,
+                body_y_end=body_y_end,
+                near_x_start=near_x_start,
+                near_x_end=near_x_end,
+                front_x_start=front_x_start,
+                front_x_end=front_x_end,
+            )
+            method_outputs[method_name] = output
+            method_scores[method_name] = output["step_score"]
+
+        stacked_scores = torch.stack([method_scores[name] for name in methods], dim=1)
+        best_indices = torch.argmax(stacked_scores, dim=1).float()
+        best_score = torch.amax(stacked_scores, dim=1)
+
+        # Threshold summaries use the union across all four methods.  This is a
+        # diagnostic "can any measurement see stairs?" probe, not a reward gate.
+        threshold_outputs = {}
+        for name, thresholds in threshold_sets.items():
+            outputs = [
+                self._height_scan_probe_method(
+                    grid,
+                    mode=mode,
+                    thresholds=thresholds,
+                    body_y_start=body_y_start,
+                    body_y_end=body_y_end,
+                    near_x_start=near_x_start,
+                    near_x_end=near_x_end,
+                    front_x_start=front_x_start,
+                    front_x_end=front_x_end,
+                )
+                for _, grid, mode in methods.values()
+            ]
+            threshold_outputs[name] = {
+                "up": torch.stack([out["up"].float() for out in outputs], dim=1).amax(dim=1),
+                "down": torch.stack([out["down"].float() for out in outputs], dim=1).amax(dim=1),
+                "wall": torch.stack([out["wall"].float() for out in outputs], dim=1).amax(dim=1),
+                "step_delta": torch.stack([out["step_delta"] for out in outputs], dim=1).mean(dim=1),
+                "up_evidence": torch.stack([out["up_evidence"] for out in outputs], dim=1).amax(dim=1),
+                "down_evidence": torch.stack([out["down_evidence"] for out in outputs], dim=1).amax(dim=1),
+                "wall_score": torch.stack([out["wall_score"] for out in outputs], dim=1).amax(dim=1),
+            }
+
+        debug = getattr(self.env, "_stair_gate_debug", {})
+        for method_name, output in method_outputs.items():
+            debug[f"gx_{method_name}"] = self._tensor_mean(output["step_score"])
+        debug["g_best_axis"] = self._tensor_mean(best_indices)
+        debug["g_best_score"] = self._tensor_mean(best_score)
+
+        mild_probe = threshold_outputs["mild"]
+        debug["g_step_delta"] = self._tensor_mean(mild_probe["step_delta"])
+        debug["g_edge_pos"] = self._tensor_mean(mild_probe["up_evidence"])
+        debug["g_edge_neg"] = self._tensor_mean(mild_probe["down_evidence"])
+        debug["g_wall_score"] = self._tensor_mean(mild_probe["wall_score"])
+
+        for name, output in threshold_outputs.items():
+            debug[f"g_{name}_up"] = self._tensor_ratio(output["up"])
+            debug[f"g_{name}_down"] = self._tensor_ratio(output["down"])
+            debug[f"g_{name}_wall"] = self._tensor_ratio(output["wall"])
+        debug["g_probe_available"] = 1.0
+        debug["g_probe_reason_code"] = 0.0
+        self.env._stair_gate_debug = debug
+        self._log_height_scan_probe_status(
+            reason="ok",
+            available=1.0,
+            best_axis=self._tensor_mean(best_indices),
+            best_score=self._tensor_mean(best_score),
+            loose_up=debug.get("g_loose_up", 0.0),
+            mild_up=debug.get("g_mild_up", 0.0),
+            current_up=debug.get("g_current_up", 0.0),
+            strict_up=debug.get("g_strict_up", 0.0),
+            wall=debug.get("g_mild_wall", 0.0),
+        )
+
+    def _set_empty_height_scan_probe_debug(self, reason: str):
+        reason_codes = {
+            "ok": 0.0,
+            "hit_grid_unavailable": 1.0,
+            "window_invalid": 2.0,
+        }
+        debug = getattr(self.env, "_stair_gate_debug", {})
+        zero_keys = (
+            "gx_mean_x",
+            "gx_mean_y",
+            "gx_edge_x",
+            "gx_edge_y",
+            "g_best_axis",
+            "g_best_score",
+            "g_step_delta",
+            "g_edge_pos",
+            "g_edge_neg",
+            "g_wall_score",
+            "g_loose_up",
+            "g_loose_down",
+            "g_loose_wall",
+            "g_mild_up",
+            "g_mild_down",
+            "g_mild_wall",
+            "g_current_up",
+            "g_current_down",
+            "g_current_wall",
+            "g_strict_up",
+            "g_strict_down",
+            "g_strict_wall",
+        )
+        for key in zero_keys:
+            debug[key] = 0.0
+        debug["g_probe_available"] = 0.0
+        debug["g_probe_reason_code"] = float(reason_codes.get(reason, 99.0))
+        self.env._stair_gate_debug = debug
+
+    def _log_height_scan_probe_status(
+        self,
+        reason: str,
+        available: float = 0.0,
+        best_axis: float = 0.0,
+        best_score: float = 0.0,
+        loose_up: float = 0.0,
+        mild_up: float = 0.0,
+        current_up: float = 0.0,
+        strict_up: float = 0.0,
+        wall: float = 0.0,
+        log_interval: int = 50,
+    ):
+        if not hasattr(self.env, "_height_scan_probe_log_count"):
+            self.env._height_scan_probe_log_count = 0
+        self.env._height_scan_probe_log_count += 1
+        count = self.env._height_scan_probe_log_count
+        interval = max(int(log_interval), 1)
+        if count != 1 and count % interval != 0:
+            return
+        self._log_reward_warning(
+            "[height_scan_probe] call=%d reason=%s available=%.3f best_axis=%.3f "
+            "best_score=%.4f loose_up=%.3f mild_up=%.3f current_up=%.3f strict_up=%.3f wall=%.3f",
+            count,
+            reason,
+            float(available),
+            float(best_axis),
+            float(best_score),
+            float(loose_up),
+            float(mild_up),
+            float(current_up),
+            float(strict_up),
+            float(wall),
+        )
+
+    def _height_scan_probe_method(
+        self,
+        grid,
+        *,
+        mode: str,
+        thresholds,
+        body_y_start: int,
+        body_y_end: int,
+        near_x_start: int,
+        near_x_end: int,
+        front_x_start: int,
+        front_x_end: int,
+    ):
+        min_h, max_h, wall_h, min_score, max_wall = thresholds
+        y0 = max(0, min(int(body_y_start), 15))
+        y1 = max(y0 + 1, min(int(body_y_end), 16))
+        x0 = max(0, min(int(near_x_start), 15))
+        x_near = max(x0 + 1, min(int(near_x_end), 16))
+        x_front0 = max(0, min(int(front_x_start), 15))
+        x_front1 = max(x_front0 + 1, min(int(front_x_end), 16))
+        x1 = max(x0 + 2, min(int(front_x_end), 16))
+        zeros = torch.zeros(self.env.num_envs, device=self.env.device)
+
+        window = grid[:, y0:y1, x0:x1]
+        if window.shape[1] < 1 or window.shape[2] < 2:
+            return {
+                "up": zeros.bool(),
+                "down": zeros.bool(),
+                "wall": zeros.bool(),
+                "step_delta": zeros,
+                "step_score": zeros,
+                "wall_score": zeros,
+                "up_evidence": zeros,
+                "down_evidence": zeros,
+            }
+
+        deltas = window[:, :, 1:] - window[:, :, :-1]
+        abs_delta = torch.abs(deltas)
+        pos_like = (deltas >= min_h) & (deltas <= max_h)
+        neg_like = (deltas <= -min_h) & (deltas >= -max_h)
+        wall_like = abs_delta >= wall_h
+        up_evidence = pos_like.float().mean(dim=(1, 2))
+        down_evidence = neg_like.float().mean(dim=(1, 2))
+        step_score = (pos_like | neg_like).float().mean(dim=(1, 2))
+        wall_score = wall_like.float().mean(dim=(1, 2))
+
+        if mode == "mean":
+            near = grid[:, y0:y1, x0:x_near].mean(dim=(1, 2))
+            front = grid[:, y0:y1, x_front0:x_front1].mean(dim=(1, 2))
+            step_delta = front - near
+            up = (step_score > min_score) & (wall_score < max_wall) & (step_delta >= min_h) & (step_delta <= max_h)
+            down = (step_score > min_score) & (wall_score < max_wall) & (step_delta <= -min_h) & (step_delta >= -max_h)
+        else:
+            positive_edge = torch.where(pos_like, deltas, torch.zeros_like(deltas)).amax(dim=(1, 2))
+            negative_edge = torch.where(neg_like, -deltas, torch.zeros_like(deltas)).amax(dim=(1, 2))
+            step_delta = positive_edge - negative_edge
+            up = (up_evidence > min_score) & (wall_score < max_wall) & (positive_edge >= min_h)
+            down = (down_evidence > min_score) & (wall_score < max_wall) & (negative_edge >= min_h)
+        wall = wall_score >= max_wall
+        return {
+            "up": up,
+            "down": down,
+            "wall": wall,
+            "step_delta": step_delta,
+            "step_score": step_score,
+            "wall_score": wall_score,
+            "up_evidence": up_evidence,
+            "down_evidence": down_evidence,
+        }
+
+    def _tensor_mean(self, value):
+        if not isinstance(value, torch.Tensor) or value.numel() == 0:
+            return 0.0
+        return float(value.detach().float().mean().item())
+
+    def _tensor_ratio(self, value):
+        if not isinstance(value, torch.Tensor) or value.numel() == 0:
+            return 0.0
+        return float((value.detach().float() > 0.0).float().mean().item())
 
     def _log_height_scan_gate_status(
         self,

@@ -83,19 +83,19 @@ max_init_terrain_level = 1
 # 合法子地形：pyramid_slope | pyramid_slope_inv | pyramid_stairs | pyramid_stairs_inv | maze
 # 注意：不存在"平地"地形类型。平地效果 = pyramid_slope + max_init_terrain_level=0（难度0时坡度≈0）
 #
-# Stair-heavy but not stair-only. Slopes remain as gait anchors so nan10's
-# general locomotion is not overwritten too quickly.
+# Diagnostic run: use only stair and inverse-stair terrains so height-scan gate
+# activation can be measured without slope samples diluting the ratios.
 [terrain.standard.pyramid_slope]
-proportion = 0.20
+proportion = 0.0
 
 [terrain.standard.pyramid_slope_inv]
-proportion = 0.20
+proportion = 0.0
 
 [terrain.standard.pyramid_stairs]
-proportion = 0.30
+proportion = 0.50
 
 [terrain.standard.pyramid_stairs_inv]
-proportion = 0.30
+proportion = 0.50
 
 [terrain.standard.maze]
 proportion = 0.0
@@ -436,10 +436,9 @@ lin_vel_threshold = 0.2
 ang_vel_threshold = 0.5
 
 [rewards.height_scan_feet_clearance]
-# Short-test weight: validate the scan semantic gate before using this as a
-# real stair-climbing signal. Positive only when the height scan sees a
-# climbable up-step, not a wall.
-weight = 0.005
+# Disabled for this gate-test run. The dedicated probe below emits the same
+# diagnostics without shaping the policy.
+weight = 0.0
 [rewards.height_scan_feet_clearance.params]
 command_name = "base_velocity"
 base_target_height = 0.08
@@ -462,9 +461,9 @@ max_wall_score = 0.08
 log_interval = 50
 
 [rewards.height_scan_wall_reject]
-# Short-test weight: small penalty for pushing forward into too-tall scan
-# obstacles. This prevents clearance reward from treating walls as stairs.
-weight = -0.005
+# Disabled for this gate-test run. Keep the implementation registered but do
+# not let an unverified scan gate affect policy updates.
+weight = 0.0
 [rewards.height_scan_wall_reject.params]
 command_name = "base_velocity"
 min_forward_speed = 0.05
@@ -477,6 +476,19 @@ front_x_end = 10
 wall_min_height = 0.24
 min_step_score = 0.02
 max_wall_score = 0.08
+log_interval = 50
+
+[rewards.height_scan_gate_probe]
+# Diagnostic-only zero reward. Tiny non-zero weight keeps the term registered
+# and called so g_*/gx_*/hs_* monitor signals are emitted.
+weight = 1e-9
+[rewards.height_scan_gate_probe.params]
+body_y_start = 5
+body_y_end = 11
+near_x_start = 0
+near_x_end = 4
+front_x_start = 4
+front_x_end = 10
 log_interval = 50
 
 [rewards.stair_relax_ang_vel_xy]
@@ -533,8 +545,9 @@ log_interval_episodes = 10
 [fine_tune_schedule.reward_initial]
 track_lin_vel_xy = 2.50
 track_ang_vel_z = 1.50
-height_scan_feet_clearance = 0.005
-height_scan_wall_reject = -0.005
+height_scan_feet_clearance = 0.0
+height_scan_wall_reject = 0.0
+height_scan_gate_probe = 1e-9
 stair_relax_ang_vel_xy = 0.00
 stair_relax_base_height = 0.00
 stair_relax_joint_position = 0.00
@@ -555,8 +568,9 @@ energy = -0.000020
 [fine_tune_schedule.reward_target]
 track_lin_vel_xy = 2.50
 track_ang_vel_z = 1.20
-height_scan_feet_clearance = 0.025
-height_scan_wall_reject = -0.015
+height_scan_feet_clearance = 0.0
+height_scan_wall_reject = 0.0
+height_scan_gate_probe = 1e-9
 stair_relax_ang_vel_xy = 0.00
 stair_relax_base_height = 0.00
 stair_relax_joint_position = 0.00
@@ -578,20 +592,20 @@ energy = -0.000020
 alpha = 0.0
 difficulty_range = [0.0, 0.6]
 max_init_terrain_level = 1
-pyramid_slope = 0.20
-pyramid_slope_inv = 0.20
-pyramid_stairs = 0.30
-pyramid_stairs_inv = 0.30
+pyramid_slope = 0.0
+pyramid_slope_inv = 0.0
+pyramid_stairs = 0.50
+pyramid_stairs_inv = 0.50
 maze = 0.0
 
 [[fine_tune_schedule.terrain_phases]]
 alpha = 1.0
 difficulty_range = [0.0, 0.85]
 max_init_terrain_level = 4
-pyramid_slope = 0.15
-pyramid_slope_inv = 0.20
-pyramid_stairs = 0.30
-pyramid_stairs_inv = 0.35
+pyramid_slope = 0.0
+pyramid_slope_inv = 0.0
+pyramid_stairs = 0.50
+pyramid_stairs_inv = 0.50
 maze = 0.0
 
 

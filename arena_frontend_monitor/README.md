@@ -42,6 +42,34 @@ Runtime output is written to:
 arena_frontend_monitor_runtime/
 ```
 
+Manual live metric recording with a visible browser:
+
+```bash
+arena_frontend_monitor/manual_metric_recorder.sh '<monitor-url>'
+arena_frontend_monitor/manual_metric_recorder.sh -c
+```
+
+The wrapper opens the monitor URL with a headed `agent-browser` session, waits
+for Enter in the terminal, then starts `manual_metric_recorder.py` with
+`--no-clear-network`. This is useful for live training pages: manually expand,
+scroll, or refresh cards first, then press Enter so already-loaded curve
+requests are kept. Extra recorder arguments can be appended after the URL. Use
+`-c` or `--clipboard` to read the monitor URL from the system clipboard.
+When the recorder exits, the wrapper automatically runs
+`postprocess_monitor_capture.py` on the latest manual session and prints a short
+terminal summary. Preprocessed files are written into the same session
+directory. These files are factual data views only; they do not classify
+training quality or make reward/code recommendations.
+
+- `ai_readable_metrics.json`
+- `metric_inventory.json`
+- `label_series_summary.json`
+- `all_metric_series_summary.json`
+- `all_metric_series_lttb.json`
+- `all_metric_series_smoothed.json`
+- `analysis_report.md`
+- `postprocess_summary.json`
+
 ## Requirements
 
 - Python 3.10+
