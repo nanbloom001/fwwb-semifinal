@@ -54,6 +54,24 @@ def _mean_abs(values: torch.Tensor) -> float:
     return float(torch.abs(values.detach().float()).mean().item())
 
 
+def _command_resample_hash(raw_command: torch.Tensor) -> torch.Tensor:
+    """Stable per-command hash used to assign mix modes.
+
+    The hash includes env id and quantized command values.  This keeps the mode
+    stable while a sampled command is unchanged, but lets the same env move to a
+    different mix mode after the command generator resamples velocity.
+    """
+    num_envs = int(raw_command.shape[0])
+    device = raw_command.device
+    env_ids = torch.arange(num_envs, device=device, dtype=torch.long)
+    quantized = torch.round(raw_command[:, :3].detach().float() / 0.02).to(torch.long)
+    hashed = env_ids * 1103515245 + 12345
+    hashed = hashed + quantized[:, 0] * 374761393
+    hashed = hashed + quantized[:, 1] * 668265263
+    hashed = hashed + quantized[:, 2] * 2246822519
+    return torch.remainder(hashed, 1000003).float() / 1000003.0
+
+
 def _log_command_mix(env, debug: dict, conf: dict, site: str) -> None:
     counter_name = "_command_mix_log_count"
     count = int(getattr(env, counter_name, 0)) + 1
@@ -128,8 +146,7 @@ def get_mixed_command_from_raw(owner, raw_command, conf: dict | None = None, sit
     num_envs = int(raw_command.shape[0])
     device = raw_command.device
 
-    env_ids = torch.arange(num_envs, device=device, dtype=torch.long)
-    hashed = torch.remainder(env_ids * 1103515245 + 12345, 1000003).float() / 1000003.0
+    hashed = _command_resample_hash(raw_command)
     spin_cut = spin_ratio
     vx_only_cut = spin_cut + vx_only_ratio
     vx_vy_cut = vx_only_cut + vx_vy_ratio

@@ -65,77 +65,6 @@ class StageConfig:
     model_save_interval = 200
 
 
-class CustomConfig(StageConfig):
-    # TODO: you can refer to LocomotionConfig to design your own track-terrain
-    # navigation training stage. The following items need to be specified:
-    # 1. stage name;
-    # 2. task_type;
-    # 3. whether to use hierarchical training;
-    # 4. semantics and dimension of the policy action;
-    # 5. obs dimension (whether to concatenate goal information);
-    # 6. training hyperparameters.
-    #
-    # After adding a new training stage, a corresponding training config file
-    # must be created in the same directory.
-    # Filename convention: train_env_conf_<task_type>_<stage.name>.toml
-    # Refer to train_env_conf_standard_locomotion.toml as an example.
-    #
-    # TODO：可参考 LocomotionConfig 自行设计 track 地形导航训练阶段。
-    # 需要明确：
-    # 1. stage 名称；
-    # 2. task_type；
-    # 3. 是否采用分层训练；
-    # 4. policy action 的语义和维度；
-    # 5. obs 维度（是否拼接 goal 信息）；
-    # 6. 训练超参。
-    #
-    # 新增训练阶段后，需在同目录创建对应训练配置文件。
-    # 文件命名规则：train_env_conf_<task_type>_<stage.name>.toml
-    # 可参考 train_env_conf_standard_locomotion.toml。
-    pass
-
-
-class LocomotionConfig(StageConfig):
-    """
-    Stage: locomotion — learn stable walking on mixed terrain.
-    阶段：locomotion —— 在混合地形上学习稳定行走。
-    """
-
-    name = "locomotion"
-    task_type = "standard"
-
-
-class StairConservativeConfig(StageConfig):
-    """
-    Stage: stair_conservative ? fine-tune stairs while replaying slopes.
-    ???stair_conservative ?? ??????????????????????????
-    """
-
-    name = "stair_conservative"
-    task_type = "standard"
-    lr = 1e-4
-    num_learning_epochs = 3
-    num_mini_batches = 4
-    num_steps_per_env = 48
-    model_save_interval = 100
-
-
-class StairInvFineTuneConfig(StageConfig):
-    """
-    Conservative fine-tune for high-level stairs, especially inverse stairs.
-    Keeps the same 301/316 observation dimensions so pretrained Standard models
-    can be loaded without shape mismatch.
-    """
-
-    name = "stair_inv_finetune"
-    task_type = "standard"
-    lr = 1e-5
-    num_learning_epochs = 2
-    num_mini_batches = 4
-    num_steps_per_env = 48
-    model_save_interval = 50
-
-
 class Nan10StairBridgeConfig(StageConfig):
     """
     Conservative stair bridge stage starting from the nan10-8750 checkpoint.
@@ -149,7 +78,7 @@ class Nan10StairBridgeConfig(StageConfig):
     num_learning_epochs = 2
     num_mini_batches = 4
     num_steps_per_env = 48
-    model_save_interval = 100
+    model_save_interval = 50
 
 
 class Config:

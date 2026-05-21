@@ -455,9 +455,41 @@ class FineTuneSchedule:
             "scheduled_elapsed_seconds": max(0.0, time.time() - self.start_time),
             "scheduled_cmd_vy_abs_max": max(abs(float(lin_y[0])), abs(float(lin_y[1]))) if len(lin_y) >= 2 else 0.0,
             "scheduled_cmd_wz_abs_max": max(abs(float(yaw[0])), abs(float(yaw[1]))) if len(yaw) >= 2 else 0.0,
+            "w_track_lin": self._reward_weight("track_lin_vel_xy"),
+            "w_cmd_prog": self._reward_weight("command_direction_progress"),
+            "w_cmd_dir_dev": self._reward_weight("command_direction_deviation"),
+            "w_cmd_path": self._reward_weight("command_path_progress"),
+            "w_cmd_stall": self._reward_weight("commanded_stall_penalty"),
+            "w_track_yaw": self._reward_weight("track_ang_vel_z"),
+            "w_feet_clear": self._reward_weight("feet_clearance"),
+            "w_hs_clear": self._reward_weight("height_scan_feet_clearance"),
+            "w_stair_place": self._reward_weight("stair_forward_foot_placement"),
+            "w_over_clear": self._reward_weight("stair_over_clearance_penalty"),
+            "w_base_clear": self._reward_weight("stair_base_clearance_penalty"),
+            "w_edge_align": self._reward_weight("stair_edge_normal_alignment"),
+            "w_down_speed": self._reward_weight("down_stair_speed_safety"),
+            "w_down_touch": self._reward_weight("down_stair_touchdown_safety"),
+            "w_no_yaw": self._reward_weight("uncommanded_yaw_rate"),
+            "w_heading_drift": self._reward_weight("uncommanded_heading_drift"),
+            "w_ang_xy": self._reward_weight("ang_vel_xy"),
+            "w_pivot": self._reward_weight("pivot_turning"),
             "sched_track_lin_w": self._reward_weight("track_lin_vel_xy"),
+            "sched_cmd_prog_w": self._reward_weight("command_direction_progress"),
+            "sched_cmd_dir_dev_w": self._reward_weight("command_direction_deviation"),
+            "sched_cmd_path_w": self._reward_weight("command_path_progress"),
+            "sched_cmd_stall_w": self._reward_weight("commanded_stall_penalty"),
             "sched_track_yaw_w": self._reward_weight("track_ang_vel_z"),
+            "sched_feet_clearance_w": self._reward_weight("feet_clearance"),
             "sched_hs_clear_w": self._reward_weight("height_scan_feet_clearance"),
+            "sched_stair_place_w": self._reward_weight("stair_forward_foot_placement"),
+            "sched_over_clear_w": self._reward_weight("stair_over_clearance_penalty"),
+            "sched_base_clear_w": self._reward_weight("stair_base_clearance_penalty"),
+            "sched_edge_align_w": self._reward_weight("stair_edge_normal_alignment"),
+            "sched_down_speed_w": self._reward_weight("down_stair_speed_safety"),
+            "sched_down_touch_w": self._reward_weight("down_stair_touchdown_safety"),
+            "sched_uncommand_yaw_w": self._reward_weight("uncommanded_yaw_rate"),
+            "sched_heading_drift_w": self._reward_weight("uncommanded_heading_drift"),
+            "sched_ang_vel_xy_w": self._reward_weight("ang_vel_xy"),
             "sched_pivot_w": self._reward_weight("pivot_turning"),
             "sched_flat_orient_w": self._reward_weight("flat_orientation"),
             "sched_base_height_w": self._reward_weight("correct_base_height"),
@@ -786,8 +818,23 @@ class FineTuneSchedule:
         rewards = usr_conf.get("rewards", {})
         for name in (
             "track_lin_vel_xy",
+            "command_direction_progress",
+            "command_direction_deviation",
+            "command_path_progress",
+            "commanded_stall_penalty",
             "track_ang_vel_z",
+            "feet_clearance",
             "height_scan_feet_clearance",
+            "stair_forward_foot_placement",
+            "stair_over_clearance_penalty",
+            "stair_base_clearance_penalty",
+            "stair_edge_normal_alignment",
+            "down_stair_speed_safety",
+            "down_stair_touchdown_safety",
+            "uncommanded_yaw_rate",
+            "uncommanded_heading_drift",
+            "ang_vel_xy",
+            "correct_base_height",
             "feet_air_time",
             "air_time_variance_penalty",
             "base_lateral_vel",
@@ -1132,7 +1179,10 @@ def report_monitor_data(ep_infos, reward_keys, agent, monitor, episode, storage_
             f"wall_score={monitor_data.get('hs_wall_score', 0.0):.4f}, "
             f"probe_available={monitor_data.get('hs_probe_available', 0.0):.4f}, "
             f"probe_reason={monitor_data.get('hs_probe_reason_code', 0.0):.0f}, "
-            f"clear_active={monitor_data.get('hs_clear_active', 0.0):.4f}"
+            f"clear_active={monitor_data.get('hs_clear_active', 0.0):.4f}, "
+            f"place_active={monitor_data.get('hs_place_active', 0.0):.4f}, "
+            f"yaw_active={monitor_data.get('uncommanded_yaw_active', 0.0):.4f}, "
+            f"yaw_stair={monitor_data.get('uncommanded_yaw_stair', 0.0):.4f}"
         )
         logger.warning(
             "[CommandMixMonitor] "
@@ -1930,6 +1980,23 @@ def _sample_rollout_height_scan_probe_stats(critic_obs, logger=None):
             }
 
         current_probe = threshold_outputs["current"]
+        structure = _height_scan_structure_tensors_from_grid(grid)
+        wall = current_probe["wall"].bool() | structure["wall_like"]
+        base = (
+            (current_probe["step_score"] > 0.02)
+            & (current_probe["wall_score"] < 0.08)
+            & (~wall)
+        )
+        diff = current_probe["up_evidence"] - current_probe["down_evidence"]
+        stair_gate = structure["stair_like"] & (~structure["slope_like"]) & (~wall)
+        up_step = stair_gate & base & (diff > 0.02)
+        down_step = stair_gate & base & (diff < -0.02)
+        command = critic_obs[:, 9:12].detach().float()
+        command_speed = torch.linalg.norm(command[:, :2], dim=1)
+        moving_command = command_speed > 0.10
+        no_yaw_command = torch.abs(command[:, 2]) < 0.08
+        uncommanded_yaw_active = moving_command & no_yaw_command
+
         stats.update(
             {
                 "hs_probe_available": 1.0,
@@ -1943,8 +2010,20 @@ def _sample_rollout_height_scan_probe_stats(critic_obs, logger=None):
                 "hs_step_delta": _tensor_mean(current_probe["step_delta"]),
                 "hs_step_score": _tensor_mean(current_probe["step_score"]),
                 "hs_wall_score": _tensor_mean(current_probe["wall_score"]),
+                # Stable rollout-side aliases for reward activation rates.  The
+                # reward-side debug dict can be hidden behind Kaiwu/Isaac worker
+                # wrappers, but critic_obs is available in the PPO workflow.
+                "hs_clear_active": _tensor_ratio(up_step & moving_command),
+                "hs_place_active": _tensor_ratio(up_step & moving_command),
+                "uncommanded_yaw_active": _tensor_ratio(uncommanded_yaw_active),
+                "uncommanded_yaw_stair": _tensor_ratio(uncommanded_yaw_active & stair_gate),
+                "hs_reward_up_step": _tensor_ratio(up_step),
+                "hs_reward_down_step": _tensor_ratio(down_step),
+                "hs_reward_stair_gate": _tensor_ratio(stair_gate),
             }
         )
+        stats.update(_height_scan_dominant_direction_stats(current_probe, min_step_score=0.02, max_wall_score=0.08))
+        stats.update(_height_scan_stair_slope_structure_stats(grid))
         return stats
     except Exception as exc:
         zero_stats["hs_probe_reason_code"] = 93.0
@@ -1964,6 +2043,23 @@ def _empty_height_scan_probe_stats():
         "hs_step_delta",
         "hs_step_score",
         "hs_wall_score",
+        "g_dom_up_02",
+        "g_dom_down_02",
+        "g_dom_conf_02",
+        "g_dom_both_02",
+        "g_dom_none_02",
+        "g_step_edge_sharpness",
+        "g_step_edge_locality",
+        "g_slope_smoothness",
+        "g_struct_wall",
+        "g_stair_noslope_m",
+        "hs_clear_active",
+        "hs_place_active",
+        "uncommanded_yaw_active",
+        "uncommanded_yaw_stair",
+        "hs_reward_up_step",
+        "hs_reward_down_step",
+        "hs_reward_stair_gate",
     )
     stats = {key: 0.0 for key in keys}
     stats["hs_probe_reason_code"] = 90.0
@@ -2082,6 +2178,64 @@ def _height_scan_stair_slope_structure_stats(grid):
         stats[f"g_slope_{label}"] = _tensor_ratio(slope_like)
         stats[f"g_stair_noslope_{label}"] = _tensor_ratio(stair_like & (~slope_like))
     return stats
+
+
+def _height_scan_structure_tensors_from_grid(grid):
+    """Return reward-matching stair/slope structure tensors from a height grid."""
+    num_envs = grid.shape[0]
+    zeros = torch.zeros(num_envs, device=grid.device, dtype=grid.dtype)
+    window = grid[:, 5:11, 0:10]
+    if window.shape[1] < 2 or window.shape[2] < 2:
+        return {
+            "edge_sharpness": zeros,
+            "edge_locality": zeros,
+            "slope_smoothness": zeros,
+            "wall_like": zeros.bool(),
+            "stair_like": zeros.bool(),
+            "slope_like": zeros.bool(),
+        }
+
+    dx = window[:, :, 1:] - window[:, :, :-1]
+    dy = window[:, 1:, :] - window[:, :-1, :]
+    abs_edges = torch.cat(
+        [torch.abs(dx).reshape(num_envs, -1), torch.abs(dy).reshape(num_envs, -1)],
+        dim=1,
+    )
+    if abs_edges.numel() == 0:
+        return {
+            "edge_sharpness": zeros,
+            "edge_locality": zeros,
+            "slope_smoothness": zeros,
+            "wall_like": zeros.bool(),
+            "stair_like": zeros.bool(),
+            "slope_like": zeros.bool(),
+        }
+
+    edge_sharpness = abs_edges.amax(dim=1)
+    edge_mean = abs_edges.mean(dim=1)
+    slope_smoothness = torch.clamp(edge_mean / (edge_sharpness + 1e-6), min=0.0, max=1.0)
+    edge_locality = torch.clamp(1.0 - slope_smoothness, min=0.0, max=1.0)
+    wall_like = edge_sharpness > 0.30
+    stair_like = (
+        (edge_sharpness >= 0.040)
+        & (edge_locality >= 0.30)
+        & (slope_smoothness <= 0.45)
+        & (~wall_like)
+    )
+    slope_like = (
+        (edge_mean >= 0.006)
+        & (slope_smoothness >= 0.60)
+        & (edge_sharpness <= 0.070)
+        & (~wall_like)
+    )
+    return {
+        "edge_sharpness": edge_sharpness,
+        "edge_locality": edge_locality,
+        "slope_smoothness": slope_smoothness,
+        "wall_like": wall_like,
+        "stair_like": stair_like,
+        "slope_like": slope_like,
+    }
 
 
 def _height_scan_empty_structure_stats():
@@ -2208,7 +2362,50 @@ def _sample_stair_gate_debug_stats(env):
         "hs_step_delta": "height_scan_step_delta_mean",
         "hs_step_score": "height_scan_step_score_mean",
         "hs_wall_score": "height_scan_wall_score_mean",
+        "feet_clear_active": "feet_clearance_active_ratio",
+        "feet_clear_height": "feet_clearance_height_mean",
+        "feet_clear_target": "feet_clearance_target_mean",
         "hs_clear_active": "height_scan_feet_clearance_active_ratio",
+        "hs_clear_reward": "height_scan_feet_clearance_reward_mean",
+        "hs_place_active": "stair_forward_foot_placement_active_ratio",
+        "hs_place_reward": "stair_forward_foot_placement_reward_mean",
+        "hs_place_contact": "stair_forward_foot_placement_first_contact_ratio",
+        "uncommanded_yaw_active": "uncommanded_yaw_active_ratio",
+        "uncommanded_yaw_stair": "uncommanded_yaw_stair_ratio",
+        "uncommanded_yaw_abs": "uncommanded_yaw_abs_mean",
+        "heading_drift_active": "heading_drift_active_ratio",
+        "heading_drift_abs_deg": "heading_drift_abs_deg_mean",
+        "heading_drift_reward": "heading_drift_reward_mean",
+        "cmd_progress_active": "cmd_progress_active_ratio",
+        "cmd_progress_vel": "cmd_progress_vel_mean",
+        "cmd_progress_reward": "cmd_progress_reward_mean",
+        "cmd_dir_dev_active": "cmd_dir_dev_active_ratio",
+        "cmd_dir_dev_angle": "cmd_dir_dev_angle_deg_mean",
+        "cmd_dir_dev_reward": "cmd_dir_dev_reward_mean",
+        "cmd_path_active": "cmd_path_progress_active_ratio",
+        "cmd_path_full": "cmd_path_full_active_ratio",
+        "cmd_path_delta": "cmd_path_delta_progress_mean",
+        "cmd_path_dist": "cmd_path_projected_dist_mean",
+        "cmd_path_cap": "cmd_path_segment_factor_mean",
+        "cmd_path_reward": "cmd_path_reward_mean",
+        "cmd_stall_active": "commanded_stall_active_ratio",
+        "cmd_stall_penalty": "commanded_stall_penalty_mean",
+        "cmd_stall_time": "commanded_stall_time_mean",
+        "over_clear_active": "stair_over_clearance_active_ratio",
+        "over_clear_penalty": "stair_over_clearance_penalty_mean",
+        "base_clear_active": "stair_base_clearance_active_ratio",
+        "base_clearance": "stair_base_clearance_mean",
+        "base_clear_deficit": "stair_base_clearance_deficit_mean",
+        "base_clear_penalty": "stair_base_clearance_penalty_mean",
+        "edge_align_active": "stair_edge_align_active_ratio",
+        "edge_align_cos": "stair_edge_align_cos_mean",
+        "edge_lateral_ratio": "stair_edge_lateral_ratio_mean",
+        "edge_strength": "stair_edge_strength_mean",
+        "edge_align_penalty": "stair_edge_normal_alignment_penalty_mean",
+        "down_speed_active": "down_stair_speed_safety_active_ratio",
+        "down_speed_penalty": "down_stair_speed_safety_penalty_mean",
+        "down_touch_active": "down_stair_touchdown_safety_active_ratio",
+        "down_touch_penalty": "down_stair_touchdown_safety_penalty_mean",
         "hs_probe_available": "hs_probe_available",
         "hs_probe_reason_code": "hs_probe_reason_code",
     }

@@ -49,7 +49,6 @@ class RewardProcess(RewardProcessBase):
         min_tracking_vx: float = 0.0,
     ):
         """Track XY velocity while optionally lifting low vx commands."""
-        asset = self._get_robot_asset()
         command = self._get_velocity_command(command_name)
         effective_command_xy = command[:, :2].clone()
         if min_tracking_vx > 0.0:
@@ -59,10 +58,217 @@ class RewardProcess(RewardProcessBase):
 
     def _reward_track_ang_vel_z(self, std: float = 0.25, command_name: str = "base_velocity"):
         """Track yaw-rate against the same mixed command that the policy sees."""
-        asset = self._get_robot_asset()
         command = self._get_velocity_command(command_name)
         ang_vel_error = torch.square(command[:, 2] - asset.data.root_ang_vel_b[:, 2])
         return torch.exp(-ang_vel_error / max(std * std, 1.0e-6))
+
+    def _reward_command_direction_progress(
+        self,
+        command_name: str = "base_velocity",
+        min_command_speed: float = 0.10,
+        target_speed_ratio: float = 0.80,
+        min_target_speed: float = 0.08,
+    ):
+        """Reward forward progress along the sampled XY velocity command.
+
+        This is intentionally different from exact velocity tracking.  It gives
+        dense credit for moving in the commanded direction, which discourages
+        stair hesitation/timeouts without binding the robot to a world axis.
+        """
+        command = self._get_velocity_command(command_name)
+        command_xy = command[:, :2]
+        command_speed = torch.linalg.norm(command_xy, dim=1)
+        command_dir = command_xy / command_speed.unsqueeze(1).clamp_min(1.0e-6)
+
+        actual_xy = asset.data.root_lin_vel_b[:, :2]
+        projected_speed = torch.sum(actual_xy * command_dir, dim=1)
+        target_speed = torch.clamp(command_speed * float(target_speed_ratio), min=float(min_target_speed))
+        progress = torch.clamp(projected_speed / target_speed.clamp_min(1.0e-6), min=0.0, max=1.0)
+        active = command_speed > float(min_command_speed)
+        value = progress * active.float()
+
+        debug = getattr(self.env, "_stair_gate_debug", {})
+        debug["cmd_progress_active_ratio"] = self._tensor_ratio(active)
+        debug["cmd_progress_vel_mean"] = self._tensor_mean(projected_speed)
+        debug["cmd_progress_reward_mean"] = self._tensor_mean(value)
+        self.env._stair_gate_debug = debug
+        return value
+
+    def _reward_command_direction_deviation(
+        self,
+        command_name: str = "base_velocity",
+        min_command_speed: float = 0.10,
+        min_actual_speed: float = 0.10,
+        angle_limit_deg: float = 0.0,
+        max_angle_deg: float = 75.0,
+        log_interval: int = 100,
+    ):
+        """Penalize moving at a large angle away from the XY velocity command.
+
+        The penalty grows quadratically from ``angle_limit_deg`` to
+        ``max_angle_deg``.  It only applies while actually moving, so standing
+        still is handled by missing progress reward rather than by a noisy
+        undefined direction penalty.
+        """
+        asset = self._get_robot_asset()
+        command = self._get_velocity_command(command_name)
+        command_xy = command[:, :2]
+        command_speed = torch.linalg.norm(command_xy, dim=1)
+        command_dir = command_xy / command_speed.unsqueeze(1).clamp_min(1.0e-6)
+
+        actual_xy = asset.data.root_lin_vel_b[:, :2]
+        actual_speed = torch.linalg.norm(actual_xy, dim=1)
+        actual_dir = actual_xy / actual_speed.unsqueeze(1).clamp_min(1.0e-6)
+        cos_angle = torch.clamp(torch.sum(actual_dir * command_dir, dim=1), min=-1.0, max=1.0)
+        angle_deg = torch.rad2deg(torch.acos(cos_angle))
+
+        active = (command_speed > float(min_command_speed)) & (actual_speed > float(min_actual_speed))
+        span = max(float(max_angle_deg) - float(angle_limit_deg), 1.0e-6)
+        deviation = torch.square(torch.clamp((angle_deg - float(angle_limit_deg)) / span, min=0.0, max=1.0))
+        value = deviation * active.float()
+
+        debug = getattr(self.env, "_stair_gate_debug", {})
+        debug["cmd_dir_dev_active_ratio"] = self._tensor_ratio(active & (angle_deg > float(angle_limit_deg)))
+        debug["cmd_dir_dev_angle_deg_mean"] = self._tensor_mean(angle_deg)
+        debug["cmd_dir_dev_reward_mean"] = self._tensor_mean(value)
+        self.env._stair_gate_debug = debug
+
+        if not hasattr(self.env, "_cmd_dir_dev_log_count"):
+            self.env._cmd_dir_dev_log_count = 0
+        self.env._cmd_dir_dev_log_count += 1
+        count = self.env._cmd_dir_dev_log_count
+        interval = max(int(log_interval), 1)
+        if count == 1 or count % interval == 0:
+            self._log_reward_warning(
+                "[CommandDirDev] call=%d active=%.4f angle_deg=%.3f reward_mean=%.6f",
+                count,
+                debug["cmd_dir_dev_active_ratio"],
+                debug["cmd_dir_dev_angle_deg_mean"],
+                debug["cmd_dir_dev_reward_mean"],
+            )
+        return value
+
+    def _reward_command_path_progress(
+        self,
+        command_name: str = "base_velocity",
+        min_command_speed: float = 0.10,
+        yaw_cmd_threshold: float = 0.08,
+        target_step_progress: float = 0.006,
+        segment_progress_cap: float = 0.35,
+        command_change_threshold: float = 1.0e-4,
+        log_interval: int = 100,
+    ):
+        """Reward short-horizon displacement along the commanded path.
+
+        For near-zero yaw commands, the desired direction is anchored at reset or
+        command resampling time.  For full commands with yaw, the current command
+        direction is used so legitimate commanded turns are not penalized.
+
+        The reward is capped by command-segment progress.  It acts as an
+        anti-stall signal near the start of a command segment, not as an
+        always-on "rush forward" reward that can destabilize down-stairs.
+        """
+        asset = self._get_robot_asset()
+        root_xy = asset.data.root_pos_w[:, :2]
+        command = self._get_velocity_command(command_name)
+        command_xy = command[:, :2]
+        command_speed = torch.linalg.norm(command_xy, dim=1)
+        active = command_speed > float(min_command_speed)
+
+        current_dir_w = self._body_xy_to_world_xy(asset, command_xy)
+        current_dir_w = current_dir_w / torch.linalg.norm(current_dir_w, dim=1, keepdim=True).clamp_min(1.0e-6)
+        fallback_dir_w = self._body_xy_to_world_xy(
+            asset,
+            torch.tensor([[1.0, 0.0]], device=root_xy.device, dtype=root_xy.dtype).repeat(self.env.num_envs, 1),
+        )
+        current_dir_w = torch.where(active.unsqueeze(1), current_dir_w, fallback_dir_w)
+
+        needs_init = (
+            not hasattr(self.env, "_cmd_path_anchor_pos_w")
+            or self.env._cmd_path_anchor_pos_w.shape != root_xy.shape
+            or not hasattr(self.env, "_cmd_path_prev_pos_w")
+            or self.env._cmd_path_prev_pos_w.shape != root_xy.shape
+            or not hasattr(self.env, "_cmd_path_anchor_dir_w")
+            or self.env._cmd_path_anchor_dir_w.shape != current_dir_w.shape
+            or not hasattr(self.env, "_cmd_path_anchor_cmd")
+            or self.env._cmd_path_anchor_cmd.shape != command.shape
+        )
+        if needs_init:
+            self.env._cmd_path_anchor_pos_w = root_xy.detach().clone()
+            self.env._cmd_path_prev_pos_w = root_xy.detach().clone()
+            self.env._cmd_path_anchor_dir_w = current_dir_w.detach().clone()
+            self.env._cmd_path_anchor_cmd = command.detach().clone()
+
+        prev_cmd = self.env._cmd_path_anchor_cmd.to(command.device)
+        command_changed = torch.linalg.norm(command - prev_cmd, dim=1) > float(command_change_threshold)
+        refresh = self._reset_mask().to(command.device) | command_changed
+
+        anchor_pos = torch.where(
+            refresh.unsqueeze(1),
+            root_xy.detach(),
+            self.env._cmd_path_anchor_pos_w.to(root_xy.device),
+        )
+        prev_pos = torch.where(
+            refresh.unsqueeze(1),
+            root_xy.detach(),
+            self.env._cmd_path_prev_pos_w.to(root_xy.device),
+        )
+        anchor_dir = torch.where(
+            refresh.unsqueeze(1),
+            current_dir_w.detach(),
+            self.env._cmd_path_anchor_dir_w.to(current_dir_w.device),
+        )
+        anchor_cmd = torch.where(refresh.unsqueeze(1), command.detach(), prev_cmd)
+
+        no_yaw = torch.abs(command[:, 2]) < float(yaw_cmd_threshold)
+        desired_dir = torch.where(no_yaw.unsqueeze(1), anchor_dir, current_dir_w)
+        step_delta = root_xy - prev_pos
+        delta_progress = torch.sum(step_delta * desired_dir, dim=1)
+        projected_dist = torch.sum((root_xy - anchor_pos) * desired_dir, dim=1)
+        raw_value = torch.clamp(
+            delta_progress / max(float(target_step_progress), 1.0e-6),
+            min=0.0,
+            max=1.0,
+        )
+        segment_factor = torch.clamp(
+            (float(segment_progress_cap) - torch.clamp(projected_dist, min=0.0))
+            / max(float(segment_progress_cap), 1.0e-6),
+            min=0.0,
+            max=1.0,
+        )
+        value = raw_value * segment_factor * active.float()
+
+        self.env._cmd_path_anchor_pos_w = anchor_pos.detach().clone()
+        self.env._cmd_path_prev_pos_w = root_xy.detach().clone()
+        self.env._cmd_path_anchor_dir_w = anchor_dir.detach().clone()
+        self.env._cmd_path_anchor_cmd = anchor_cmd.detach().clone()
+
+        debug = getattr(self.env, "_stair_gate_debug", {})
+        debug["cmd_path_progress_active_ratio"] = self._tensor_ratio(active)
+        debug["cmd_path_full_active_ratio"] = self._tensor_ratio(active & (~no_yaw))
+        debug["cmd_path_delta_progress_mean"] = self._tensor_mean(delta_progress)
+        debug["cmd_path_projected_dist_mean"] = self._tensor_mean(projected_dist)
+        debug["cmd_path_segment_factor_mean"] = self._tensor_mean(segment_factor)
+        debug["cmd_path_reward_mean"] = self._tensor_mean(value)
+        self.env._stair_gate_debug = debug
+
+        if not hasattr(self.env, "_cmd_path_progress_log_count"):
+            self.env._cmd_path_progress_log_count = 0
+        self.env._cmd_path_progress_log_count += 1
+        count = self.env._cmd_path_progress_log_count
+        interval = max(int(log_interval), 1)
+        if count == 1 or count % interval == 0:
+            self._log_reward_warning(
+                "[CommandPathProgress] call=%d active=%.4f full=%.4f delta=%.5f dist=%.3f cap_factor=%.3f reward_mean=%.6f",
+                count,
+                debug["cmd_path_progress_active_ratio"],
+                debug["cmd_path_full_active_ratio"],
+                debug["cmd_path_delta_progress_mean"],
+                debug["cmd_path_projected_dist_mean"],
+                debug["cmd_path_segment_factor_mean"],
+                debug["cmd_path_reward_mean"],
+            )
+        return value
 
     def _reward_feet_air_time(self, command_name: str = "base_velocity", threshold: float = 0.5):
         """Reward long steps (feet air time above threshold when moving).
@@ -93,6 +299,8 @@ class RewardProcess(RewardProcessBase):
         near_x_start: int = 2,
         near_x_end: int = 10,
         delta_quantile: float = 0.85,
+        reward_scale: float = 1.0,
+        max_reward: float = 1.0,
     ):
         """Reward terrain-aware swing-foot clearance to reduce stair-edge tripping.
 
@@ -115,7 +323,16 @@ class RewardProcess(RewardProcessBase):
             .max(dim=1)[0]
         )
         swing = contact_forces <= 1.0
-        foot_height = asset.data.body_pos_w[:, asset_cfg.body_ids, 2] - asset.data.root_pos_w[:, 2].unsqueeze(1)
+        foot_z = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
+        ground_z = self._ground_z_window_from_scan(
+            body_y_start=body_y_start,
+            body_y_end=body_y_end,
+            x_start=0,
+            x_end=near_x_end,
+        )
+        if ground_z is None:
+            ground_z = asset.data.root_pos_w[:, 2] - 0.35
+        foot_height = foot_z - ground_z.unsqueeze(1)
         command = self._get_velocity_command(command_name)
         command_speed = torch.norm(command[:, :2], dim=1)
 
@@ -139,7 +356,16 @@ class RewardProcess(RewardProcessBase):
         height_error = (foot_height - dynamic_target_height.unsqueeze(1)) / max(std, 1e-6)
         clearance_reward = torch.exp(-torch.square(height_error))
         is_moving = command_speed > 0.1
-        return torch.sum(clearance_reward * swing.float(), dim=1) * is_moving.float() / max(len(asset_cfg.body_ids), 1)
+        value = torch.sum(clearance_reward * swing.float(), dim=1) * is_moving.float() / max(len(asset_cfg.body_ids), 1)
+        value = torch.clamp(value * float(reward_scale), min=0.0, max=float(max_reward))
+
+        debug = getattr(self.env, "_stair_gate_debug", {})
+        debug["feet_clearance_reward_mean"] = self._tensor_mean(value)
+        debug["feet_clearance_active_ratio"] = self._tensor_ratio(swing.float() * is_moving.float().unsqueeze(1))
+        debug["feet_clearance_height_mean"] = self._tensor_mean(foot_height)
+        debug["feet_clearance_target_mean"] = self._tensor_mean(dynamic_target_height)
+        self.env._stair_gate_debug = debug
+        return value
 
     def _reward_feet_swing_forward(
         self,
@@ -190,10 +416,14 @@ class RewardProcess(RewardProcessBase):
         self,
         command_name: str = "base_velocity",
         base_target_height: float = 0.08,
+        base_clearance: float = 0.06,
+        min_clearance: float = 0.03,
+        max_clearance: float = 0.12,
         step_height_scale: float = 0.75,
         max_extra_height: float = 0.12,
         speed_height_scale: float = 0.01,
         std: float = 0.05,
+        max_air_time: float = 0.45,
         min_command_speed: float = 0.10,
         body_y_start: int = 5,
         body_y_end: int = 11,
@@ -206,20 +436,24 @@ class RewardProcess(RewardProcessBase):
         wall_min_height: float = 0.24,
         min_step_score: float = 0.02,
         max_wall_score: float = 0.08,
+        reward_scale: float = 1.0,
+        max_reward: float = 1.0,
         log_interval: int = 50,
     ):
-        """Reward swing-foot clearance only when height scan sees a climbable up-step.
+        """Reward swing-foot clearance in a bounded height band over an up-step.
 
         This is deliberately scan-gated rather than terrain-label-gated. It does
         not encode a world/stair heading, so it should not create the previous
-        diagonal-path dependency by itself.
+        diagonal-path dependency by itself.  The target is expressed relative to
+        the scan-estimated upper step surface: enough clearance to avoid the
+        edge, but no extra reward for throwing a foot far above the step.
         """
         sensor_cfg = self._get_foot_sensor_cfg()
         asset_cfg = self._get_foot_asset_cfg()
         contact_sensor = self.env.scene.sensors[sensor_cfg.name]
         asset = self.env.scene[asset_cfg.name]
 
-        gate = self._height_scan_semantic_gate(
+        gate = self._height_scan_reward_stair_gate(
             body_y_start=body_y_start,
             body_y_end=body_y_end,
             near_x_start=near_x_start,
@@ -240,24 +474,386 @@ class RewardProcess(RewardProcessBase):
             .max(dim=1)[0]
         )
         swing = contact_forces <= 1.0
-        foot_height = asset.data.body_pos_w[:, asset_cfg.body_ids, 2] - asset.data.root_pos_w[:, 2].unsqueeze(1)
+        current_air_time = contact_sensor.data.current_air_time[:, sensor_cfg.body_ids]
+        air_time_ok = current_air_time <= float(max_air_time)
+        foot_z = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
         command = self._get_velocity_command(command_name)
         command_speed = torch.linalg.norm(command[:, :2], dim=1)
 
         up_gate = gate["up_step"].float()
-        step_extra = torch.clamp(step_height_scale * torch.clamp(gate["step_delta"], min=0.0), 0.0, max_extra_height)
+        upper_surface_z = torch.maximum(gate["near_z"], gate["front_z"])
+        # The target is measured above the upper surface itself, so the local
+        # step height should not be added again. Keep legacy params accepted by
+        # the function signature for TOML compatibility.
         speed_extra = speed_height_scale * torch.clamp(command_speed, 0.0, 1.0)
-        target_height = base_target_height + step_extra + speed_extra
-        height_error = (foot_height - target_height.unsqueeze(1)) / max(std, 1.0e-6)
+        target_clearance = (
+            float(base_clearance)
+            + speed_extra
+        )
+        target_clearance = torch.clamp(target_clearance, min=float(min_clearance), max=float(max_clearance))
+        clearance = foot_z - upper_surface_z.unsqueeze(1)
+        height_error = (clearance - target_clearance.unsqueeze(1)) / max(std, 1.0e-6)
         reward = torch.exp(-torch.square(height_error))
+        clearance_valid = clearance >= float(min_clearance)
         active = (command_speed > min_command_speed).float() * up_gate
-        value = torch.sum(reward * swing.float(), dim=1) / max(len(asset_cfg.body_ids), 1)
+        value = torch.sum(
+            reward * swing.float() * air_time_ok.float() * clearance_valid.float(),
+            dim=1,
+        ) / max(len(asset_cfg.body_ids), 1)
         value = value * active
+        value = torch.clamp(value * float(reward_scale), min=0.0, max=float(max_reward))
 
         debug = getattr(self.env, "_stair_gate_debug", {})
         debug["height_scan_feet_clearance_reward_mean"] = float(value.detach().float().mean().item()) if value.numel() else 0.0
         debug["height_scan_feet_clearance_active_ratio"] = float((active.detach().float() > 0.0).float().mean().item()) if active.numel() else 0.0
+        debug["height_scan_feet_clearance_clearance_mean"] = self._tensor_mean(clearance)
+        debug["height_scan_feet_clearance_target_mean"] = self._tensor_mean(target_clearance)
         self.env._stair_gate_debug = debug
+        return value
+
+    def _reward_stair_forward_foot_placement(
+        self,
+        command_name: str = "base_velocity",
+        target_forward: float = 0.12,
+        max_forward: float = 0.30,
+        forward_std: float = 0.08,
+        overshoot_std: float = 0.12,
+        height_std: float = 0.07,
+        touchdown_speed_std: float = 0.35,
+        foot_ground_offset: float = 0.02,
+        min_air_time: float = 0.04,
+        min_command_speed: float = 0.10,
+        body_y_start: int = 5,
+        body_y_end: int = 11,
+        near_x_start: int = 0,
+        near_x_end: int = 4,
+        front_x_start: int = 4,
+        front_x_end: int = 10,
+        up_min_height: float = 0.025,
+        up_max_height: float = 0.20,
+        wall_min_height: float = 0.24,
+        min_step_score: float = 0.02,
+        max_wall_score: float = 0.08,
+        reward_scale: float = 1.0,
+        max_reward: float = 1.0,
+        log_interval: int = 50,
+    ):
+        """Reward touchdown that places swing feet forward onto an up-step.
+
+        This complements ``height_scan_feet_clearance``.  Clearance rewards
+        lifting to a suitable height during swing; this term is a sparse
+        touchdown reward that prefers landing forward along the sampled velocity
+        command and near the scan-estimated upper step surface.  It is positive
+        only, so missed placements do not add an extra destabilizing penalty.
+        """
+        sensor_cfg = self._get_foot_sensor_cfg()
+        asset_cfg = self._get_foot_asset_cfg()
+        contact_sensor = self.env.scene.sensors[sensor_cfg.name]
+        asset = self.env.scene[asset_cfg.name]
+
+        gate = self._height_scan_reward_stair_gate(
+            body_y_start=body_y_start,
+            body_y_end=body_y_end,
+            near_x_start=near_x_start,
+            near_x_end=near_x_end,
+            front_x_start=front_x_start,
+            front_x_end=front_x_end,
+            up_min_height=up_min_height,
+            up_max_height=up_max_height,
+            wall_min_height=wall_min_height,
+            min_step_score=min_step_score,
+            max_wall_score=max_wall_score,
+            log_interval=log_interval,
+        )
+
+        command = self._get_velocity_command(command_name)
+        command_xy = command[:, :2]
+        command_speed = torch.linalg.norm(command_xy, dim=1)
+        command_dir = command_xy / command_speed.unsqueeze(1).clamp_min(1.0e-6)
+        fallback = torch.zeros_like(command_dir)
+        fallback[:, 0] = 1.0
+        command_dir = torch.where((command_speed > 1.0e-6).unsqueeze(1), command_dir, fallback)
+
+        foot_rel_xy = asset.data.body_pos_w[:, asset_cfg.body_ids, :2] - asset.data.root_pos_w[:, :2].unsqueeze(1)
+        foot_forward, foot_lateral = self._project_world_xy_to_body_xy(asset, foot_rel_xy)
+        foot_command_forward = (
+            foot_forward * command_dir[:, 0].unsqueeze(1)
+            + foot_lateral * command_dir[:, 1].unsqueeze(1)
+        )
+
+        shortfall = torch.clamp(target_forward - foot_command_forward, min=0.0)
+        overshoot = torch.clamp(foot_command_forward - max_forward, min=0.0)
+        forward_score = torch.exp(-torch.square(shortfall / max(forward_std, 1.0e-6)))
+        forward_score = forward_score * torch.exp(-torch.square(overshoot / max(overshoot_std, 1.0e-6)))
+
+        foot_z = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
+        target_z = torch.maximum(gate["near_z"], gate["front_z"]).unsqueeze(1)
+        height_error = foot_z - (target_z + foot_ground_offset)
+        height_score = torch.exp(-torch.square(height_error / max(height_std, 1.0e-6)))
+
+        foot_vel_z = asset.data.body_lin_vel_w[:, asset_cfg.body_ids, 2]
+        downward_speed = torch.clamp(-foot_vel_z, min=0.0)
+        touchdown_speed_score = torch.exp(
+            -torch.square(downward_speed / max(float(touchdown_speed_std), 1.0e-6))
+        )
+
+        contact_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :].norm(dim=-1)
+        contact_now = contact_forces > 1.0
+        first_contact = self._foot_first_contact(
+            contact_sensor,
+            sensor_cfg,
+            contact_now,
+            min_air_time=min_air_time,
+            cache_name="stair_forward_foot_placement",
+        )
+
+        active = (command_speed > min_command_speed).float() * gate["up_step"].float()
+        placement = forward_score * height_score * touchdown_speed_score * first_contact.float()
+        value = torch.sum(placement, dim=1) / max(len(asset_cfg.body_ids), 1)
+        value = value * active
+        value = torch.clamp(value * float(reward_scale), min=0.0, max=float(max_reward))
+
+        debug = getattr(self.env, "_stair_gate_debug", {})
+        debug["stair_forward_foot_placement_reward_mean"] = float(value.detach().float().mean().item()) if value.numel() else 0.0
+        debug["stair_forward_foot_placement_active_ratio"] = float((active.detach().float() > 0.0).float().mean().item()) if active.numel() else 0.0
+        debug["stair_forward_foot_placement_first_contact_ratio"] = (
+            float(first_contact.detach().float().mean().item()) if first_contact.numel() else 0.0
+        )
+        debug["stair_forward_foot_placement_forward_mean"] = (
+            float(foot_command_forward.detach().float().mean().item()) if foot_command_forward.numel() else 0.0
+        )
+        debug["stair_forward_foot_placement_height_error_abs_mean"] = (
+            float(torch.abs(height_error).detach().float().mean().item()) if height_error.numel() else 0.0
+        )
+        debug["stair_forward_foot_placement_down_speed_mean"] = self._tensor_mean(downward_speed)
+        self.env._stair_gate_debug = debug
+        return value
+
+    def _reward_stair_over_clearance_penalty(
+        self,
+        max_clearance: float = 0.14,
+        std: float = 0.07,
+        min_air_time: float = 0.08,
+        body_y_start: int = 5,
+        body_y_end: int = 11,
+        near_x_start: int = 0,
+        near_x_end: int = 4,
+        front_x_start: int = 4,
+        front_x_end: int = 10,
+        up_min_height: float = 0.025,
+        up_max_height: float = 0.20,
+        wall_min_height: float = 0.24,
+        min_step_score: float = 0.02,
+        max_wall_score: float = 0.08,
+        max_penalty: float = 1.0,
+        log_interval: int = 50,
+    ):
+        """Penalize sustained swing-foot height far above the upper stair surface."""
+        sensor_cfg = self._get_foot_sensor_cfg()
+        asset_cfg = self._get_foot_asset_cfg()
+        contact_sensor = self.env.scene.sensors[sensor_cfg.name]
+        asset = self.env.scene[asset_cfg.name]
+        gate = self._height_scan_reward_stair_gate(
+            body_y_start=body_y_start,
+            body_y_end=body_y_end,
+            near_x_start=near_x_start,
+            near_x_end=near_x_end,
+            front_x_start=front_x_start,
+            front_x_end=front_x_end,
+            up_min_height=up_min_height,
+            up_max_height=up_max_height,
+            wall_min_height=wall_min_height,
+            min_step_score=min_step_score,
+            max_wall_score=max_wall_score,
+            log_interval=log_interval,
+        )
+
+        contact_forces = (
+            contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
+            .norm(dim=-1)
+            .max(dim=1)[0]
+        )
+        swing = contact_forces <= 1.0
+        air_time = contact_sensor.data.current_air_time[:, sensor_cfg.body_ids]
+        sustained_swing = air_time >= float(min_air_time)
+        foot_z = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
+        upper_surface_z = torch.maximum(gate["near_z"], gate["front_z"]).unsqueeze(1)
+        clearance = foot_z - upper_surface_z
+        over = torch.clamp(clearance - float(max_clearance), min=0.0)
+        per_foot = torch.square(over / max(float(std), 1.0e-6))
+        per_foot = torch.clamp(per_foot, min=0.0, max=float(max_penalty))
+        active = gate["stair_gate"].float().unsqueeze(1) * swing.float() * sustained_swing.float()
+        value = torch.sum(per_foot * active, dim=1) / max(len(asset_cfg.body_ids), 1)
+
+        debug = getattr(self.env, "_stair_gate_debug", {})
+        debug["stair_over_clearance_penalty_mean"] = self._tensor_mean(value)
+        debug["stair_over_clearance_active_ratio"] = self._tensor_ratio(active)
+        debug["stair_over_clearance_clearance_mean"] = self._tensor_mean(clearance)
+        self.env._stair_gate_debug = debug
+        return value
+
+    def _reward_stair_base_clearance_penalty(
+        self,
+        command_name: str = "base_velocity",
+        min_command_speed: float = 0.10,
+        min_clearance: float = 0.34,
+        std: float = 0.08,
+        max_penalty: float = 1.5,
+        body_y_start: int = 5,
+        body_y_end: int = 11,
+        near_x_start: int = 0,
+        near_x_end: int = 4,
+        front_x_start: int = 4,
+        front_x_end: int = 10,
+        up_min_height: float = 0.025,
+        up_max_height: float = 0.20,
+        wall_min_height: float = 0.24,
+        min_step_score: float = 0.02,
+        max_wall_score: float = 0.08,
+        log_interval: int = 50,
+    ):
+        """Penalize a low base over an up-step without enforcing flat height globally."""
+        asset = self._get_robot_asset()
+        command = self._get_velocity_command(command_name)
+        command_speed = torch.linalg.norm(command[:, :2], dim=1)
+        gate = self._height_scan_reward_stair_gate(
+            body_y_start=body_y_start,
+            body_y_end=body_y_end,
+            near_x_start=near_x_start,
+            near_x_end=near_x_end,
+            front_x_start=front_x_start,
+            front_x_end=front_x_end,
+            up_min_height=up_min_height,
+            up_max_height=up_max_height,
+            wall_min_height=wall_min_height,
+            min_step_score=min_step_score,
+            max_wall_score=max_wall_score,
+            log_interval=log_interval,
+        )
+
+        upper_surface_z = torch.maximum(gate["near_z"], gate["front_z"])
+        base_clearance = asset.data.root_pos_w[:, 2] - upper_surface_z
+        deficit = torch.clamp(float(min_clearance) - base_clearance, min=0.0)
+        value = torch.square(deficit / max(float(std), 1.0e-6))
+        value = torch.clamp(value, min=0.0, max=float(max_penalty))
+        active = (command_speed > float(min_command_speed)) & gate["up_step"]
+        value = value * active.float()
+
+        active_float = active.float()
+        active_count = active_float.sum().clamp_min(1.0)
+        active_clearance = (base_clearance * active_float).sum() / active_count
+        debug = getattr(self.env, "_stair_gate_debug", {})
+        debug["stair_base_clearance_penalty_mean"] = self._tensor_mean(value)
+        debug["stair_base_clearance_active_ratio"] = self._tensor_ratio(active)
+        debug["stair_base_clearance_mean"] = float(active_clearance.detach().float().item())
+        debug["stair_base_clearance_deficit_mean"] = self._tensor_mean(deficit * active_float)
+        self.env._stair_gate_debug = debug
+
+        if not hasattr(self.env, "_stair_base_clearance_log_count"):
+            self.env._stair_base_clearance_log_count = 0
+        self.env._stair_base_clearance_log_count += 1
+        count = self.env._stair_base_clearance_log_count
+        interval = max(int(log_interval), 1)
+        if count == 1 or count % interval == 0:
+            self._log_reward_warning(
+                "[StairBaseClearance] call=%d active=%.4f clearance=%.4f deficit=%.4f penalty=%.6f",
+                count,
+                debug["stair_base_clearance_active_ratio"],
+                debug["stair_base_clearance_mean"],
+                debug["stair_base_clearance_deficit_mean"],
+                debug["stair_base_clearance_penalty_mean"],
+            )
+        return value
+
+    def _reward_stair_edge_normal_alignment(
+        self,
+        command_name: str = "base_velocity",
+        min_command_speed: float = 0.10,
+        min_edge_strength: float = 0.04,
+        max_penalty: float = 1.0,
+        body_y_start: int = 5,
+        body_y_end: int = 11,
+        near_x_start: int = 0,
+        near_x_end: int = 4,
+        front_x_start: int = 4,
+        front_x_end: int = 10,
+        up_min_height: float = 0.025,
+        up_max_height: float = 0.20,
+        wall_min_height: float = 0.24,
+        min_step_score: float = 0.02,
+        max_wall_score: float = 0.08,
+        log_interval: int = 50,
+    ):
+        """Penalize moving along a stair edge instead of across its local normal."""
+        grid = self._height_scan_ground_proxy_grid()
+        zeros = torch.zeros(self.env.num_envs, device=self.env.device)
+        if grid is None:
+            return zeros
+
+        command = self._get_velocity_command(command_name)
+        command_xy = command[:, :2]
+        command_speed = torch.linalg.norm(command_xy, dim=1)
+        command_dir = command_xy / command_speed.unsqueeze(1).clamp_min(1.0e-6)
+        normal, edge_strength, lateral_ratio = self._height_scan_edge_normal_body(
+            grid,
+            body_y_start=body_y_start,
+            body_y_end=body_y_end,
+            x_start=near_x_start,
+            x_end=front_x_end,
+        )
+        forward_dir = torch.zeros_like(command_dir)
+        forward_dir[:, 0] = 1.0
+        command_dir = torch.where((command_speed > 1.0e-6).unsqueeze(1), command_dir, forward_dir)
+
+        gate = self._height_scan_reward_stair_gate(
+            body_y_start=body_y_start,
+            body_y_end=body_y_end,
+            near_x_start=near_x_start,
+            near_x_end=near_x_end,
+            front_x_start=front_x_start,
+            front_x_end=front_x_end,
+            up_min_height=up_min_height,
+            up_max_height=up_max_height,
+            wall_min_height=wall_min_height,
+            min_step_score=min_step_score,
+            max_wall_score=max_wall_score,
+            log_interval=log_interval,
+        )
+
+        align_cos = torch.abs(torch.sum(normal * command_dir, dim=1)).clamp(0.0, 1.0)
+        value = torch.clamp(1.0 - align_cos, min=0.0, max=float(max_penalty))
+        active = (
+            (command_speed > float(min_command_speed))
+            & gate["stair_gate"]
+            & (edge_strength > float(min_edge_strength))
+        )
+        value = value * active.float()
+
+        active_float = active.float()
+        active_count = active_float.sum().clamp_min(1.0)
+        debug = getattr(self.env, "_stair_gate_debug", {})
+        debug["stair_edge_normal_alignment_penalty_mean"] = self._tensor_mean(value)
+        debug["stair_edge_align_active_ratio"] = self._tensor_ratio(active)
+        debug["stair_edge_align_cos_mean"] = float(((align_cos * active_float).sum() / active_count).detach().float().item())
+        debug["stair_edge_lateral_ratio_mean"] = float(((lateral_ratio * active_float).sum() / active_count).detach().float().item())
+        debug["stair_edge_strength_mean"] = float(((edge_strength * active_float).sum() / active_count).detach().float().item())
+        self.env._stair_gate_debug = debug
+
+        if not hasattr(self.env, "_stair_edge_align_log_count"):
+            self.env._stair_edge_align_log_count = 0
+        self.env._stair_edge_align_log_count += 1
+        count = self.env._stair_edge_align_log_count
+        interval = max(int(log_interval), 1)
+        if count == 1 or count % interval == 0:
+            self._log_reward_warning(
+                "[StairEdgeNormalAlign] call=%d active=%.4f cos=%.4f lateral=%.4f strength=%.4f penalty=%.6f",
+                count,
+                debug["stair_edge_align_active_ratio"],
+                debug["stair_edge_align_cos_mean"],
+                debug["stair_edge_lateral_ratio_mean"],
+                debug["stair_edge_strength_mean"],
+                debug["stair_edge_normal_alignment_penalty_mean"],
+            )
         return value
 
     def _reward_feet_slide(self):
@@ -388,6 +984,228 @@ class RewardProcess(RewardProcessBase):
             max=1.0,
         )
         return commanded_to_move.float() * stillness
+
+    def _reward_commanded_stall_penalty(
+        self,
+        command_name: str = "base_velocity",
+        min_command_speed: float = 0.15,
+        min_projected_speed: float = 0.10,
+        progress_ratio: float = 0.25,
+        stall_time_s: float = 0.80,
+        step_dt: float = 0.02,
+        grace_after_contact_s: float = 0.20,
+        min_contact_air_time: float = 0.04,
+        body_y_start: int = 5,
+        body_y_end: int = 11,
+        near_x_start: int = 0,
+        near_x_end: int = 4,
+        front_x_start: int = 4,
+        front_x_end: int = 10,
+        up_min_height: float = 0.025,
+        up_max_height: float = 0.20,
+        wall_min_height: float = 0.24,
+        min_step_score: float = 0.02,
+        max_wall_score: float = 0.08,
+        log_interval: int = 100,
+    ):
+        """Penalize sustained failure to progress along the XY command.
+
+        This is not a dense forward reward.  It only activates after sustained
+        low projected velocity and is disabled during down-step probing and a
+        short window after touchdown, so it does not force a stair descent rush.
+        """
+        asset = self._get_robot_asset()
+        command = self._get_velocity_command(command_name)
+        command_xy = command[:, :2]
+        command_speed = torch.linalg.norm(command_xy, dim=1)
+        command_dir = command_xy / command_speed.unsqueeze(1).clamp_min(1.0e-6)
+        actual_xy = asset.data.root_lin_vel_b[:, :2]
+        projected_speed = torch.sum(actual_xy * command_dir, dim=1)
+
+        gate = self._height_scan_reward_stair_gate(
+            body_y_start=body_y_start,
+            body_y_end=body_y_end,
+            near_x_start=near_x_start,
+            near_x_end=near_x_end,
+            front_x_start=front_x_start,
+            front_x_end=front_x_end,
+            up_min_height=up_min_height,
+            up_max_height=up_max_height,
+            wall_min_height=wall_min_height,
+            min_step_score=min_step_score,
+            max_wall_score=max_wall_score,
+            log_interval=log_interval,
+        )
+
+        sensor_cfg = self._get_foot_sensor_cfg()
+        contact_sensor = self.env.scene.sensors[sensor_cfg.name]
+        contact_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :].norm(dim=-1)
+        contact_now = contact_forces > 1.0
+        first_contact = self._foot_first_contact(
+            contact_sensor,
+            sensor_cfg,
+            contact_now,
+            min_air_time=min_contact_air_time,
+            cache_name="commanded_stall",
+        )
+        any_first_contact = torch.any(first_contact, dim=1)
+
+        dt = max(float(step_dt), 1.0e-6)
+        grace_steps = max(int(math.ceil(float(grace_after_contact_s) / dt)), 0)
+        if (
+            not hasattr(self.env, "_commanded_stall_time")
+            or self.env._commanded_stall_time.shape != command_speed.shape
+        ):
+            self.env._commanded_stall_time = torch.zeros_like(command_speed)
+        if (
+            not hasattr(self.env, "_commanded_stall_contact_grace")
+            or self.env._commanded_stall_contact_grace.shape != command_speed.shape
+        ):
+            self.env._commanded_stall_contact_grace = torch.zeros_like(command_speed)
+
+        reset_mask = self._reset_mask().to(command_speed.device)
+        grace = self.env._commanded_stall_contact_grace.to(command_speed.device)
+        grace = torch.where(any_first_contact, torch.full_like(grace, float(grace_steps)), torch.clamp(grace - 1.0, min=0.0))
+        grace = torch.where(reset_mask, torch.zeros_like(grace), grace)
+        contact_grace_active = grace > 0.0
+
+        threshold = torch.maximum(
+            torch.full_like(command_speed, float(min_projected_speed)),
+            float(progress_ratio) * command_speed,
+        )
+        below_threshold = projected_speed < threshold
+        allowed_pause = gate["down_step"].to(command_speed.device) | contact_grace_active
+        commanded = command_speed > float(min_command_speed)
+        stalled = commanded & below_threshold & (~allowed_pause)
+
+        stall_time = self.env._commanded_stall_time.to(command_speed.device)
+        stall_time = torch.where(stalled, stall_time + dt, torch.zeros_like(stall_time))
+        stall_time = torch.where(reset_mask, torch.zeros_like(stall_time), stall_time)
+        self.env._commanded_stall_time = stall_time.detach().clone()
+        self.env._commanded_stall_contact_grace = grace.detach().clone()
+
+        severity = torch.clamp((threshold - projected_speed) / threshold.clamp_min(1.0e-6), min=0.0, max=1.0)
+        time_factor = torch.clamp((stall_time - float(stall_time_s)) / max(float(stall_time_s), 1.0e-6), min=0.0, max=1.0)
+        value = torch.square(severity) * torch.square(time_factor) * commanded.float()
+
+        debug = getattr(self.env, "_stair_gate_debug", {})
+        debug["commanded_stall_active_ratio"] = self._tensor_ratio(stalled)
+        debug["commanded_stall_penalty_mean"] = self._tensor_mean(value)
+        debug["commanded_stall_projected_speed_mean"] = self._tensor_mean(projected_speed)
+        debug["commanded_stall_time_mean"] = self._tensor_mean(stall_time)
+        self.env._stair_gate_debug = debug
+        return value
+
+    def _reward_uncommanded_yaw_rate(
+        self,
+        command_name: str = "base_velocity",
+        yaw_cmd_threshold: float = 0.08,
+        min_command_speed: float = 0.10,
+        base_scale: float = 0.25,
+        stair_scale: float = 1.0,
+        log_interval: int = 100,
+    ):
+        """Penalize yawing while the command asks for translation, not rotation.
+
+        This targets the observed "turn on the stair before climbing" behavior
+        without binding the policy to a world/stair axis.  The stair multiplier
+        uses the same height-scan structure gate as the stair foot rewards.
+        """
+        asset = self._get_robot_asset()
+        command = self._get_velocity_command(command_name)
+        command_speed = torch.linalg.norm(command[:, :2], dim=1)
+        no_yaw_command = torch.abs(command[:, 2]) < yaw_cmd_threshold
+        moving_command = command_speed > min_command_speed
+
+        gate = self._height_scan_reward_stair_gate(log_interval=log_interval)
+        stair_gate = gate["stair_gate"].float()
+        active = moving_command.float() * no_yaw_command.float()
+        scale = float(base_scale) + float(stair_scale) * stair_gate
+        yaw_rate = torch.abs(asset.data.root_ang_vel_b[:, 2])
+        value = torch.square(yaw_rate) * active * scale
+
+        debug = getattr(self.env, "_stair_gate_debug", {})
+        debug["uncommanded_yaw_active_ratio"] = self._tensor_ratio(active)
+        debug["uncommanded_yaw_stair_ratio"] = self._tensor_ratio(active * stair_gate)
+        debug["uncommanded_yaw_abs_mean"] = self._tensor_mean(yaw_rate)
+        debug["uncommanded_yaw_reward_mean"] = self._tensor_mean(value)
+        self.env._stair_gate_debug = debug
+        return value
+
+    def _reward_uncommanded_heading_drift(
+        self,
+        command_name: str = "base_velocity",
+        min_command_speed: float = 0.10,
+        yaw_cmd_threshold: float = 0.08,
+        deadzone_deg: float = 6.0,
+        max_error_deg: float = 45.0,
+        command_change_threshold: float = 1.0e-4,
+        log_interval: int = 100,
+    ):
+        """Penalize heading drift when the command asks for translation but no yaw.
+
+        The anchor heading is refreshed on env reset or when the mixed velocity
+        command changes.  This keeps the penalty command-relative instead of
+        binding the policy to a world axis, stair axis, or terrain label.
+        """
+        asset = self._get_robot_asset()
+        yaw = self._robot_yaw_w(asset)
+        command = self._get_velocity_command(command_name)
+        command_speed = torch.linalg.norm(command[:, :2], dim=1)
+
+        needs_init = (
+            not hasattr(self.env, "_uncommanded_heading_anchor_yaw")
+            or not hasattr(self.env, "_uncommanded_heading_anchor_cmd")
+            or self.env._uncommanded_heading_anchor_yaw.shape != yaw.shape
+            or self.env._uncommanded_heading_anchor_cmd.shape != command.shape
+        )
+        if needs_init:
+            self.env._uncommanded_heading_anchor_yaw = yaw.detach().clone()
+            self.env._uncommanded_heading_anchor_cmd = command.detach().clone()
+        else:
+            prev_cmd = self.env._uncommanded_heading_anchor_cmd.to(command.device)
+            command_changed = torch.linalg.norm(command - prev_cmd, dim=1) > command_change_threshold
+            refresh = self._reset_mask().to(command.device) | command_changed
+            anchor_yaw = torch.where(
+                refresh,
+                yaw.detach(),
+                self.env._uncommanded_heading_anchor_yaw.to(command.device),
+            )
+            anchor_cmd = torch.where(refresh.unsqueeze(1), command.detach(), prev_cmd)
+            self.env._uncommanded_heading_anchor_yaw = anchor_yaw.detach().clone()
+            self.env._uncommanded_heading_anchor_cmd = anchor_cmd.detach().clone()
+
+        anchor_yaw = self.env._uncommanded_heading_anchor_yaw.to(command.device)
+        heading_error = self._wrap_to_pi(yaw - anchor_yaw)
+        abs_error = torch.abs(heading_error)
+        deadzone = math.radians(float(deadzone_deg))
+        max_error = max(math.radians(float(max_error_deg)), deadzone + 1.0e-6)
+        excess = torch.clamp(abs_error - deadzone, min=0.0, max=max_error - deadzone)
+        normalized = excess / max(max_error - deadzone, 1.0e-6)
+
+        active = (command_speed > min_command_speed) & (torch.abs(command[:, 2]) < yaw_cmd_threshold)
+        value = torch.square(normalized) * active.float()
+
+        debug = getattr(self.env, "_stair_gate_debug", {})
+        debug["heading_drift_active_ratio"] = self._tensor_ratio(active.float())
+        debug["heading_drift_abs_deg_mean"] = self._tensor_mean(torch.rad2deg(abs_error))
+        debug["heading_drift_reward_mean"] = self._tensor_mean(value)
+        self.env._stair_gate_debug = debug
+
+        if not hasattr(self.env, "_heading_drift_log_count"):
+            self.env._heading_drift_log_count = 0
+        self.env._heading_drift_log_count += 1
+        count = self.env._heading_drift_log_count
+        interval = max(int(log_interval), 1)
+        if count == 1 or count % interval == 0:
+            self._log_reward_warning(
+                "[HeadingDrift] call=%d active=%.4f mean_abs_deg=%.3f reward_mean=%.6f",
+                count,
+                debug["heading_drift_active_ratio"],
+                debug["heading_drift_abs_deg_mean"],
+                debug["heading_drift_reward_mean"],
+            )
+        return value
 
     def _reward_feet_stumble(self):
         """Penalize feet hitting vertical surfaces (stair edges, walls).
@@ -527,6 +1345,295 @@ class RewardProcess(RewardProcessBase):
             return None
         scan = sensor.data.pos_w[:, 2:3] - ray_hits[..., 2]
         return scan[:, :256].view(self.env.num_envs, 16, 16)
+
+    def _height_scan_ground_proxy_grid(self):
+        """Return observation-compatible local ground-height proxy.
+
+        The height scanner stores distance-to-ground.  The rollout probe that
+        was validated in monitor data uses ``-height_scan`` as a local
+        ground-height proxy, because only relative deltas matter for stair vs
+        slope detection.  Reward-side stair gates must use the same semantics.
+        """
+        grid = self._height_scan_grid()
+        if grid is None:
+            return None
+        return torch.nan_to_num(-grid, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _height_scan_reward_stair_gate(
+        self,
+        body_y_start: int = 5,
+        body_y_end: int = 11,
+        near_x_start: int = 0,
+        near_x_end: int = 4,
+        front_x_start: int = 4,
+        front_x_end: int = 10,
+        up_min_height: float = 0.025,
+        up_max_height: float = 0.20,
+        down_min_height: float = 0.025,
+        down_max_height: float = 0.22,
+        wall_min_height: float = 0.24,
+        min_step_score: float = 0.02,
+        max_wall_score: float = 0.08,
+        direction_margin: float = 0.02,
+        log_interval: int = 100,
+    ):
+        """Height-scan gate matching the validated rollout monitor probes.
+
+        This replaces the old front-window mean-height gate.  It detects
+        discrete stair edges by local edge concentration, rejects smooth slopes,
+        and uses dominant up/down evidence so a reward can be tied to step-up
+        actions without using terrain labels or world-axis headings.
+        """
+        zeros = torch.zeros(self.env.num_envs, device=self.env.device)
+        grid = self._height_scan_ground_proxy_grid()
+        near_z = self._ground_z_window_from_scan(
+            body_y_start=body_y_start,
+            body_y_end=body_y_end,
+            x_start=near_x_start,
+            x_end=near_x_end,
+        )
+        front_z = self._ground_z_window_from_scan(
+            body_y_start=body_y_start,
+            body_y_end=body_y_end,
+            x_start=front_x_start,
+            x_end=front_x_end,
+        )
+        if grid is None or near_z is None or front_z is None:
+            self._set_stair_gate_debug(
+                "height_scan",
+                available=zeros,
+                up_step=zeros,
+                down_step=zeros,
+                wall=zeros,
+                flat=torch.ones_like(zeros),
+                step_delta=zeros,
+                step_score=zeros,
+                wall_score=zeros,
+            )
+            self._log_height_scan_gate_status(
+                available=zeros,
+                up_step=zeros,
+                down_step=zeros,
+                wall=zeros,
+                flat=torch.ones_like(zeros),
+                step_delta=zeros,
+                step_score=zeros,
+                wall_score=zeros,
+                reason="height_scan_unavailable",
+                log_interval=log_interval,
+            )
+            return {
+                "available": zeros,
+                "stair_gate": zeros.bool(),
+                "up_step": zeros.bool(),
+                "down_step": zeros.bool(),
+                "wall": zeros.bool(),
+                "flat": torch.ones_like(zeros).bool(),
+                "step_delta": zeros,
+                "step_height": zeros,
+                "step_score": zeros,
+                "wall_score": zeros,
+                "near_z": zeros,
+                "front_z": zeros,
+            }
+
+        thresholds = (
+            min(float(up_min_height), float(down_min_height)),
+            max(float(up_max_height), float(down_max_height)),
+            float(wall_min_height),
+            float(min_step_score),
+            float(max_wall_score),
+        )
+        method_outputs = [
+            self._height_scan_probe_method(
+                method_grid,
+                mode=mode,
+                thresholds=thresholds,
+                body_y_start=body_y_start,
+                body_y_end=body_y_end,
+                near_x_start=near_x_start,
+                near_x_end=near_x_end,
+                front_x_start=front_x_start,
+                front_x_end=front_x_end,
+            )
+            for method_grid, mode in (
+                (grid, "mean"),
+                (grid.transpose(1, 2), "mean"),
+                (grid, "edge"),
+                (grid.transpose(1, 2), "edge"),
+            )
+        ]
+        probe = {
+            "up": torch.stack([out["up"].float() for out in method_outputs], dim=1).amax(dim=1).bool(),
+            "down": torch.stack([out["down"].float() for out in method_outputs], dim=1).amax(dim=1).bool(),
+            "wall": torch.stack([out["wall"].float() for out in method_outputs], dim=1).amax(dim=1).bool(),
+            "step_delta": torch.stack([out["step_delta"] for out in method_outputs], dim=1).mean(dim=1),
+            "step_score": torch.stack([out["step_score"] for out in method_outputs], dim=1).amax(dim=1),
+            "wall_score": torch.stack([out["wall_score"] for out in method_outputs], dim=1).amax(dim=1),
+            "up_evidence": torch.stack([out["up_evidence"] for out in method_outputs], dim=1).amax(dim=1),
+            "down_evidence": torch.stack([out["down_evidence"] for out in method_outputs], dim=1).amax(dim=1),
+        }
+        structure = self._height_scan_structure_tensors(grid)
+        wall = probe["wall"] | structure["wall_like"]
+        base = (probe["step_score"] > float(min_step_score)) & (probe["wall_score"] < float(max_wall_score)) & (~wall)
+        diff = probe["up_evidence"] - probe["down_evidence"]
+        stair_gate = structure["stair_like"] & (~structure["slope_like"]) & (~wall)
+        up_step = stair_gate & base & (diff > float(direction_margin))
+        down_step = stair_gate & base & (diff < -float(direction_margin))
+        flat = ~(up_step | down_step | wall)
+        step_height = torch.clamp(structure["edge_sharpness"], 0.0, max(float(up_max_height), float(down_max_height)))
+        available = torch.ones_like(step_height)
+
+        self._set_stair_gate_debug(
+            "height_scan",
+            available=available,
+            up_step=up_step.float(),
+            down_step=down_step.float(),
+            wall=wall.float(),
+            flat=flat.float(),
+            step_delta=probe["step_delta"],
+            step_score=probe["step_score"],
+            wall_score=probe["wall_score"],
+        )
+        debug = getattr(self.env, "_stair_gate_debug", {})
+        debug["g_stair_noslope_m"] = self._tensor_ratio(stair_gate)
+        debug["g_dom_up_02"] = self._tensor_ratio(up_step)
+        debug["g_dom_down_02"] = self._tensor_ratio(down_step)
+        debug["g_dom_both_02"] = self._tensor_ratio(
+            stair_gate
+            & base
+            & (probe["up_evidence"] > float(min_step_score))
+            & (probe["down_evidence"] > float(min_step_score))
+            & (torch.abs(diff) <= float(direction_margin))
+        )
+        debug["g_step_edge_sharpness"] = self._tensor_mean(structure["edge_sharpness"])
+        debug["g_step_edge_locality"] = self._tensor_mean(structure["edge_locality"])
+        debug["g_slope_smoothness"] = self._tensor_mean(structure["slope_smoothness"])
+        debug["g_struct_wall"] = self._tensor_ratio(structure["wall_like"])
+        self.env._stair_gate_debug = debug
+        self._log_height_scan_gate_status(
+            available=available,
+            up_step=up_step.float(),
+            down_step=down_step.float(),
+            wall=wall.float(),
+            flat=flat.float(),
+            step_delta=probe["step_delta"],
+            step_score=probe["step_score"],
+            wall_score=probe["wall_score"],
+            reason="ok",
+            log_interval=log_interval,
+        )
+        return {
+            "available": available,
+            "stair_gate": stair_gate,
+            "up_step": up_step,
+            "down_step": down_step,
+            "wall": wall,
+            "flat": flat,
+            "step_delta": probe["step_delta"],
+            "step_height": step_height,
+            "step_score": probe["step_score"],
+            "wall_score": probe["wall_score"],
+            "near_z": near_z,
+            "front_z": front_z,
+        }
+
+    def _height_scan_structure_tensors(self, grid):
+        num_envs = grid.shape[0]
+        zeros = torch.zeros(num_envs, device=grid.device, dtype=grid.dtype)
+        window = grid[:, 5:11, 0:10]
+        if window.shape[1] < 2 or window.shape[2] < 2:
+            return {
+                "edge_sharpness": zeros,
+                "edge_locality": zeros,
+                "slope_smoothness": zeros,
+                "wall_like": zeros.bool(),
+                "stair_like": zeros.bool(),
+                "slope_like": zeros.bool(),
+            }
+        dx = window[:, :, 1:] - window[:, :, :-1]
+        dy = window[:, 1:, :] - window[:, :-1, :]
+        abs_edges = torch.cat(
+            [torch.abs(dx).reshape(num_envs, -1), torch.abs(dy).reshape(num_envs, -1)],
+            dim=1,
+        )
+        if abs_edges.numel() == 0:
+            return {
+                "edge_sharpness": zeros,
+                "edge_locality": zeros,
+                "slope_smoothness": zeros,
+                "wall_like": zeros.bool(),
+                "stair_like": zeros.bool(),
+                "slope_like": zeros.bool(),
+            }
+        edge_sharpness = abs_edges.amax(dim=1)
+        edge_mean = abs_edges.mean(dim=1)
+        slope_smoothness = torch.clamp(edge_mean / (edge_sharpness + 1.0e-6), min=0.0, max=1.0)
+        edge_locality = torch.clamp(1.0 - slope_smoothness, min=0.0, max=1.0)
+        wall_like = edge_sharpness > 0.30
+        stair_like = (
+            (edge_sharpness >= 0.040)
+            & (edge_locality >= 0.30)
+            & (slope_smoothness <= 0.45)
+            & (~wall_like)
+        )
+        slope_like = (
+            (edge_mean >= 0.006)
+            & (slope_smoothness >= 0.60)
+            & (edge_sharpness <= 0.070)
+            & (~wall_like)
+        )
+        return {
+            "edge_sharpness": edge_sharpness,
+            "edge_locality": edge_locality,
+            "slope_smoothness": slope_smoothness,
+            "wall_like": wall_like,
+            "stair_like": stair_like,
+            "slope_like": slope_like,
+        }
+
+    def _height_scan_edge_normal_body(
+        self,
+        grid,
+        body_y_start: int = 5,
+        body_y_end: int = 11,
+        x_start: int = 0,
+        x_end: int = 10,
+    ):
+        """Estimate the local stair-edge normal in robot body XY coordinates.
+
+        The 16x16 height scan is already robot-aligned.  Height gradients across
+        x/y scan cells approximate the normal of a discrete stair edge; the edge
+        itself is perpendicular to this vector.  The sign is not important for
+        crossing a stair, so downstream rewards use an absolute dot product.
+        """
+        num_envs = grid.shape[0]
+        zeros = torch.zeros(num_envs, device=grid.device, dtype=grid.dtype)
+        forward = torch.zeros((num_envs, 2), device=grid.device, dtype=grid.dtype)
+        forward[:, 0] = 1.0
+
+        y0 = max(0, min(int(body_y_start), 15))
+        y1 = max(y0 + 1, min(int(body_y_end), 16))
+        x0 = max(0, min(int(x_start), 15))
+        x1 = max(x0 + 1, min(int(x_end), 16))
+        window = grid[:, y0:y1, x0:x1]
+        if window.shape[1] < 2 or window.shape[2] < 2:
+            return forward, zeros, zeros
+
+        dx = window[:, :, 1:] - window[:, :, :-1]
+        dy = window[:, 1:, :] - window[:, :-1, :]
+        abs_dx = torch.abs(dx)
+        abs_dy = torch.abs(dy)
+        dx_weight = abs_dx.sum(dim=(1, 2)).clamp_min(1.0e-6)
+        dy_weight = abs_dy.sum(dim=(1, 2)).clamp_min(1.0e-6)
+        grad_x = (dx * abs_dx).sum(dim=(1, 2)) / dx_weight
+        grad_y = (dy * abs_dy).sum(dim=(1, 2)) / dy_weight
+        normal = torch.stack((grad_x, grad_y), dim=1)
+        norm = torch.linalg.norm(normal, dim=1, keepdim=True)
+        normal = torch.where(norm > 1.0e-6, normal / norm.clamp_min(1.0e-6), forward)
+        edge_strength = torch.maximum(abs_dx.amax(dim=(1, 2)), abs_dy.amax(dim=(1, 2)))
+        lateral_ratio = abs_dy.sum(dim=(1, 2)) / (abs_dx.sum(dim=(1, 2)) + abs_dy.sum(dim=(1, 2)) + 1.0e-6)
+        return normal, edge_strength, lateral_ratio
 
     def _ground_z_window_from_scan(
         self,
@@ -718,6 +1825,8 @@ class RewardProcess(RewardProcessBase):
                 "step_delta": zeros,
                 "step_score": zeros,
                 "wall_score": zeros,
+                "near_z": zeros,
+                "front_z": zeros,
             }
 
         y0 = max(0, min(int(body_y_start), 15))
@@ -787,6 +1896,8 @@ class RewardProcess(RewardProcessBase):
             "step_delta": step_delta,
             "step_score": step_score,
             "wall_score": wall_score,
+            "near_z": near_z,
+            "front_z": front_z,
         }
 
     def _height_scan_hit_grid(self):
@@ -1335,6 +2446,31 @@ class RewardProcess(RewardProcessBase):
         if time_outs is None:
             return terminated.bool()
         return torch.logical_or(terminated.bool(), time_outs.bool())
+
+    def _foot_first_contact(
+        self,
+        contact_sensor,
+        sensor_cfg,
+        contact_now,
+        min_air_time: float = 0.04,
+        cache_name: str = "foot_contact",
+    ):
+        """Return one-frame foot touchdown events with a per-reward contact latch."""
+        cache_attr = f"_{cache_name}_prev_contact"
+        last_air_time = contact_sensor.data.last_air_time[:, sensor_cfg.body_ids]
+        contact_now = contact_now.bool()
+        prev_contact = getattr(self.env, cache_attr, None)
+        if prev_contact is None or prev_contact.shape != contact_now.shape:
+            prev_contact = contact_now.detach().clone()
+            setattr(self.env, cache_attr, prev_contact)
+            return torch.zeros_like(contact_now, dtype=torch.bool)
+
+        prev_contact = prev_contact.to(contact_now.device).bool()
+        valid_air_time = last_air_time >= float(min_air_time)
+        reset_mask = self._reset_mask().to(contact_now.device).unsqueeze(1)
+        first_contact = contact_now & (~prev_contact) & valid_air_time & (~reset_mask)
+        setattr(self.env, cache_attr, contact_now.detach().clone())
+        return first_contact
 
     def _command_xy_speed_dir(self, command_name: str = "base_velocity"):
         command = self._get_velocity_command(command_name)
@@ -1997,6 +3133,149 @@ class RewardProcess(RewardProcessBase):
         heading_limit = math.radians(float(heading_limit_deg))
         heading_excess = torch.clamp(torch.abs(heading_angle) - heading_limit, min=0.0)
         return torch.square(heading_excess) * stair_gate.float() * command_gate.float()
+
+    def _reward_down_stair_speed_safety(
+        self,
+        command_name: str = "base_velocity",
+        min_command_speed: float = 0.10,
+        min_allowed_speed: float = 0.35,
+        command_speed_ratio: float = 0.65,
+        speed_std: float = 0.25,
+        max_vertical_speed: float = 0.35,
+        vertical_std: float = 0.25,
+        max_ang_vel_xy: float = 0.75,
+        ang_std: float = 0.45,
+        vertical_weight: float = 1.0,
+        angular_weight: float = 1.0,
+        max_penalty: float = 2.0,
+        body_y_start: int = 5,
+        body_y_end: int = 11,
+        near_x_start: int = 0,
+        near_x_end: int = 4,
+        front_x_start: int = 4,
+        front_x_end: int = 10,
+        up_min_height: float = 0.025,
+        up_max_height: float = 0.20,
+        wall_min_height: float = 0.24,
+        min_step_score: float = 0.02,
+        max_wall_score: float = 0.08,
+        log_interval: int = 50,
+    ):
+        """Penalize rushing and unstable body motion on detected down-steps."""
+        asset = self._get_robot_asset()
+        command = self._get_velocity_command(command_name)
+        command_xy = command[:, :2]
+        command_speed = torch.linalg.norm(command_xy, dim=1)
+        command_dir = command_xy / command_speed.unsqueeze(1).clamp_min(1.0e-6)
+        actual_xy = asset.data.root_lin_vel_b[:, :2]
+        projected_speed = torch.sum(actual_xy * command_dir, dim=1)
+
+        gate = self._height_scan_reward_stair_gate(
+            body_y_start=body_y_start,
+            body_y_end=body_y_end,
+            near_x_start=near_x_start,
+            near_x_end=near_x_end,
+            front_x_start=front_x_start,
+            front_x_end=front_x_end,
+            up_min_height=up_min_height,
+            up_max_height=up_max_height,
+            wall_min_height=wall_min_height,
+            min_step_score=min_step_score,
+            max_wall_score=max_wall_score,
+            log_interval=log_interval,
+        )
+
+        allowed_speed = torch.maximum(
+            torch.full_like(command_speed, float(min_allowed_speed)),
+            float(command_speed_ratio) * command_speed,
+        )
+        speed_excess = torch.clamp(projected_speed - allowed_speed, min=0.0)
+        vertical_excess = torch.clamp(torch.abs(asset.data.root_lin_vel_b[:, 2]) - float(max_vertical_speed), min=0.0)
+        ang_xy = torch.linalg.norm(asset.data.root_ang_vel_b[:, :2], dim=1)
+        angular_excess = torch.clamp(ang_xy - float(max_ang_vel_xy), min=0.0)
+        value = (
+            torch.square(speed_excess / max(float(speed_std), 1.0e-6))
+            + float(vertical_weight) * torch.square(vertical_excess / max(float(vertical_std), 1.0e-6))
+            + float(angular_weight) * torch.square(angular_excess / max(float(ang_std), 1.0e-6))
+        )
+        value = torch.clamp(value, min=0.0, max=float(max_penalty))
+        active = (command_speed > float(min_command_speed)).float() * gate["down_step"].float()
+        value = value * active
+
+        debug = getattr(self.env, "_stair_gate_debug", {})
+        debug["down_stair_speed_safety_penalty_mean"] = self._tensor_mean(value)
+        debug["down_stair_speed_safety_active_ratio"] = self._tensor_ratio(active)
+        debug["down_stair_speed_safety_projected_mean"] = self._tensor_mean(projected_speed)
+        debug["down_stair_speed_safety_allowed_mean"] = self._tensor_mean(allowed_speed)
+        self.env._stair_gate_debug = debug
+        return value
+
+    def _reward_down_stair_touchdown_safety(
+        self,
+        max_foot_down_vel: float = 0.45,
+        foot_vel_std: float = 0.30,
+        max_contact_force: float = 180.0,
+        force_std: float = 120.0,
+        max_penalty: float = 2.0,
+        min_air_time: float = 0.04,
+        body_y_start: int = 5,
+        body_y_end: int = 11,
+        near_x_start: int = 0,
+        near_x_end: int = 4,
+        front_x_start: int = 4,
+        front_x_end: int = 10,
+        up_min_height: float = 0.025,
+        up_max_height: float = 0.20,
+        wall_min_height: float = 0.24,
+        min_step_score: float = 0.02,
+        max_wall_score: float = 0.08,
+        log_interval: int = 50,
+    ):
+        """Penalize hard down-step touchdowns."""
+        sensor_cfg = self._get_foot_sensor_cfg()
+        asset_cfg = self._get_foot_asset_cfg()
+        contact_sensor = self.env.scene.sensors[sensor_cfg.name]
+        asset = self.env.scene[asset_cfg.name]
+        gate = self._height_scan_reward_stair_gate(
+            body_y_start=body_y_start,
+            body_y_end=body_y_end,
+            near_x_start=near_x_start,
+            near_x_end=near_x_end,
+            front_x_start=front_x_start,
+            front_x_end=front_x_end,
+            up_min_height=up_min_height,
+            up_max_height=up_max_height,
+            wall_min_height=wall_min_height,
+            min_step_score=min_step_score,
+            max_wall_score=max_wall_score,
+            log_interval=log_interval,
+        )
+
+        contact_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :].norm(dim=-1)
+        contact_now = contact_forces > 1.0
+        first_contact = self._foot_first_contact(
+            contact_sensor,
+            sensor_cfg,
+            contact_now,
+            min_air_time=min_air_time,
+            cache_name="down_stair_touchdown_safety",
+        )
+        foot_vel_z = asset.data.body_lin_vel_w[:, asset_cfg.body_ids, 2]
+        down_vel = torch.clamp(-foot_vel_z - float(max_foot_down_vel), min=0.0)
+        force_excess = torch.clamp(contact_forces - float(max_contact_force), min=0.0)
+        velocity_penalty = torch.square(down_vel / max(float(foot_vel_std), 1.0e-6)) * first_contact.float()
+        force_penalty = torch.square(force_excess / max(float(force_std), 1.0e-6)) * contact_now.float()
+        per_foot = velocity_penalty + force_penalty
+        per_foot = torch.clamp(per_foot, min=0.0, max=float(max_penalty))
+        active = gate["down_step"].float().unsqueeze(1) * ((first_contact | (force_excess > 0.0)).float())
+        value = torch.sum(per_foot * active, dim=1) / max(len(asset_cfg.body_ids), 1)
+
+        debug = getattr(self.env, "_stair_gate_debug", {})
+        debug["down_stair_touchdown_safety_penalty_mean"] = self._tensor_mean(value)
+        debug["down_stair_touchdown_safety_active_ratio"] = self._tensor_ratio(active)
+        debug["down_stair_touchdown_safety_down_vel_mean"] = self._tensor_mean(torch.clamp(-foot_vel_z, min=0.0))
+        self.env._stair_gate_debug = debug
+        return value
 
     def _reward_down_stair_safety(
         self,

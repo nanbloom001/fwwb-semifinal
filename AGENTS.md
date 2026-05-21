@@ -291,8 +291,8 @@ AI agent operating rule:
   deletes `agent_diy/codex_rpc_bridge_runtime/uploads` after successful apply and
   uses split retention under `agent_diy/codex_rpc_bridge_runtime/backups`:
   keep only the newest 1 directory under `backups/sync` for one-click sync
-  backups, and only the newest 3 directories under `backups/rpc` for direct RPC
-  write backups. `codex_file_rpc.log` is capped to 512KB by default. If a sync
+  backups, and only the newest 1 directory under `backups/rpc` for direct RPC
+  write backups. `codex_file_rpc.log` is capped to 64KB by default. If a sync
   is interrupted before cleanup, remove stale upload/backup directories before
   packaging or starting a platform submission.
 - Do not upload repository notes/docs or local metadata as part of routine code
