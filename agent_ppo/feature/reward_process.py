@@ -49,6 +49,7 @@ class RewardProcess(RewardProcessBase):
         min_tracking_vx: float = 0.0,
     ):
         """Track XY velocity while optionally lifting low vx commands."""
+        asset = self._get_robot_asset()
         command = self._get_velocity_command(command_name)
         effective_command_xy = command[:, :2].clone()
         if min_tracking_vx > 0.0:
@@ -58,6 +59,7 @@ class RewardProcess(RewardProcessBase):
 
     def _reward_track_ang_vel_z(self, std: float = 0.25, command_name: str = "base_velocity"):
         """Track yaw-rate against the same mixed command that the policy sees."""
+        asset = self._get_robot_asset()
         command = self._get_velocity_command(command_name)
         ang_vel_error = torch.square(command[:, 2] - asset.data.root_ang_vel_b[:, 2])
         return torch.exp(-ang_vel_error / max(std * std, 1.0e-6))
@@ -75,6 +77,7 @@ class RewardProcess(RewardProcessBase):
         dense credit for moving in the commanded direction, which discourages
         stair hesitation/timeouts without binding the robot to a world axis.
         """
+        asset = self._get_robot_asset()
         command = self._get_velocity_command(command_name)
         command_xy = command[:, :2]
         command_speed = torch.linalg.norm(command_xy, dim=1)
@@ -692,7 +695,24 @@ class RewardProcess(RewardProcessBase):
         self.env._stair_gate_debug = debug
         return value
 
-    def _reward_stair_base_clearance_penalty(
+    def _reward_stair_base_clearance_penalty(self, *args, **kwargs):
+        try:
+            return self._stair_base_clearance_penalty_impl(*args, **kwargs)
+        except Exception as exc:
+            if not hasattr(self.env, "_stair_base_clearance_error_count"):
+                self.env._stair_base_clearance_error_count = 0
+            self.env._stair_base_clearance_error_count += 1
+            count = self.env._stair_base_clearance_error_count
+            if count == 1 or count % 100 == 0:
+                self._log_reward_warning(
+                    "[StairBaseClearanceError] call=%d error=%s: %s",
+                    count,
+                    type(exc).__name__,
+                    exc,
+                )
+            return torch.zeros(self.env.num_envs, device=self.env.device)
+
+    def _stair_base_clearance_penalty_impl(
         self,
         command_name: str = "base_velocity",
         min_command_speed: float = 0.10,
@@ -765,7 +785,24 @@ class RewardProcess(RewardProcessBase):
             )
         return value
 
-    def _reward_stair_edge_normal_alignment(
+    def _reward_stair_edge_normal_alignment(self, *args, **kwargs):
+        try:
+            return self._stair_edge_normal_alignment_impl(*args, **kwargs)
+        except Exception as exc:
+            if not hasattr(self.env, "_stair_edge_align_error_count"):
+                self.env._stair_edge_align_error_count = 0
+            self.env._stair_edge_align_error_count += 1
+            count = self.env._stair_edge_align_error_count
+            if count == 1 or count % 100 == 0:
+                self._log_reward_warning(
+                    "[StairEdgeNormalAlignError] call=%d error=%s: %s",
+                    count,
+                    type(exc).__name__,
+                    exc,
+                )
+            return torch.zeros(self.env.num_envs, device=self.env.device)
+
+    def _stair_edge_normal_alignment_impl(
         self,
         command_name: str = "base_velocity",
         min_command_speed: float = 0.10,
