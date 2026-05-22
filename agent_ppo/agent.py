@@ -100,6 +100,8 @@ class Agent(BaseAgent):
             logger=self.logger,
             monitor=self.monitor,
             learning_rate=stage.lr,
+            min_learning_rate=getattr(stage, "min_lr", 1e-5),
+            max_learning_rate=getattr(stage, "max_lr", 1e-2),
             num_mini_batches=stage.num_mini_batches,
             num_learning_epochs=stage.num_learning_epochs,
         )

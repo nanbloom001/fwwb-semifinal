@@ -27,6 +27,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("capture_dir", type=Path, help="monitor capture session directory")
     parser.add_argument("--downsample-points", type=int, default=80)
     parser.add_argument("--smooth-window", type=int, default=9)
+    parser.add_argument("--cycle-min-period", type=int, default=2)
+    parser.add_argument("--cycle-max-period", type=int, default=8)
+    parser.add_argument("--cycle-smooth-window", type=int, default=3)
     parser.add_argument(
         "--no-full-series",
         action="store_true",
@@ -248,6 +251,152 @@ def centered_moving_average(points: list[tuple[int, float]], window: int) -> lis
     return smoothed
 
 
+def _safe_corr(a: list[float], b: list[float]) -> float:
+    if len(a) != len(b) or len(a) < 3:
+        return 0.0
+    mean_a = statistics.fmean(a)
+    mean_b = statistics.fmean(b)
+    var_a = sum((value - mean_a) ** 2 for value in a)
+    var_b = sum((value - mean_b) ** 2 for value in b)
+    if var_a <= 1e-24 or var_b <= 1e-24:
+        return 0.0
+    cov = sum((x - mean_a) * (y - mean_b) for x, y in zip(a, b))
+    return cov / math.sqrt(var_a * var_b)
+
+
+def infer_cycle_period(
+    points: list[tuple[int, float]],
+    min_period: int,
+    max_period: int,
+    trend_window: int,
+) -> tuple[int | None, float]:
+    """Infer a short periodic sampling artifact from detrended residuals.
+
+    The monitor often emits a low/low/low/high pattern when some terrain buckets
+    finish near max episode length while others terminate early.  Detecting the
+    period on detrended residuals avoids falsely treating slow learning curves as
+    cyclic.
+    """
+    if len(points) < max(18, max_period * 4):
+        return None, 0.0
+
+    trend = centered_moving_average(points, max(trend_window, max_period * 3))
+    residual = [value - trend_value for (_, value), (_, trend_value) in zip(points, trend)]
+    if max(residual) - min(residual) <= 1e-12:
+        return None, 0.0
+
+    best_period: int | None = None
+    best_corr = 0.0
+    for period in range(max(2, min_period), max_period + 1):
+        corr = _safe_corr(residual[:-period], residual[period:])
+        if corr > best_corr:
+            best_corr = corr
+            best_period = period
+
+    if best_period is None or best_corr < 0.45:
+        return None, best_corr
+    return best_period, best_corr
+
+
+def cycle_bias_corrected_smoothing(
+    points: list[tuple[int, float]],
+    min_period: int,
+    max_period: int,
+    trend_window: int,
+    smooth_window: int,
+) -> tuple[list[tuple[int, float]], dict[str, Any]]:
+    """Remove a detected short-period phase bias, then lightly smooth.
+
+    This is deliberately conservative: it writes a separate analysis view and
+    preserves the original series.  It subtracts a robust per-phase residual
+    median rather than using a wide moving average, so real long-horizon changes
+    are retained better than with a large smoothing window.
+    """
+    if len(points) <= 2:
+        return list(points), {"method": "copy", "reason": "too_few_points"}
+
+    period, corr = infer_cycle_period(points, min_period, max_period, trend_window)
+    if period is None:
+        smoothed = centered_moving_average(points, smooth_window)
+        return smoothed, {
+            "method": "centered_moving_average",
+            "reason": "no_strong_cycle",
+            "best_corr": corr,
+            "smooth_window": smooth_window,
+        }
+
+    trend = centered_moving_average(points, max(trend_window, period * 3))
+    residual = [value - trend_value for (_, value), (_, trend_value) in zip(points, trend)]
+    phase_residuals: list[list[float]] = [[] for _ in range(period)]
+    for idx, value in enumerate(residual):
+        phase_residuals[idx % period].append(value)
+
+    phase_bias = [
+        statistics.median(values) if values else 0.0
+        for values in phase_residuals
+    ]
+    # Keep the global level unchanged; only remove relative phase bias.
+    center = statistics.fmean(phase_bias)
+    phase_bias = [value - center for value in phase_bias]
+
+    corrected = [
+        (timestamp, value - phase_bias[idx % period])
+        for idx, (timestamp, value) in enumerate(points)
+    ]
+    smoothed = centered_moving_average(corrected, smooth_window)
+    return smoothed, {
+        "method": "cycle_bias_corrected",
+        "period_points": period,
+        "period_seconds": int((points[1][0] - points[0][0]) * period / 1000) if len(points) > 1 else None,
+        "residual_lag_corr": corr,
+        "trend_window": max(trend_window, period * 3),
+        "smooth_window": smooth_window,
+        "phase_bias": phase_bias,
+    }
+
+
+def cycle_block_aggregate(
+    points: list[tuple[int, float]],
+    min_period: int,
+    max_period: int,
+    trend_window: int,
+) -> tuple[list[tuple[int, float]], dict[str, Any]]:
+    """Aggregate one detected monitor cycle into one point.
+
+    For sawtooth counters, each phase can represent a different completion
+    bucket.  Averaging a full period is less distorting than smoothing across
+    arbitrary windows because it keeps every phase exactly once.
+    """
+    if len(points) <= 2:
+        return list(points), {"method": "copy", "reason": "too_few_points"}
+
+    period, corr = infer_cycle_period(points, min_period, max_period, trend_window)
+    if period is None:
+        return list(points), {
+            "method": "copy",
+            "reason": "no_strong_cycle",
+            "best_corr": corr,
+        }
+
+    aggregated: list[tuple[int, float]] = []
+    for start in range(0, len(points), period):
+        block = points[start : start + period]
+        if len(block) < max(2, period // 2):
+            continue
+        timestamp = block[len(block) // 2][0]
+        value = statistics.fmean(value for _, value in block)
+        aggregated.append((timestamp, value))
+
+    return aggregated, {
+        "method": "cycle_block_mean",
+        "period_points": period,
+        "period_seconds": int((points[1][0] - points[0][0]) * period / 1000) if len(points) > 1 else None,
+        "residual_lag_corr": corr,
+        "raw_points": len(points),
+        "aggregated_points": len(aggregated),
+    }
+
+
 def summarize(points: list[tuple[int, float]], meta: dict[str, Any]) -> dict[str, Any]:
     values = [value for _, value in points]
     first20 = values[: min(20, len(values))]
@@ -435,7 +584,7 @@ def build_markdown_report(capture_dir: Path, summary: dict[str, dict[str, Any]],
         f"- capture_dir: `{capture_dir}`",
         f"- series_count: {overview['series_count']}",
         f"- source: {overview.get('source')}",
-        f"- outputs: `{overview['outputs']['ai_readable']}`, `{overview['outputs']['inventory']}`, `{overview['outputs']['summary']}`, `{overview['outputs']['lttb']}`, `{overview['outputs']['smoothed']}`",
+        f"- outputs: `{overview['outputs']['ai_readable']}`, `{overview['outputs']['inventory']}`, `{overview['outputs']['summary']}`, `{overview['outputs']['lttb']}`, `{overview['outputs']['smoothed']}`, `{overview['outputs']['cycle_smoothed']}`, `{overview['outputs']['cycle_blocks']}`",
         "",
         "This report is a factual preprocessing view only. It does not classify training quality or make optimization recommendations.",
         "",
@@ -536,6 +685,28 @@ def main() -> None:
         name: encode_points(centered_moving_average(points, args.smooth_window))
         for name, points in sorted(series.items())
     }
+    cycle_smoothed: dict[str, list[dict[str, float | int]]] = {}
+    cycle_diagnostics: dict[str, dict[str, Any]] = {}
+    cycle_blocks: dict[str, list[dict[str, float | int]]] = {}
+    cycle_block_diagnostics: dict[str, dict[str, Any]] = {}
+    for name, points in sorted(series.items()):
+        processed, diagnostic = cycle_bias_corrected_smoothing(
+            points,
+            min_period=args.cycle_min_period,
+            max_period=args.cycle_max_period,
+            trend_window=args.smooth_window,
+            smooth_window=args.cycle_smooth_window,
+        )
+        cycle_smoothed[name] = encode_points(processed)
+        cycle_diagnostics[name] = diagnostic
+        block_points, block_diagnostic = cycle_block_aggregate(
+            points,
+            min_period=args.cycle_min_period,
+            max_period=args.cycle_max_period,
+            trend_window=args.smooth_window,
+        )
+        cycle_blocks[name] = encode_points(block_points)
+        cycle_block_diagnostics[name] = block_diagnostic
 
     (capture_dir / "all_metric_series_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2)
@@ -554,6 +725,18 @@ def main() -> None:
     )
     (capture_dir / "all_metric_series_smoothed.json").write_text(
         json.dumps(smoothed, ensure_ascii=False)
+    )
+    (capture_dir / "all_metric_series_cycle_smoothed.json").write_text(
+        json.dumps(cycle_smoothed, ensure_ascii=False)
+    )
+    (capture_dir / "cycle_smoothing_diagnostics.json").write_text(
+        json.dumps(cycle_diagnostics, ensure_ascii=False, indent=2)
+    )
+    (capture_dir / "all_metric_series_cycle_blocks.json").write_text(
+        json.dumps(cycle_blocks, ensure_ascii=False)
+    )
+    (capture_dir / "cycle_block_diagnostics.json").write_text(
+        json.dumps(cycle_block_diagnostics, ensure_ascii=False, indent=2)
     )
     if not args.no_full_series:
         (capture_dir / "all_metric_series.json").write_text(
@@ -574,6 +757,9 @@ def main() -> None:
         "empty_metric_count": sum(1 for item in summary.values() if item.get("count", 0) == 0),
         "downsample_points": args.downsample_points,
         "smooth_window": args.smooth_window,
+        "cycle_min_period": args.cycle_min_period,
+        "cycle_max_period": args.cycle_max_period,
+        "cycle_smooth_window": args.cycle_smooth_window,
         "group_counts": dict(sorted(group_counts.items())),
         "outputs": {
             "ai_readable": "ai_readable_metrics.json",
@@ -583,6 +769,10 @@ def main() -> None:
             "full_series": None if args.no_full_series else "all_metric_series.json",
             "lttb": "all_metric_series_lttb.json",
             "smoothed": "all_metric_series_smoothed.json",
+            "cycle_smoothed": "all_metric_series_cycle_smoothed.json",
+            "cycle_diagnostics": "cycle_smoothing_diagnostics.json",
+            "cycle_blocks": "all_metric_series_cycle_blocks.json",
+            "cycle_block_diagnostics": "cycle_block_diagnostics.json",
             "report": "analysis_report.md",
         },
     }

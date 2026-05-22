@@ -86,16 +86,16 @@ max_init_terrain_level = 9
 # preserve the original gait, while making stairs/inverse-stairs the main
 # acquisition target.
 [terrain.standard.pyramid_slope]
-proportion = 0.075
+proportion = 0.10
 
 [terrain.standard.pyramid_slope_inv]
-proportion = 0.075
+proportion = 0.10
 
 [terrain.standard.pyramid_stairs]
 proportion = 0.40
 
 [terrain.standard.pyramid_stairs_inv]
-proportion = 0.45
+proportion = 0.40
 
 [terrain.standard.maze]
 proportion = 0.0
@@ -153,7 +153,7 @@ pos = [0.0, 0.0, 0.35]
 [commands]
 # Velocity command resampling interval [min, max] (seconds).
 # 速度命令重采样区间 [min, max]（秒）
-resampling_time = [10.0, 15.0]
+resampling_time = [12.0, 18.0]
 
 [commands.limit]
 # Velocity command **hard limits** (curriculum may expand sampling range up to here).
@@ -181,9 +181,9 @@ ang_vel_yaw = [-0.40, 0.40]
 # without rewarding a pre-stair yaw turn.
 enabled = true
 spin_only_ratio = 0.00
-vx_only_ratio = 0.60
+vx_only_ratio = 0.50
 vx_vy_only_ratio = 0.00
-full_ratio = 0.40
+full_ratio = 0.50
 log_interval = 200
 
 
@@ -598,13 +598,13 @@ log_interval = 50
 # Sparse touchdown reward for placing the foot forward onto an up-step surface.
 # Kept weaker than clearance because first-contact signals are noisier.
 # Fixed tiny touchdown weight; keep low because first-contact timing is noisy.
-weight = 0.30
+weight = 0.33
 [rewards.stair_forward_foot_placement.params]
 command_name = "base_velocity"
-target_forward = 0.12
-max_forward = 0.30
-forward_std = 0.12
-overshoot_std = 0.12
+target_forward = 0.10
+max_forward = 0.24
+forward_std = 0.10
+overshoot_std = 0.07
 height_std = 0.09
 touchdown_speed_std = 0.50
 foot_ground_offset = 0.02
@@ -628,10 +628,10 @@ log_interval = 50
 [rewards.stair_over_clearance_penalty]
 # Penalize sustained swing-foot height far above the scan-estimated upper stair
 # surface.  Fixed non-zero registration; do not schedule from zero.
-weight = -0.12
+weight = -0.13
 [rewards.stair_over_clearance_penalty.params]
-max_clearance = 0.16
-std = 0.06
+max_clearance = 0.15
+std = 0.055
 min_air_time = 0.08
 body_y_start = 5
 body_y_end = 11
@@ -647,16 +647,102 @@ max_wall_score = 0.08
 max_penalty = 1.5
 log_interval = 50
 
+[rewards.stair_swing_step_targeting]
+# Dense swing-phase stair targeting.  Encourages short, step-by-step foot
+# placement near the next stair surface instead of long lunges.
+weight = 0.065
+[rewards.stair_swing_step_targeting.params]
+command_name = "base_velocity"
+min_forward = 0.06
+max_forward = 0.24
+forward_std = 0.08
+overshoot_std = 0.08
+target_clearance = 0.055
+down_target_clearance = 0.035
+height_std = 0.07
+max_air_time = 0.55
+min_command_speed = 0.10
+body_y_start = 5
+body_y_end = 11
+near_x_start = 0
+near_x_end = 4
+front_x_start = 4
+front_x_end = 10
+up_min_height = 0.025
+up_max_height = 0.20
+wall_min_height = 0.24
+min_step_score = 0.02
+max_wall_score = 0.08
+reward_scale = 1.5
+max_reward = 1.0
+log_interval = 50
+
+[rewards.stair_stride_length_penalty]
+# Penalize overreaching on stairs: front feet too far ahead, hind feet lagging,
+# or excessive front-to-hind stance span.
+weight = -0.030
+[rewards.stair_stride_length_penalty.params]
+command_name = "base_velocity"
+max_front_reach = 0.28
+max_hind_lag = 0.36
+max_body_span = 0.62
+reach_std = 0.08
+span_std = 0.10
+min_command_speed = 0.10
+body_y_start = 5
+body_y_end = 11
+near_x_start = 0
+near_x_end = 4
+front_x_start = 4
+front_x_end = 10
+up_min_height = 0.025
+up_max_height = 0.20
+wall_min_height = 0.24
+min_step_score = 0.02
+max_wall_score = 0.08
+max_penalty = 2.0
+log_interval = 50
+
+[rewards.stair_support_continuity_penalty]
+# Penalize stair steps with too few contacts or only front/hind support.  This
+# is a soft gait-independent support term, not a fixed gait-phase prior.
+weight = -0.020
+[rewards.stair_support_continuity_penalty.params]
+command_name = "base_velocity"
+min_contacts = 2.0
+front_hind_balance_weight = 0.35
+min_command_speed = 0.10
+body_y_start = 5
+body_y_end = 11
+near_x_start = 0
+near_x_end = 4
+front_x_start = 4
+front_x_end = 10
+up_min_height = 0.025
+up_max_height = 0.20
+wall_min_height = 0.24
+min_step_score = 0.02
+max_wall_score = 0.08
+max_penalty = 2.0
+log_interval = 50
+
 [rewards.stair_base_clearance_penalty]
-# Penalize the "body too low on up-step" failure mode only when the height
-# scanner sees an upward stair edge.  This is not a global base-height prior.
+# Penalize low trunk/belly clearance over detected stair edges on both ascent
+# and descent.  This is local to stair transitions and is not a global base
+# height prior.
 weight = -0.08
 [rewards.stair_base_clearance_penalty.params]
 command_name = "base_velocity"
 min_command_speed = 0.10
-min_clearance = 0.34
-std = 0.08
-max_penalty = 1.5
+min_body_clearance = 0.12
+body_half_length = 0.24
+body_half_width = 0.09
+body_half_height = 0.10
+fallback_body_bottom_offset = 0.10
+std = 0.05
+max_penalty = 2.0
+up_scale = 1.0
+down_scale = 0.8
 body_y_start = 5
 body_y_end = 11
 near_x_start = 0
@@ -748,8 +834,8 @@ log_interval = 50
 
 [fine_tune_schedule]
 enabled = true
-transition_seconds = 900.0
-fallback_transition_episodes = 90
+transition_seconds = 5400.0
+fallback_transition_episodes = 540
 update_interval_episodes = 10
 log_interval_episodes = 10
 
@@ -762,8 +848,11 @@ commanded_stall_penalty = -0.10
 track_ang_vel_z = 1.33
 feet_clearance = 0.40
 height_scan_feet_clearance = 0.28
-stair_forward_foot_placement = 0.30
-stair_over_clearance_penalty = -0.12
+stair_forward_foot_placement = 0.33
+stair_over_clearance_penalty = -0.13
+stair_swing_step_targeting = 0.065
+stair_stride_length_penalty = -0.030
+stair_support_continuity_penalty = -0.020
 stair_base_clearance_penalty = -0.08
 stair_edge_normal_alignment = -0.035
 down_stair_speed_safety = -0.10
@@ -786,65 +875,68 @@ dof_vel = -0.0004
 energy = -0.000020
 
 [fine_tune_schedule.reward_target]
-track_lin_vel_xy = 2.25
-command_direction_progress = 0.60
-command_direction_deviation = -0.52
-command_path_progress = 0.40
+track_lin_vel_xy = 2.70
+command_direction_progress = 0.55
+command_direction_deviation = -0.62
+command_path_progress = 0.28
 commanded_stall_penalty = -0.10
-track_ang_vel_z = 1.30
-feet_clearance = 0.30
-height_scan_feet_clearance = 0.28
+track_ang_vel_z = 1.40
+feet_clearance = 0.28
+height_scan_feet_clearance = 0.22
 stair_forward_foot_placement = 0.38
-stair_over_clearance_penalty = -0.15
-stair_base_clearance_penalty = -0.08
+stair_over_clearance_penalty = -0.20
+stair_swing_step_targeting = 0.16
+stair_stride_length_penalty = -0.10
+stair_support_continuity_penalty = -0.075
+stair_base_clearance_penalty = -0.14
 stair_edge_normal_alignment = -0.035
-down_stair_speed_safety = -0.12
-down_stair_touchdown_safety = -0.18
-uncommanded_yaw_rate = -0.095
-uncommanded_heading_drift = -0.095
-ang_vel_xy = -0.28
-feet_air_time = 0.28
-air_time_variance_penalty = -0.85
+down_stair_speed_safety = -0.16
+down_stair_touchdown_safety = -0.22
+uncommanded_yaw_rate = -0.12
+uncommanded_heading_drift = -0.12
+ang_vel_xy = -0.38
+feet_air_time = 0.22
+air_time_variance_penalty = -0.88
 feet_stumble = -0.05
 base_lateral_vel = -0.50
 pivot_turning = -0.25
-flat_orientation = -1.00
-correct_base_height = -0.35
+flat_orientation = -1.35
+correct_base_height = -0.42
 joint_position_penalty = -0.18
 termination = -3.5
 action_rate = -0.014
 action_smoothness = -0.007
 dof_vel = -0.0004
-energy = -0.000020
+energy = -0.000030
 
 [[fine_tune_schedule.terrain_phases]]
 alpha = 0.0
 difficulty_range = [0.0, 1.0]
 max_init_terrain_level = 9
-pyramid_slope = 0.075
-pyramid_slope_inv = 0.075
+pyramid_slope = 0.10
+pyramid_slope_inv = 0.10
 pyramid_stairs = 0.40
-pyramid_stairs_inv = 0.45
+pyramid_stairs_inv = 0.40
 maze = 0.0
 
 [[fine_tune_schedule.terrain_phases]]
 alpha = 0.5
 difficulty_range = [0.0, 1.0]
 max_init_terrain_level = 9
-pyramid_slope = 0.075
-pyramid_slope_inv = 0.075
+pyramid_slope = 0.10
+pyramid_slope_inv = 0.10
 pyramid_stairs = 0.40
-pyramid_stairs_inv = 0.45
+pyramid_stairs_inv = 0.40
 maze = 0.0
 
 [[fine_tune_schedule.terrain_phases]]
 alpha = 1.0
 difficulty_range = [0.0, 1.0]
 max_init_terrain_level = 9
-pyramid_slope = 0.075
-pyramid_slope_inv = 0.075
+pyramid_slope = 0.10
+pyramid_slope_inv = 0.10
 pyramid_stairs = 0.40
-pyramid_stairs_inv = 0.45
+pyramid_stairs_inv = 0.40
 maze = 0.0
 
 

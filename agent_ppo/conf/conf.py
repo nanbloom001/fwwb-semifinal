@@ -55,6 +55,8 @@ class StageConfig:
     # --- Training hyperparameters
     # 训练超参数 ---
     lr = 3e-4
+    min_lr = 1e-5
+    max_lr = 1e-2
     num_learning_epochs = 5
     num_mini_batches = 4
     num_steps_per_env = 48
@@ -74,7 +76,9 @@ class Nan10StairBridgeConfig(StageConfig):
 
     name = "nan10_stair_bridge"
     task_type = "standard"
-    lr = 1e-5
+    lr = 1.5e-5
+    min_lr = 1e-5
+    max_lr = 2e-4
     num_learning_epochs = 2
     num_mini_batches = 4
     num_steps_per_env = 48

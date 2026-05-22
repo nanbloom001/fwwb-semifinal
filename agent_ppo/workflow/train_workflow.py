@@ -465,6 +465,9 @@ class FineTuneSchedule:
             "w_hs_clear": self._reward_weight("height_scan_feet_clearance"),
             "w_stair_place": self._reward_weight("stair_forward_foot_placement"),
             "w_over_clear": self._reward_weight("stair_over_clearance_penalty"),
+            "w_stair_swing": self._reward_weight("stair_swing_step_targeting"),
+            "w_stair_stride": self._reward_weight("stair_stride_length_penalty"),
+            "w_stair_support": self._reward_weight("stair_support_continuity_penalty"),
             "w_base_clear": self._reward_weight("stair_base_clearance_penalty"),
             "w_edge_align": self._reward_weight("stair_edge_normal_alignment"),
             "w_down_speed": self._reward_weight("down_stair_speed_safety"),
@@ -483,6 +486,9 @@ class FineTuneSchedule:
             "sched_hs_clear_w": self._reward_weight("height_scan_feet_clearance"),
             "sched_stair_place_w": self._reward_weight("stair_forward_foot_placement"),
             "sched_over_clear_w": self._reward_weight("stair_over_clearance_penalty"),
+            "sched_stair_swing_w": self._reward_weight("stair_swing_step_targeting"),
+            "sched_stair_stride_w": self._reward_weight("stair_stride_length_penalty"),
+            "sched_stair_support_w": self._reward_weight("stair_support_continuity_penalty"),
             "sched_base_clear_w": self._reward_weight("stair_base_clearance_penalty"),
             "sched_edge_align_w": self._reward_weight("stair_edge_normal_alignment"),
             "sched_down_speed_w": self._reward_weight("down_stair_speed_safety"),
@@ -827,6 +833,9 @@ class FineTuneSchedule:
             "height_scan_feet_clearance",
             "stair_forward_foot_placement",
             "stair_over_clearance_penalty",
+            "stair_swing_step_targeting",
+            "stair_stride_length_penalty",
+            "stair_support_continuity_penalty",
             "stair_base_clearance_penalty",
             "stair_edge_normal_alignment",
             "down_stair_speed_safety",
@@ -2393,6 +2402,18 @@ def _sample_stair_gate_debug_stats(env):
         "cmd_stall_time": "commanded_stall_time_mean",
         "over_clear_active": "stair_over_clearance_active_ratio",
         "over_clear_penalty": "stair_over_clearance_penalty_mean",
+        "stair_swing_active": "stair_swing_step_targeting_active_ratio",
+        "stair_swing_reward": "stair_swing_step_targeting_reward_mean",
+        "stair_swing_forward": "stair_swing_step_targeting_forward_mean",
+        "stair_swing_clearance": "stair_swing_step_targeting_clearance_mean",
+        "stair_stride_active": "stair_stride_length_active_ratio",
+        "stair_stride_penalty": "stair_stride_length_penalty_mean",
+        "stair_stride_span": "stair_stride_span_mean",
+        "stair_stride_reach": "stair_stride_front_reach_mean",
+        "stair_support_active": "stair_support_continuity_active_ratio",
+        "stair_support_penalty": "stair_support_continuity_penalty_mean",
+        "stair_support_contacts": "stair_support_contact_count_mean",
+        "stair_support_balance": "stair_support_balance_loss_mean",
         "base_clear_active": "stair_base_clearance_active_ratio",
         "base_clearance": "stair_base_clearance_mean",
         "base_clear_deficit": "stair_base_clearance_deficit_mean",
@@ -2410,7 +2431,8 @@ def _sample_stair_gate_debug_stats(env):
         "hs_probe_reason_code": "hs_probe_reason_code",
     }
     for alias, source_key in aliases.items():
-        stats[alias] = float(stats.get(source_key, 0.0))
+        if source_key in stats:
+            stats[alias] = float(stats[source_key])
     return stats
 
 

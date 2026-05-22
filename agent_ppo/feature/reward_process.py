@@ -695,6 +695,268 @@ class RewardProcess(RewardProcessBase):
         self.env._stair_gate_debug = debug
         return value
 
+    def _reward_stair_swing_step_targeting(
+        self,
+        command_name: str = "base_velocity",
+        min_forward: float = 0.06,
+        max_forward: float = 0.24,
+        forward_std: float = 0.08,
+        overshoot_std: float = 0.08,
+        target_clearance: float = 0.055,
+        down_target_clearance: float = 0.035,
+        height_std: float = 0.07,
+        max_air_time: float = 0.55,
+        min_command_speed: float = 0.10,
+        body_y_start: int = 5,
+        body_y_end: int = 11,
+        near_x_start: int = 0,
+        near_x_end: int = 4,
+        front_x_start: int = 4,
+        front_x_end: int = 10,
+        up_min_height: float = 0.025,
+        up_max_height: float = 0.20,
+        wall_min_height: float = 0.24,
+        min_step_score: float = 0.02,
+        max_wall_score: float = 0.08,
+        reward_scale: float = 1.5,
+        max_reward: float = 1.0,
+        log_interval: int = 50,
+    ):
+        """Dense stair swing reward for short, step-by-step foot targeting.
+
+        Mature locomotion rewards usually define swing from contact state and
+        shape clearance/placement during swing.  This term follows that pattern
+        without hard-coding a trot phase: while a stair edge is detected, swing
+        feet are rewarded for moving a short distance along the command
+        direction and staying near the next stair surface instead of reaching
+        far ahead or lifting arbitrarily high.
+        """
+        sensor_cfg = self._get_foot_sensor_cfg()
+        asset_cfg = self._get_foot_asset_cfg()
+        contact_sensor = self.env.scene.sensors[sensor_cfg.name]
+        asset = self.env.scene[asset_cfg.name]
+
+        gate = self._height_scan_reward_stair_gate(
+            body_y_start=body_y_start,
+            body_y_end=body_y_end,
+            near_x_start=near_x_start,
+            near_x_end=near_x_end,
+            front_x_start=front_x_start,
+            front_x_end=front_x_end,
+            up_min_height=up_min_height,
+            up_max_height=up_max_height,
+            wall_min_height=wall_min_height,
+            min_step_score=min_step_score,
+            max_wall_score=max_wall_score,
+            log_interval=log_interval,
+        )
+
+        command = self._get_velocity_command(command_name)
+        command_xy = command[:, :2]
+        command_speed = torch.linalg.norm(command_xy, dim=1)
+        command_dir = command_xy / command_speed.unsqueeze(1).clamp_min(1.0e-6)
+        fallback = torch.zeros_like(command_dir)
+        fallback[:, 0] = 1.0
+        command_dir = torch.where((command_speed > 1.0e-6).unsqueeze(1), command_dir, fallback)
+
+        contact_forces = (
+            contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
+            .norm(dim=-1)
+            .max(dim=1)[0]
+        )
+        swing = contact_forces <= 1.0
+        air_time = contact_sensor.data.current_air_time[:, sensor_cfg.body_ids]
+        air_time_ok = air_time <= float(max_air_time)
+
+        foot_rel_xy = asset.data.body_pos_w[:, asset_cfg.body_ids, :2] - asset.data.root_pos_w[:, :2].unsqueeze(1)
+        foot_forward, foot_lateral = self._project_world_xy_to_body_xy(asset, foot_rel_xy)
+        foot_command_forward = (
+            foot_forward * command_dir[:, 0].unsqueeze(1)
+            + foot_lateral * command_dir[:, 1].unsqueeze(1)
+        )
+        shortfall = torch.clamp(float(min_forward) - foot_command_forward, min=0.0)
+        overshoot = torch.clamp(foot_command_forward - float(max_forward), min=0.0)
+        forward_score = torch.exp(-torch.square(shortfall / max(float(forward_std), 1.0e-6)))
+        forward_score = forward_score * torch.exp(-torch.square(overshoot / max(float(overshoot_std), 1.0e-6)))
+
+        foot_z = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
+        upper_surface_z = torch.maximum(gate["near_z"], gate["front_z"])
+        lower_surface_z = torch.minimum(gate["near_z"], gate["front_z"])
+        target_surface_z = torch.where(gate["down_step"], lower_surface_z, upper_surface_z)
+        target_clearance_by_env = torch.where(
+            gate["down_step"],
+            torch.full_like(command_speed, float(down_target_clearance)),
+            torch.full_like(command_speed, float(target_clearance)),
+        )
+        clearance = foot_z - target_surface_z.unsqueeze(1)
+        height_error = (clearance - target_clearance_by_env.unsqueeze(1)) / max(float(height_std), 1.0e-6)
+        height_score = torch.exp(-torch.square(height_error))
+
+        active_env = gate["stair_gate"] & (command_speed > float(min_command_speed))
+        per_foot = forward_score * height_score * swing.float() * air_time_ok.float()
+        value = torch.sum(per_foot, dim=1) / max(len(asset_cfg.body_ids), 1)
+        value = value * active_env.float()
+        value = torch.clamp(value * float(reward_scale), min=0.0, max=float(max_reward))
+
+        active = active_env.unsqueeze(1) & swing & air_time_ok
+        debug = getattr(self.env, "_stair_gate_debug", {})
+        debug["stair_swing_step_targeting_reward_mean"] = self._tensor_mean(value)
+        debug["stair_swing_step_targeting_active_ratio"] = self._tensor_ratio(active)
+        debug["stair_swing_step_targeting_forward_mean"] = self._tensor_mean(foot_command_forward)
+        debug["stair_swing_step_targeting_clearance_mean"] = self._tensor_mean(clearance)
+        self.env._stair_gate_debug = debug
+        return value
+
+    def _reward_stair_stride_length_penalty(
+        self,
+        command_name: str = "base_velocity",
+        max_front_reach: float = 0.32,
+        max_hind_lag: float = 0.40,
+        max_body_span: float = 0.68,
+        reach_std: float = 0.08,
+        span_std: float = 0.10,
+        min_command_speed: float = 0.10,
+        body_y_start: int = 5,
+        body_y_end: int = 11,
+        near_x_start: int = 0,
+        near_x_end: int = 4,
+        front_x_start: int = 4,
+        front_x_end: int = 10,
+        up_min_height: float = 0.025,
+        up_max_height: float = 0.20,
+        wall_min_height: float = 0.24,
+        min_step_score: float = 0.02,
+        max_wall_score: float = 0.08,
+        max_penalty: float = 2.0,
+        log_interval: int = 50,
+    ):
+        """Penalize stair overreach that turns climbing into a long lunge."""
+        asset_cfg = self._get_foot_asset_cfg()
+        asset = self.env.scene[asset_cfg.name]
+        gate = self._height_scan_reward_stair_gate(
+            body_y_start=body_y_start,
+            body_y_end=body_y_end,
+            near_x_start=near_x_start,
+            near_x_end=near_x_end,
+            front_x_start=front_x_start,
+            front_x_end=front_x_end,
+            up_min_height=up_min_height,
+            up_max_height=up_max_height,
+            wall_min_height=wall_min_height,
+            min_step_score=min_step_score,
+            max_wall_score=max_wall_score,
+            log_interval=log_interval,
+        )
+
+        command = self._get_velocity_command(command_name)
+        command_xy = command[:, :2]
+        command_speed = torch.linalg.norm(command_xy, dim=1)
+        command_dir = command_xy / command_speed.unsqueeze(1).clamp_min(1.0e-6)
+        fallback = torch.zeros_like(command_dir)
+        fallback[:, 0] = 1.0
+        command_dir = torch.where((command_speed > 1.0e-6).unsqueeze(1), command_dir, fallback)
+
+        foot_rel_xy = asset.data.body_pos_w[:, asset_cfg.body_ids, :2] - asset.data.root_pos_w[:, :2].unsqueeze(1)
+        foot_forward, foot_lateral = self._project_world_xy_to_body_xy(asset, foot_rel_xy)
+        foot_command_forward = (
+            foot_forward * command_dir[:, 0].unsqueeze(1)
+            + foot_lateral * command_dir[:, 1].unsqueeze(1)
+        )
+
+        frontmost = torch.max(foot_command_forward, dim=1).values
+        hindmost = torch.min(foot_command_forward, dim=1).values
+        body_span = frontmost - hindmost
+        front_over = torch.clamp(frontmost - float(max_front_reach), min=0.0)
+        hind_lag = torch.clamp((-hindmost) - float(max_hind_lag), min=0.0)
+        span_over = torch.clamp(body_span - float(max_body_span), min=0.0)
+
+        value = torch.square(front_over / max(float(reach_std), 1.0e-6))
+        value = value + torch.square(hind_lag / max(float(reach_std), 1.0e-6))
+        value = value + torch.square(span_over / max(float(span_std), 1.0e-6))
+        value = torch.clamp(value, min=0.0, max=float(max_penalty))
+        active = gate["stair_gate"] & (command_speed > float(min_command_speed))
+        value = value * active.float()
+
+        debug = getattr(self.env, "_stair_gate_debug", {})
+        debug["stair_stride_length_penalty_mean"] = self._tensor_mean(value)
+        debug["stair_stride_length_active_ratio"] = self._tensor_ratio(active)
+        debug["stair_stride_span_mean"] = self._tensor_mean(body_span)
+        debug["stair_stride_front_reach_mean"] = self._tensor_mean(frontmost)
+        self.env._stair_gate_debug = debug
+        return value
+
+    def _reward_stair_support_continuity_penalty(
+        self,
+        command_name: str = "base_velocity",
+        min_contacts: float = 2.0,
+        front_hind_balance_weight: float = 0.35,
+        min_command_speed: float = 0.10,
+        body_y_start: int = 5,
+        body_y_end: int = 11,
+        near_x_start: int = 0,
+        near_x_end: int = 4,
+        front_x_start: int = 4,
+        front_x_end: int = 10,
+        up_min_height: float = 0.025,
+        up_max_height: float = 0.20,
+        wall_min_height: float = 0.24,
+        min_step_score: float = 0.02,
+        max_wall_score: float = 0.08,
+        max_penalty: float = 2.0,
+        log_interval: int = 50,
+    ):
+        """Penalize unstable support loss on stair terrain."""
+        sensor_cfg = self._get_foot_sensor_cfg()
+        asset_cfg = self._get_foot_asset_cfg()
+        contact_sensor = self.env.scene.sensors[sensor_cfg.name]
+        asset = self.env.scene[asset_cfg.name]
+        gate = self._height_scan_reward_stair_gate(
+            body_y_start=body_y_start,
+            body_y_end=body_y_end,
+            near_x_start=near_x_start,
+            near_x_end=near_x_end,
+            front_x_start=front_x_start,
+            front_x_end=front_x_end,
+            up_min_height=up_min_height,
+            up_max_height=up_max_height,
+            wall_min_height=wall_min_height,
+            min_step_score=min_step_score,
+            max_wall_score=max_wall_score,
+            log_interval=log_interval,
+        )
+
+        command = self._get_velocity_command(command_name)
+        command_speed = torch.linalg.norm(command[:, :2], dim=1)
+        contact_forces = (
+            contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
+            .norm(dim=-1)
+            .max(dim=1)[0]
+        )
+        contact_now = contact_forces > 1.0
+        contact_count = torch.sum(contact_now.float(), dim=1)
+        contact_deficit = torch.clamp(float(min_contacts) - contact_count, min=0.0)
+
+        foot_rel_xy = asset.data.body_pos_w[:, asset_cfg.body_ids, :2] - asset.data.root_pos_w[:, :2].unsqueeze(1)
+        foot_forward, _ = self._project_world_xy_to_body_xy(asset, foot_rel_xy)
+        front_contact = contact_now & (foot_forward > 0.0)
+        hind_contact = contact_now & (foot_forward <= 0.0)
+        front_missing = torch.sum(front_contact.float(), dim=1) < 1.0
+        hind_missing = torch.sum(hind_contact.float(), dim=1) < 1.0
+        balance_loss = (front_missing | hind_missing).float() * float(front_hind_balance_weight)
+
+        value = torch.square(contact_deficit) + balance_loss
+        value = torch.clamp(value, min=0.0, max=float(max_penalty))
+        active = gate["stair_gate"] & (command_speed > float(min_command_speed))
+        value = value * active.float()
+
+        debug = getattr(self.env, "_stair_gate_debug", {})
+        debug["stair_support_continuity_penalty_mean"] = self._tensor_mean(value)
+        debug["stair_support_continuity_active_ratio"] = self._tensor_ratio(active & (value > 0.0))
+        debug["stair_support_contact_count_mean"] = self._tensor_mean(contact_count)
+        debug["stair_support_balance_loss_mean"] = self._tensor_mean(balance_loss)
+        self.env._stair_gate_debug = debug
+        return value
+
     def _reward_stair_base_clearance_penalty(self, *args, **kwargs):
         try:
             return self._stair_base_clearance_penalty_impl(*args, **kwargs)
@@ -716,9 +978,16 @@ class RewardProcess(RewardProcessBase):
         self,
         command_name: str = "base_velocity",
         min_command_speed: float = 0.10,
-        min_clearance: float = 0.34,
-        std: float = 0.08,
-        max_penalty: float = 1.5,
+        min_body_clearance: float = 0.12,
+        min_clearance=None,
+        body_half_length: float = 0.24,
+        body_half_width: float = 0.09,
+        body_half_height: float = 0.10,
+        fallback_body_bottom_offset: float = 0.10,
+        std: float = 0.05,
+        max_penalty: float = 2.0,
+        up_scale: float = 1.0,
+        down_scale: float = 0.8,
         body_y_start: int = 5,
         body_y_end: int = 11,
         near_x_start: int = 0,
@@ -732,7 +1001,13 @@ class RewardProcess(RewardProcessBase):
         max_wall_score: float = 0.08,
         log_interval: int = 50,
     ):
-        """Penalize a low base over an up-step without enforcing flat height globally."""
+        """Penalize low belly clearance over stair edges without a global height prior.
+
+        The old version used root/base-center height over an up-step only.  This
+        estimates the lowest trunk underside corner from root pose and measures
+        it against the higher side of a detected stair edge, so both ascending
+        and descending stair transitions get a local anti-scrape signal.
+        """
         asset = self._get_robot_asset()
         command = self._get_velocity_command(command_name)
         command_speed = torch.linalg.norm(command[:, :2], dim=1)
@@ -751,22 +1026,43 @@ class RewardProcess(RewardProcessBase):
             log_interval=log_interval,
         )
 
-        upper_surface_z = torch.maximum(gate["near_z"], gate["front_z"])
-        base_clearance = asset.data.root_pos_w[:, 2] - upper_surface_z
-        deficit = torch.clamp(float(min_clearance) - base_clearance, min=0.0)
+        high_surface_z = torch.maximum(gate["near_z"], gate["front_z"])
+        body_bottom_z = self._trunk_underside_min_z(
+            asset,
+            body_half_length=body_half_length,
+            body_half_width=body_half_width,
+            body_half_height=body_half_height,
+            fallback_body_bottom_offset=fallback_body_bottom_offset,
+        )
+        body_clearance = body_bottom_z - high_surface_z
+        target_clearance = float(min_body_clearance if min_clearance is None else min_clearance)
+        deficit = torch.clamp(target_clearance - body_clearance, min=0.0)
         value = torch.square(deficit / max(float(std), 1.0e-6))
         value = torch.clamp(value, min=0.0, max=float(max_penalty))
-        active = (command_speed > float(min_command_speed)) & gate["up_step"]
+        stair_active = gate["up_step"] | gate["down_step"]
+        active = (command_speed > float(min_command_speed)) & stair_active
+        transition_scale = torch.where(
+            gate["down_step"],
+            torch.full_like(value, float(down_scale)),
+            torch.full_like(value, float(up_scale)),
+        )
+        value = value * transition_scale
         value = value * active.float()
 
         active_float = active.float()
         active_count = active_float.sum().clamp_min(1.0)
-        active_clearance = (base_clearance * active_float).sum() / active_count
+        active_clearance = (body_clearance * active_float).sum() / active_count
+        active_body_bottom = (body_bottom_z * active_float).sum() / active_count
+        active_edge_z = (high_surface_z * active_float).sum() / active_count
         debug = getattr(self.env, "_stair_gate_debug", {})
         debug["stair_base_clearance_penalty_mean"] = self._tensor_mean(value)
         debug["stair_base_clearance_active_ratio"] = self._tensor_ratio(active)
+        debug["stair_base_clearance_up_ratio"] = self._tensor_ratio(active & gate["up_step"])
+        debug["stair_base_clearance_down_ratio"] = self._tensor_ratio(active & gate["down_step"])
         debug["stair_base_clearance_mean"] = float(active_clearance.detach().float().item())
         debug["stair_base_clearance_deficit_mean"] = self._tensor_mean(deficit * active_float)
+        debug["stair_base_clearance_body_bottom_mean"] = float(active_body_bottom.detach().float().item())
+        debug["stair_base_clearance_edge_z_mean"] = float(active_edge_z.detach().float().item())
         self.env._stair_gate_debug = debug
 
         if not hasattr(self.env, "_stair_base_clearance_log_count"):
@@ -776,14 +1072,48 @@ class RewardProcess(RewardProcessBase):
         interval = max(int(log_interval), 1)
         if count == 1 or count % interval == 0:
             self._log_reward_warning(
-                "[StairBaseClearance] call=%d active=%.4f clearance=%.4f deficit=%.4f penalty=%.6f",
+                "[StairBaseClearance] call=%d active=%.4f up=%.4f down=%.4f "
+                "clearance=%.4f deficit=%.4f belly_z=%.4f edge_z=%.4f penalty=%.6f",
                 count,
                 debug["stair_base_clearance_active_ratio"],
+                debug["stair_base_clearance_up_ratio"],
+                debug["stair_base_clearance_down_ratio"],
                 debug["stair_base_clearance_mean"],
                 debug["stair_base_clearance_deficit_mean"],
+                debug["stair_base_clearance_body_bottom_mean"],
+                debug["stair_base_clearance_edge_z_mean"],
                 debug["stair_base_clearance_penalty_mean"],
             )
         return value
+
+    def _trunk_underside_min_z(
+        self,
+        asset,
+        body_half_length: float = 0.24,
+        body_half_width: float = 0.09,
+        body_half_height: float = 0.10,
+        fallback_body_bottom_offset: float = 0.10,
+    ):
+        root_z = asset.data.root_pos_w[:, 2]
+        quat = getattr(asset.data, "root_quat_w", None)
+        if quat is None:
+            return root_z - float(fallback_body_bottom_offset)
+
+        quat = quat.to(device=root_z.device, dtype=root_z.dtype)
+        w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+        r20 = 2.0 * (x * z - w * y)
+        r21 = 2.0 * (y * z + w * x)
+        r22 = 1.0 - 2.0 * (x * x + y * y)
+
+        lx = float(body_half_length)
+        ly = float(body_half_width)
+        lz = -float(body_half_height)
+        z_offsets = []
+        for sx in (-lx, lx):
+            for sy in (-ly, ly):
+                z_offsets.append(r20 * sx + r21 * sy + r22 * lz)
+        min_offset = torch.stack(z_offsets, dim=1).amin(dim=1)
+        return root_z + min_offset
 
     def _reward_stair_edge_normal_alignment(self, *args, **kwargs):
         try:
