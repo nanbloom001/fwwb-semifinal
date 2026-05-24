@@ -7,8 +7,6 @@
 Author: Tencent AI Arena Authors
 """
 
-from __future__ import annotations
-
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
@@ -49,6 +47,9 @@ class ActorCritic(nn.Module):
         actor_hidden_dims: tuple[int] | list[int] = (512, 256, 128),
         critic_hidden_dims: tuple[int] | list[int] = (512, 256, 128),
         activation: str = "elu",
+        rnn_type: str = "lstm",
+        rnn_hidden_size: int = 256,
+        rnn_num_layers: int = 1,
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
         **kwargs: dict[str, Any],
@@ -78,6 +79,10 @@ class ActorCritic(nn.Module):
         super().__init__()
 
         activation_fn = resolve_nn_activation(activation)
+
+        # Keep recurrent constructor args for API compatibility, but use the
+        # original feed-forward actor so locomotion checkpoints transfer.
+        self._hidden_states = None
 
         # Build actor MLP
         # 构建策略网络
@@ -141,6 +146,12 @@ class ActorCritic(nn.Module):
         """
         pass
 
+    def get_hidden_states(self):
+        return None
+
+    def set_hidden_states(self, hidden_states):
+        self._hidden_states = None
+
     def forward(self):
         """
         Forward pass (not implemented, use act/evaluate instead)
@@ -172,7 +183,7 @@ class ActorCritic(nn.Module):
         """
         return self.distribution.entropy().sum(dim=-1)
 
-    def update_distribution(self, obs: torch.Tensor):
+    def update_distribution(self, obs: torch.Tensor, hidden_states=None, masks: torch.Tensor | None = None):
         """
         Update action distribution based on observations
         基于观测更新动作分布
@@ -181,6 +192,8 @@ class ActorCritic(nn.Module):
             obs: [B, num_obs] flat actor observation tensor
             obs: [B, num_obs] Actor观测张量
         """
+        if obs.dim() != 2:
+            raise ValueError(f"Actor observation must be 2D [B, num_obs], got shape {tuple(obs.shape)}")
         mean = self.actor(obs)
         if self.noise_std_type == "scalar":
             std = self.std.clamp(min=1e-6).expand_as(mean)

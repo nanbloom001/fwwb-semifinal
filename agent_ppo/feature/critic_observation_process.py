@@ -1,45 +1,60 @@
 # -*- coding: UTF-8 -*-
 ###########################################################################
-# Copyright © 1998 - 2026 Tencent. All Rights Reserved.
+# Copyright 漏 1998 - 2026 Tencent. All Rights Reserved.
 ###########################################################################
-"""
-CriticObservationProcess — custom critic observation processor.
-CriticObservationProcess — 自定义 critic 观测处理器。
+"""Critic observation processor."""
 
-critic obs layout: [critic_proprio(60) | height_scan(256)] → 316 dim
-critic 观测布局：[critic_proprio(60) | height_scan(256)] → 316 维
+import torch
 
-When extending to track terrain, please refer to the extension guide in
-policy_observation_process.py; the critic observation must stay in sync
-with the policy on the task-information convention.
-扩展到 track 地形时，请参考 policy_observation_process.py 的扩展指引；
-critic 观测需保持与 policy 同步的任务信息约定。
-"""
-
+from agent_ppo.conf.conf import Config
 from tools.base_env.observation_process import ObservationProcess
-from agent_ppo.feature.command_mix import apply_command_mix_to_observation
 
 
 class CriticObservationProcess(ObservationProcess):
     target_group = "critic"
-    _EXPECTED_OBS_DIM = 316
+    _BASE_OBS_DIM = 316
+
+    def _goal_features(self):
+        feature_dim = getattr(Config.CURRENT, "num_goal_obs", 0)
+        if feature_dim <= 0:
+            return None
+
+        zeros = torch.zeros(self.env.num_envs, feature_dim, device=self.env.device)
+        if feature_dim != 3:
+            return zeros
+
+        if hasattr(self, "goal_position_in_robot_frame"):
+            self.goal_position_in_robot_frame()
+        if not hasattr(self.env, "goal_positions") or self.env.goal_positions is None:
+            return zeros
+
+        try:
+            robot = self.env.scene["robot"]
+            root_pos_w = robot.data.root_pos_w
+            quat = robot.data.root_quat_w
+        except Exception:
+            return zeros
+
+        delta_w = self.env.goal_positions[:, :2] - root_pos_w[:, :2]
+        qw, qx, qy, qz = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+        heading = torch.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+        cos_h = torch.cos(-heading)
+        sin_h = torch.sin(-heading)
+        local_x = cos_h * delta_w[:, 0] - sin_h * delta_w[:, 1]
+        local_y = sin_h * delta_w[:, 0] + cos_h * delta_w[:, 1]
+        local_goal = torch.stack((local_x, local_y), dim=1)
+        local_goal = torch.clamp(local_goal / 10.0, -1.0, 1.0)
+        goal_dist = torch.clamp(torch.linalg.norm(delta_w, dim=1), 0.0, 20.0) / 20.0
+        return torch.cat((local_goal, goal_dist.unsqueeze(1)), dim=1)
 
     def process(self):
         obs = self.default_observation()
-        if obs.shape[-1] != self._EXPECTED_OBS_DIM:
+        if obs.shape[-1] != self._BASE_OBS_DIM:
             raise ValueError(
-                f"Critic observation dim mismatch: expected {self._EXPECTED_OBS_DIM}, got {obs.shape[-1]}. "
-                "This usually means height_scan or privileged observation layout changed unexpectedly."
+                f"Critic observation dim mismatch: expected base {self._BASE_OBS_DIM}, got {obs.shape[-1]}."
             )
-        obs = apply_command_mix_to_observation(
-            self.env,
-            obs,
-            slice(9, 12),
-            command_name="base_velocity",
-            site="critic_obs",
-        )
-        # TODO (track terrain): if the policy observation appends goal features,
-        # the critic observation must keep the same task-information convention.
-        # TODO (track 地形)：如果 policy 观测追加了 goal 特征，
-        # critic 观测也需保持同步的任务信息约定。
+
+        goal_features = self._goal_features()
+        if goal_features is not None:
+            obs = self.concatenate_terms(obs, goal_features)
         return obs

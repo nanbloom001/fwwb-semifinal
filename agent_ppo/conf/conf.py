@@ -11,9 +11,10 @@ Author: Tencent AI Arena Authors
 import os
 
 try:
-    import tomllib as _toml_loader
+    import toml
 except ModuleNotFoundError:
-    import toml as _toml_loader
+    toml = None
+    import tomllib
 
 
 # Valid task types (Isaac Lab native config format)
@@ -43,6 +44,7 @@ class StageConfig:
     num_actions = 12  # Go2 joint action dim / Go2 关节动作维度
     num_proprio_obs = 45  # proprioceptive obs dim / 本体感知观测维度
     num_scan = 256  # 16x16 height-scan dim / 16x16 高度扫描维度
+    num_goal_obs = 0
     num_critic_observations = 316  # proprio(45) + scan(256) + privileged(15)
 
     # --- Model architecture
@@ -55,34 +57,109 @@ class StageConfig:
     # --- Training hyperparameters
     # 训练超参数 ---
     lr = 3e-4
-    min_lr = 1e-5
-    max_lr = 1e-2
     num_learning_epochs = 5
     num_mini_batches = 4
     num_steps_per_env = 48
+    clip_param = 0.2
+    entropy_coef = 0.01
+    desired_kl = 0.01
+    init_noise_std = 1.0
     min_normalized_std = [0.05, 0.02, 0.05] * 4
+    max_normalized_std = [1.2, 0.8, 1.2] * 4
 
     # --- Saving
     # 保存 ---
-    model_save_interval = 200
+    model_save_interval = 50
 
 
-class Nan10StairBridgeConfig(StageConfig):
+class CustomConfig(StageConfig):
+    # TODO: you can refer to LocomotionConfig to design your own track-terrain
+    # navigation training stage. The following items need to be specified:
+    # 1. stage name;
+    # 2. task_type;
+    # 3. whether to use hierarchical training;
+    # 4. semantics and dimension of the policy action;
+    # 5. obs dimension (whether to concatenate goal information);
+    # 6. training hyperparameters.
+    #
+    # After adding a new training stage, a corresponding training config file
+    # must be created in the same directory.
+    # Filename convention: train_env_conf_<task_type>_<stage.name>.toml
+    # Refer to train_env_conf_standard_locomotion.toml as an example.
+    #
+    # TODO：可参考 LocomotionConfig 自行设计 track 地形导航训练阶段。
+    # 需要明确：
+    # 1. stage 名称；
+    # 2. task_type；
+    # 3. 是否采用分层训练；
+    # 4. policy action 的语义和维度；
+    # 5. obs 维度（是否拼接 goal 信息）；
+    # 6. 训练超参。
+    #
+    # 新增训练阶段后，需在同目录创建对应训练配置文件。
+    # 文件命名规则：train_env_conf_<task_type>_<stage.name>.toml
+    # 可参考 train_env_conf_standard_locomotion.toml。
+    pass
+
+
+class LocomotionConfig(StageConfig):
     """
-    Conservative stair bridge stage starting from the nan10-8750 checkpoint.
-    It keeps the nan10 locomotion behavior as the anchor and only adds mild,
-    command-centric stair acquisition shaping.
+    Stage: locomotion — learn stable walking on mixed terrain.
+    阶段：locomotion —— 在混合地形上学习稳定行走。
     """
 
-    name = "nan10_stair_bridge"
+    name = "locomotion"
     task_type = "standard"
-    lr = 1.5e-5
-    min_lr = 1e-5
-    max_lr = 2e-4
-    num_learning_epochs = 2
+
+
+class StairConservativeConfig(StageConfig):
+    """
+    Stage: stair_conservative ? fine-tune stairs while replaying slopes.
+    ???stair_conservative ?? ??????????????????????????
+    """
+
+    name = "stair_conservative"
+    task_type = "standard"
+    lr = 1e-4
+    num_learning_epochs = 3
     num_mini_batches = 4
     num_steps_per_env = 48
     model_save_interval = 50
+
+
+class StairInvFineTuneConfig(StageConfig):
+    """
+    Conservative fine-tune for high-level stairs, especially inverse stairs.
+    Keeps the same 301/316 observation dimensions so pretrained Standard models
+    can be loaded without shape mismatch.
+    """
+
+    name = "stair_inv_finetune"
+    task_type = "standard"
+    lr = 1e-4
+    num_learning_epochs = 3
+    num_mini_batches = 4
+    num_steps_per_env = 48
+    model_save_interval = 100
+
+
+class TrackNavConfig(StageConfig):
+    """Track navigation fine-tune from a pretrained locomotion checkpoint."""
+
+    name = "nav"
+    task_type = "track"
+    num_goal_obs = 3   # goal direction (2D) + goal distance (1D)
+    num_critic_observations = 319  # 316 + 3
+    lr = 1e-5
+    num_learning_epochs = 3
+    num_mini_batches = 4
+    num_steps_per_env = 48
+    entropy_coef = 0.00045
+    desired_kl = 0.002
+    init_noise_std = 0.60
+    min_normalized_std = [0.05, 0.025, 0.05] * 4
+    max_normalized_std = [0.20, 0.12, 0.20] * 4
+    model_save_interval = 20
 
 
 class Config:
@@ -99,7 +176,7 @@ class Config:
 
     # Switch stage by changing CURRENT
     # 通过修改 CURRENT 切换阶段
-    CURRENT = Nan10StairBridgeConfig
+    CURRENT = TrackNavConfig
 
     @staticmethod
     def load_conf(logger):
@@ -171,6 +248,14 @@ def _deep_merge(base, override):
     return merged
 
 
+def _load_toml(path):
+    if toml is not None:
+        with open(path, "r", encoding="utf-8") as f:
+            return toml.load(f)
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
 def _load_conf(conf_file, logger):
     """
     Load config: first load base TOML, then deep-merge user TOML on top.
@@ -201,8 +286,7 @@ def _load_conf(conf_file, logger):
     base_config = {}
     if os.path.exists(base_file):
         try:
-            with open(base_file, "rb") as f:
-                base_config = _toml_loader.load(f)
+            base_config = _load_toml(base_file)
             logger.info(f"Loaded base config: {base_file}")
         except Exception as e:
             logger.warning(f"Cannot load base config: {base_file}. Error: {e}")
@@ -210,8 +294,7 @@ def _load_conf(conf_file, logger):
     # Load user config
     # 加载用户配置
     try:
-        with open(conf_file, "rb") as f:
-            user_config = _toml_loader.load(f)
+        user_config = _load_toml(conf_file)
         logger.info(f"Loaded user config: {conf_file}")
     except Exception as e:
         logger.error(f"Cannot load config file: {conf_file}. Error: {e}")

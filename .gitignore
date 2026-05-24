@@ -1,57 +1,29 @@
-# Python
-__pycache__/
-*.py[cod]
+# 二进制/大文件
+*.pyc
 *.pyo
-*.pyd
-.Python
-*.egg-info/
-dist/
-build/
-.eggs/
+*.so
+*.dll
+*.exe
 
-# Checkpoints / model outputs
-*.pt
-*.pth
-*.ckpt
-checkpoints/
-saved_models/
-runs/
+# 压缩包
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
 
-# Logs
+# 日志
 *.log
-logs/
-tensorboard/
 
-# Temp / IDE
-.DS_Store
-.vscode/settings.json
-.idea/
-*.swp
-*.swo
-*~
+# 模型/数据文件
+*.pkl
+*.pth
+*.h5
+*.hdf5
 
-# Platform temp files
-.tmp_*.json
-code-legged_robot_competition_26-IDE-*.zip
-*.har
-tmp_training_*.png
-node_modules/
-
-# Secrets / env
-.env
-.env.local
-.env.*.local
-*.key
-tencent-arena-auth.json
-# Codex RPC runtime files
-agent_diy/codex_rpc_bridge_runtime/
-agent_diy/codex_rpc_bridge/__pycache__/
-codex_rpc_bridge_runtime/
-.arena_frontend_monitor/
-arena_frontend_monitor_runtime/
-.codex_rpc/
-.codex_rpc/token
-.codex_rpc/admin_token
-.codex_rpc/codex_file_rpc.log
-.codex_rpc/backups/
-.codex_rpc/__pycache__/
+# 上传/备份/缓存
+uploads/
+backups/
+__pycache__/
+.cache/

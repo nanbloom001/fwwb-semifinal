@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
 ###########################################################################
-# Copyright © 1998 - 2026 Tencent. All Rights Reserved.
+# Copyright 漏 1998 - 2026 Tencent. All Rights Reserved.
 ###########################################################################
 """
 Author: Tencent AI Arena Authors
 """
 
 
-from common_python.utils.common_func import Frame
 import os
 import time
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 from agent_ppo.conf.conf import Config
 from agent_ppo.feature.definition import RolloutStorage
-from agent_ppo.feature.command_mix import apply_command_mix_to_obs_pair
+from tools.train_env_conf_validate import check_usr_conf
 from tools.utils import load_reward_keys_from_monitor_config
 import torch
 from collections import deque, defaultdict
@@ -29,23 +28,18 @@ class VelocityCurriculum:
     demote_count consecutive checks. Neither counter changes when the metric
     stays in the neutral zone [demote_threshold, promote_threshold).
 
-    Completely independent of terrain.curriculum — terrain difficulty is managed
+    Completely independent of terrain.curriculum 鈥?terrain difficulty is managed
     separately (num_rows=10, difficulty_range=[0,1.0]). Stage changes call
     env.reset(usr_conf) to apply new velocity ranges.
-    Policy weights are NOT affected — only env command-sampling changes.
+    Policy weights are NOT affected 鈥?only env command-sampling changes.
 
     Configuration is loaded from usr_conf["velocity_curriculum"] (TOML section
     [velocity_curriculum]), so all thresholds and stage definitions live in the
     TOML file rather than being hard-coded here.
 
-    性能驱动的速度课程，复用地形课程逻辑（表现好则升级，差则降级）。
-    与 terrain.curriculum 完全独立——地形难度由 TOML [terrain] 节独立管理
-    （10 档，覆盖完整 [0,1] 难度带）。
-    所有阈值和阶段定义均从 TOML [velocity_curriculum] 节读取。
-    """
+    鎬ц兘椹卞姩鐨勯€熷害璇剧▼锛屽鐢ㄥ湴褰㈣绋嬮€昏緫锛堣〃鐜板ソ鍒欏崌绾э紝宸垯闄嶇骇锛夈€?    涓?terrain.curriculum 瀹屽叏鐙珛鈥斺€斿湴褰㈤毦搴︾敱 TOML [terrain] 鑺傜嫭绔嬬鐞?    锛?0 妗ｏ紝瑕嗙洊瀹屾暣 [0,1] 闅惧害甯︼級銆?    鎵€鏈夐槇鍊煎拰闃舵瀹氫箟鍧囦粠 TOML [velocity_curriculum] 鑺傝鍙栥€?    """
 
     # Default stages used only when usr_conf has no [velocity_curriculum] section.
-    # 仅当 TOML 缺少 [velocity_curriculum] 节时作为退路默认值。
     _DEFAULT_STAGES = [
         {"lin_vel_x": [0.0,  0.5], "lin_vel_y": [-0.3,  0.3], "ang_vel_yaw": [-1.0,  1.0]},
         {"lin_vel_x": [0.0,  1.0], "lin_vel_y": [-0.5,  0.5], "ang_vel_yaw": [-1.5,  1.5]},
@@ -55,8 +49,6 @@ class VelocityCurriculum:
 
     # ep_info key used as performance signal.  Different framework versions may
     # expose reward terms with slightly different names, so lookup is tolerant.
-    # 用于速度课程的 episode 指标。不同框架版本可能使用略有差异的 reward key，
-    # 因此实际查找时会做兼容匹配。
     _TRACKING_KEY = "reward_track_lin_vel_xy"
     _TRACKING_KEY_CANDIDATES = (
         "reward_track_lin_vel_xy",
@@ -69,17 +61,8 @@ class VelocityCurriculum:
         """Build curriculum from usr_conf["velocity_curriculum"] (TOML section).
 
         Falls back to _DEFAULT_STAGES / hard-coded thresholds if the section is absent.
-        从 TOML 的 [velocity_curriculum] 节加载配置；节缺失时回退到默认值。
-        """
+        浠?TOML 鐨?[velocity_curriculum] 鑺傚姞杞介厤缃紱鑺傜己澶辨椂鍥為€€鍒伴粯璁ゅ€笺€?        """
         self.logger = logger
-        fine_tune_conf = usr_conf.get("fine_tune_schedule", {})
-        self._commands_owned_by_schedule = bool(
-            fine_tune_conf.get("enabled", False)
-            and (
-                fine_tune_conf.get("command_initial", {})
-                or fine_tune_conf.get("command_target", {})
-            )
-        )
         vc_conf = usr_conf.get("velocity_curriculum", {})
         tracking_reward_conf = usr_conf.get("rewards", {}).get("track_lin_vel_xy", {})
 
@@ -100,8 +83,6 @@ class VelocityCurriculum:
         )
         self.promote_count:     int   = int(vc_conf.get("promote_count", 5))
         self.demote_count:      int   = int(vc_conf.get("demote_count",  3))
-        self.min_checks_per_stage: int = max(0, int(vc_conf.get("min_checks_per_stage", 0)))
-        self.min_seconds_per_stage: float = max(0.0, float(vc_conf.get("min_seconds_per_stage", 0.0)))
 
         raw_stages = vc_conf.get("stages", None)
         if raw_stages:
@@ -140,16 +121,11 @@ class VelocityCurriculum:
         self._tracking_key_resolved = None
         self._tracking_key_warning_logged = False
         self._debug_check_count = 0
-        self._stage_enter_check = 0
-        self._stage_enter_time = time.time()
         logger.info(
             f"[VelocityCurriculum] Initialized: {len(self.STAGES)} stages, "
             f"tracking_weight={self._tracking_reward_weight}, "
             f"promote_threshold={self.promote_threshold}, demote_threshold={self.demote_threshold}, "
-            f"promote_count={self.promote_count}, demote_count={self.demote_count}, "
-            f"min_checks_per_stage={self.min_checks_per_stage}, "
-            f"min_seconds_per_stage={self.min_seconds_per_stage}, "
-            f"commands_owned_by_schedule={self._commands_owned_by_schedule}"
+            f"promote_count={self.promote_count}, demote_count={self.demote_count}"
         )
 
     def _normalize_threshold(self, threshold_value: float, field_name: str) -> float:
@@ -159,9 +135,7 @@ class VelocityCurriculum:
         That makes curriculum behavior drift every time reward weight changes.
         New configs should store ratios in [0, 1], e.g. 0.55 means 55% of the
         current track_lin_vel_xy maximum reward.
-        历史配置使用加权 reward 的绝对阈值（如 1.6），reward weight 一改就会漂。
-        现在统一转为比例阈值：[0,1] 区间，0.55 表示达到当前最大 tracking reward 的 55%。
-        """
+        鍘嗗彶閰嶇疆浣跨敤鍔犳潈 reward 鐨勭粷瀵归槇鍊硷紙濡?1.6锛夛紝reward weight 涓€鏀瑰氨浼氭紓銆?        鐜板湪缁熶竴杞负姣斾緥闃堝€硷細[0,1] 鍖洪棿锛?.55 琛ㄧず杈惧埌褰撳墠鏈€澶?tracking reward 鐨?55%銆?        """
         if threshold_value <= 1.0:
             return threshold_value
 
@@ -184,20 +158,10 @@ class VelocityCurriculum:
     def last_tracking_ratio(self) -> float:
         return self._last_mean_tracking_ratio
 
-    def monitor_stats(self):
-        cfg = self.STAGES[self._stage_idx]
-        lin_y = cfg.get("lin_vel_y", [0.0, 0.0])
-        yaw = cfg.get("ang_vel_yaw", [0.0, 0.0])
-        return {
-            "vel_cmd_vy_abs_max": max(abs(float(lin_y[0])), abs(float(lin_y[1]))) if len(lin_y) >= 2 else 0.0,
-            "vel_cmd_wz_abs_max": max(abs(float(yaw[0])), abs(float(yaw[1]))) if len(yaw) >= 2 else 0.0,
-        }
-
     def _resolve_tracking_metric(self, ep_info):
         """Return the tracking metric value and the key used to find it.
 
-        返回 episode info 中的速度追踪指标值，以及命中的 key。
-        """
+        杩斿洖 episode info 涓殑閫熷害杩借釜鎸囨爣鍊硷紝浠ュ強鍛戒腑鐨?key銆?        """
         if self._tracking_key_resolved and self._tracking_key_resolved in ep_info:
             return ep_info[self._tracking_key_resolved], self._tracking_key_resolved
 
@@ -218,8 +182,7 @@ class VelocityCurriculum:
         """Average reward_track_lin_vel_xy across completed episodes.
 
         Returns both the raw weighted reward and the normalized ratio.
-        返回加权后的原始 tracking reward，以及相对当前 reward weight 的归一化比例。
-        """
+        杩斿洖鍔犳潈鍚庣殑鍘熷 tracking reward锛屼互鍙婄浉瀵瑰綋鍓?reward weight 鐨勫綊涓€鍖栨瘮渚嬨€?        """
         values = []
         for ep_info in ep_infos:
             v, key = self._resolve_tracking_metric(ep_info)
@@ -251,9 +214,9 @@ class VelocityCurriculum:
         usr_conf["commands"]["ranges"]["lin_vel_y"]   = cfg["lin_vel_y"]
         usr_conf["commands"]["ranges"]["ang_vel_yaw"] = cfg["ang_vel_yaw"]
         self.logger.info(
-            f"[VelocityCurriculum] → Stage {self._stage_idx}: "
+            f"[VelocityCurriculum] 鈫?Stage {self._stage_idx}: "
             f"lin_vel_x={cfg['lin_vel_x']}, lin_vel_y={cfg['lin_vel_y']}, "
-            f"ang_vel_yaw={cfg['ang_vel_yaw']} — calling env.reset"
+            f"ang_vel_yaw={cfg['ang_vel_yaw']} 鈥?calling env.reset"
         )
         data = env.reset(usr_conf)
         if data is None:
@@ -262,9 +225,6 @@ class VelocityCurriculum:
         new_obs, new_critic_obs = data
         if new_critic_obs is None:
             new_critic_obs = new_obs
-        new_obs, new_critic_obs = apply_command_mix_to_obs_pair(
-            env, new_obs, new_critic_obs, usr_conf, site="velocity_reset"
-        )
         return torch.clone(new_obs), torch.clone(new_critic_obs), True
 
     def check_and_update(self, ep_infos, usr_conf, env, obs, critic_obs, rollout_stats=None):
@@ -275,10 +235,7 @@ class VelocityCurriculum:
         reset_happened=True means env.reset was called; caller should zero
         cur_reward_sum / cur_episode_length to avoid stale statistics.
 
-        在 ep_infos.clear() 前调用，确保能读到当前批次的数据。
-        reset_happened=True 时调用方需清零 cur_reward_sum / cur_episode_length，
-        避免 env.reset 后旧累计值污染 rewbuffer 统计。
-        """
+        鍦?ep_infos.clear() 鍓嶈皟鐢紝纭繚鑳借鍒板綋鍓嶆壒娆＄殑鏁版嵁銆?        reset_happened=True 鏃惰皟鐢ㄦ柟闇€娓呴浂 cur_reward_sum / cur_episode_length锛?        閬垮厤 env.reset 鍚庢棫绱鍊兼薄鏌?rewbuffer 缁熻銆?        """
         self._debug_check_count += 1
         rollout_stats = rollout_stats or {}
         mean_reward, mean_ratio = self._mean_tracking_reward(ep_infos)
@@ -305,51 +262,20 @@ class VelocityCurriculum:
         self._last_mean_tracking_reward = mean_reward
         self._last_mean_tracking_ratio = mean_ratio
 
-        if self._commands_owned_by_schedule:
-            self._promote_streak = 0
-            self._demote_streak = 0
-            if self._debug_check_count <= 10 or self._debug_check_count % 20 == 0:
-                current_cfg = self.STAGES[self._stage_idx]
-                self.logger.warning(
-                    "[VelocityCurriculumDebug] "
-                    f"check={self._debug_check_count}, ep_infos={len(ep_infos)}, "
-                    f"source={metric_source}, key={self._tracking_key_resolved}, "
-                    f"reward={mean_reward:.4f}, "
-                    f"ratio={mean_ratio:.4f}, stage={self._stage_idx}->{self._stage_idx}, "
-                    "command_update=disabled_by_fine_tune_schedule, "
-                    f"ranges={current_cfg}"
-                )
-            return obs, critic_obs, False
-
         stage_changed = False
         old_stage = self._stage_idx
-
-        checks_in_stage = self._debug_check_count - self._stage_enter_check
-        seconds_in_stage = time.time() - self._stage_enter_time
-        stage_age_ready = (
-            checks_in_stage >= self.min_checks_per_stage
-            and seconds_in_stage >= self.min_seconds_per_stage
-        )
 
         if mean_ratio >= self.promote_threshold:
             self._promote_streak += 1
             self._demote_streak = 0
-            if (
-                stage_age_ready
-                and self._promote_streak >= self.promote_count
-                and self._stage_idx < len(self.STAGES) - 1
-            ):
+            if self._promote_streak >= self.promote_count and self._stage_idx < len(self.STAGES) - 1:
                 self._stage_idx += 1
                 self._promote_streak = 0
-                self._stage_enter_check = self._debug_check_count
-                self._stage_enter_time = time.time()
                 self.logger.warning(
-                    f"[VelocityCurriculum] PROMOTE ↑ stage {self._stage_idx} "
+                    f"[VelocityCurriculum] PROMOTE 鈫?stage {self._stage_idx} "
                     f"(tracking_ratio={mean_ratio:.3f} >= {self.promote_threshold:.3f}, "
                     f"tracking_reward={mean_reward:.3f}, "
-                    f"for {self.promote_count} consecutive checks, "
-                    f"stage_age={checks_in_stage}/{self.min_checks_per_stage} checks, "
-                    f"{seconds_in_stage:.1f}/{self.min_seconds_per_stage:.1f}s)"
+                    f"for {self.promote_count} consecutive checks)"
                 )
                 stage_changed = True
         elif mean_ratio < self.demote_threshold:
@@ -358,10 +284,8 @@ class VelocityCurriculum:
             if self._demote_streak >= self.demote_count and self._stage_idx > 0:
                 self._stage_idx -= 1
                 self._demote_streak = 0
-                self._stage_enter_check = self._debug_check_count
-                self._stage_enter_time = time.time()
                 self.logger.warning(
-                    f"[VelocityCurriculum] DEMOTE ↓ stage {self._stage_idx} "
+                    f"[VelocityCurriculum] DEMOTE 鈫?stage {self._stage_idx} "
                     f"(tracking_ratio={mean_ratio:.3f} < {self.demote_threshold:.3f}, "
                     f"tracking_reward={mean_reward:.3f}, "
                     f"for {self.demote_count} consecutive checks)"
@@ -369,7 +293,6 @@ class VelocityCurriculum:
                 stage_changed = True
         else:
             # Neutral zone: slowly decay both streaks to avoid oscillation
-            # 中性区间：缓慢衰减两个计数器，避免振荡。
             self._promote_streak = max(0, self._promote_streak - 1)
             self._demote_streak = max(0, self._demote_streak - 1)
 
@@ -385,8 +308,6 @@ class VelocityCurriculum:
                 f"@{self.promote_threshold:.3f}, "
                 f"demote={self._demote_streak}/{self.demote_count} "
                 f"@{self.demote_threshold:.3f}, "
-                f"stage_age={checks_in_stage}/{self.min_checks_per_stage} checks, "
-                f"{seconds_in_stage:.1f}/{self.min_seconds_per_stage:.1f}s, "
                 f"ranges={current_cfg}"
             )
 
@@ -395,366 +316,21 @@ class VelocityCurriculum:
         return obs, critic_obs, False
 
 
-class FineTuneSchedule:
-    """Wall-clock-first linear schedule for conservative HJC fine-tuning."""
+def _initialize_training_state(env, agent, logger):
+    """
+    Initialize training state including storage, buffers, and observations.
+    鍒濆鍖栬缁冪姸鎬侊紝鍖呮嫭瀛樺偍銆佺紦鍐插尯鍜岃娴嬨€?
+    Returns:
+        tuple: (storage, obs, critic_obs, ep_infos, rewbuffer, lenbuffer,
+                cur_reward_sum, cur_episode_length, reward_keys, usr_conf)
+        杩斿洖鍊硷細(storage, obs, critic_obs, ep_infos, rewbuffer, lenbuffer,
+                cur_reward_sum, cur_episode_length, reward_keys, usr_conf)
+    """
+    usr_conf, usr_conf_file, is_eval, stage = Config.load_conf(logger)
 
-    def __init__(self, logger, usr_conf: dict):
-        self.logger = logger
-        self.conf = usr_conf.get("fine_tune_schedule", {})
-        self.enabled = bool(self.conf.get("enabled", False))
-        self.transition_seconds = float(self.conf.get("transition_seconds", 900.0))
-        self.transition_episodes = max(1, int(self.conf.get("fallback_transition_episodes", 200)))
-        self.update_interval_episodes = max(1, int(self.conf.get("update_interval_episodes", 10)))
-        self.log_interval_episodes = max(1, int(self.conf.get("log_interval_episodes", 10)))
-        self.start_time = time.time()
-        self._last_applied_episode = None
-        self._last_alpha = 0.0
-        self._last_reset_happened = False
-        self._runtime_reward_weights = {}
-        self._runtime_command_ranges = {}
-        self._runtime_command_limits = {}
-
-        self.reward_initial = dict(self.conf.get("reward_initial", {}))
-        self.reward_target = dict(self.conf.get("reward_target", {}))
-        self.command_initial = self._normalize_command_ranges(self.conf.get("command_initial", {}))
-        self.command_target = self._normalize_command_ranges(self.conf.get("command_target", {}))
-        self.terrain_phases = self._normalize_terrain_phases(self.conf.get("terrain_phases", []))
-        self._current_terrain_phase_idx = None
-
-        if not self.enabled:
-            logger.warning("[FineTuneSchedule] disabled: no schedule will be applied.")
-            self._log_reward_registration(usr_conf)
-            return
-
-        self._log_initial_alignment(usr_conf)
-        self._apply_rewards(usr_conf, self.reward_initial)
-        self._apply_commands(usr_conf, self.command_initial)
-        self._apply_terrain_phase(usr_conf, self._terrain_phase_for_alpha(0.0))
-        self._current_command_ranges = dict(usr_conf.get("commands", {}).get("ranges", {}))
-        self._log_reward_registration(usr_conf)
-        logger.warning(
-            f"[FineTuneSchedule] initialized transition_seconds={self.transition_seconds:.1f} "
-            f"fallback_episodes={self.transition_episodes} "
-            f"update_interval={self.update_interval_episodes} "
-            f"reward_initial={self.reward_initial} reward_target={self.reward_target} "
-            f"command_initial={self.command_initial} command_target={self.command_target} "
-            f"terrain_phases={self.terrain_phases}"
-        )
-
-    @property
-    def last_alpha(self) -> float:
-        return self._last_alpha
-
-    def monitor_stats(self):
-        ranges = self.command_target if self.command_target else {}
-        current = getattr(self, "_current_command_ranges", {})
-        lin_y = current.get("lin_vel_y", ranges.get("lin_vel_y", [0.0, 0.0]))
-        yaw = current.get("ang_vel_yaw", ranges.get("ang_vel_yaw", [0.0, 0.0]))
-        return {
-            "scheduled_alpha": self._last_alpha,
-            "scheduled_elapsed_seconds": max(0.0, time.time() - self.start_time),
-            "scheduled_cmd_vy_abs_max": max(abs(float(lin_y[0])), abs(float(lin_y[1]))) if len(lin_y) >= 2 else 0.0,
-            "scheduled_cmd_wz_abs_max": max(abs(float(yaw[0])), abs(float(yaw[1]))) if len(yaw) >= 2 else 0.0,
-            "w_track_lin": self._reward_weight("track_lin_vel_xy"),
-            "w_cmd_prog": self._reward_weight("command_direction_progress"),
-            "w_cmd_dir_dev": self._reward_weight("command_direction_deviation"),
-            "w_cmd_path": self._reward_weight("command_path_progress"),
-            "w_cmd_stall": self._reward_weight("commanded_stall_penalty"),
-            "w_track_yaw": self._reward_weight("track_ang_vel_z"),
-            "w_feet_clear": self._reward_weight("feet_clearance"),
-            "w_hs_clear": self._reward_weight("height_scan_feet_clearance"),
-            "w_stair_place": self._reward_weight("stair_forward_foot_placement"),
-            "w_over_clear": self._reward_weight("stair_over_clearance_penalty"),
-            "w_stair_swing": self._reward_weight("stair_swing_step_targeting"),
-            "w_stair_stride": self._reward_weight("stair_stride_length_penalty"),
-            "w_stair_support": self._reward_weight("stair_support_continuity_penalty"),
-            "w_base_clear": self._reward_weight("stair_base_clearance_penalty"),
-            "w_edge_align": self._reward_weight("stair_edge_normal_alignment"),
-            "w_down_speed": self._reward_weight("down_stair_speed_safety"),
-            "w_down_touch": self._reward_weight("down_stair_touchdown_safety"),
-            "w_no_yaw": self._reward_weight("uncommanded_yaw_rate"),
-            "w_heading_drift": self._reward_weight("uncommanded_heading_drift"),
-            "w_ang_xy": self._reward_weight("ang_vel_xy"),
-            "w_pivot": self._reward_weight("pivot_turning"),
-            "sched_track_lin_w": self._reward_weight("track_lin_vel_xy"),
-            "sched_cmd_prog_w": self._reward_weight("command_direction_progress"),
-            "sched_cmd_dir_dev_w": self._reward_weight("command_direction_deviation"),
-            "sched_cmd_path_w": self._reward_weight("command_path_progress"),
-            "sched_cmd_stall_w": self._reward_weight("commanded_stall_penalty"),
-            "sched_track_yaw_w": self._reward_weight("track_ang_vel_z"),
-            "sched_feet_clearance_w": self._reward_weight("feet_clearance"),
-            "sched_hs_clear_w": self._reward_weight("height_scan_feet_clearance"),
-            "sched_stair_place_w": self._reward_weight("stair_forward_foot_placement"),
-            "sched_over_clear_w": self._reward_weight("stair_over_clearance_penalty"),
-            "sched_stair_swing_w": self._reward_weight("stair_swing_step_targeting"),
-            "sched_stair_stride_w": self._reward_weight("stair_stride_length_penalty"),
-            "sched_stair_support_w": self._reward_weight("stair_support_continuity_penalty"),
-            "sched_base_clear_w": self._reward_weight("stair_base_clearance_penalty"),
-            "sched_edge_align_w": self._reward_weight("stair_edge_normal_alignment"),
-            "sched_down_speed_w": self._reward_weight("down_stair_speed_safety"),
-            "sched_down_touch_w": self._reward_weight("down_stair_touchdown_safety"),
-            "sched_uncommand_yaw_w": self._reward_weight("uncommanded_yaw_rate"),
-            "sched_heading_drift_w": self._reward_weight("uncommanded_heading_drift"),
-            "sched_ang_vel_xy_w": self._reward_weight("ang_vel_xy"),
-            "sched_pivot_w": self._reward_weight("pivot_turning"),
-            "sched_flat_orient_w": self._reward_weight("flat_orientation"),
-            "sched_base_height_w": self._reward_weight("correct_base_height"),
-            "scheduled_terrain_phase": float(self._current_terrain_phase_idx or 0),
-        }
-
-    def check_and_update(self, usr_conf, env, obs, critic_obs, episode: int):
-        if not self.enabled:
-            return obs, critic_obs, False
-        if self._last_applied_episode is not None and episode - self._last_applied_episode < self.update_interval_episodes:
-            return obs, critic_obs, False
-
-        alpha = self._alpha(episode)
-        reward_values = self._interpolate_dict(self.reward_initial, self.reward_target, alpha)
-        command_values = self._interpolate_commands(self.command_initial, self.command_target, alpha)
-        terrain_phase = self._terrain_phase_for_alpha(alpha)
-        self._apply_rewards(usr_conf, reward_values)
-        command_changed = self._apply_commands(usr_conf, command_values)
-        terrain_changed = self._apply_terrain_phase(usr_conf, terrain_phase)
-        reward_runtime = self._apply_rewards_runtime(env, reward_values)
-        command_runtime = self._apply_commands_runtime(env, command_values)
-        self._last_alpha = alpha
-        self._last_applied_episode = episode
-
-        should_log = episode <= self.log_interval_episodes or episode % self.log_interval_episodes == 0 or command_changed
-        if should_log:
-            self.logger.warning(
-                f"[FineTuneSchedule] apply episode={episode} alpha={alpha:.3f} "
-                f"elapsed={time.time() - self.start_time:.1f}s rewards={reward_values} "
-                f"commands={command_values} command_changed={command_changed} "
-                f"terrain_changed={terrain_changed} terrain_phase={terrain_phase} "
-                f"runtime_rewards={reward_runtime} runtime_commands={command_runtime}"
-            )
-
-        needs_reset = self._needs_reset_for_schedule_apply(reward_runtime, command_runtime)
-        if needs_reset or terrain_changed:
-            data = env.reset(usr_conf)
-            if data is None:
-                self.logger.error("[FineTuneSchedule] env.reset failed after scheduled config update!")
-                raise RuntimeError("FineTuneSchedule env.reset failed after scheduled config update")
-            new_obs, new_critic_obs = data
-            if new_critic_obs is None:
-                new_critic_obs = new_obs
-            new_obs, new_critic_obs = apply_command_mix_to_obs_pair(
-                env, new_obs, new_critic_obs, usr_conf, site="fine_tune_reset"
-            )
-            if should_log:
-                reset_reason = "terrain_phase_changed" if terrain_changed and not needs_reset else "runtime_manager_update_unavailable"
-                self.logger.warning(
-                    f"[FineTuneSchedule] applied_by=env_reset reason={reset_reason} "
-                    f"episode={episode} alpha={alpha:.3f} terrain_changed={terrain_changed}"
-                )
-            return torch.clone(new_obs), torch.clone(new_critic_obs), True
-
-        if should_log:
-            self.logger.warning(
-                f"[FineTuneSchedule] applied_by=runtime_manager episode={episode} alpha={alpha:.3f}"
-            )
-        return obs, critic_obs, False
-
-    def _alpha(self, episode: int) -> float:
-        if self.transition_seconds > 0.0:
-            return max(0.0, min(1.0, (time.time() - self.start_time) / self.transition_seconds))
-        return max(0.0, min(1.0, float(episode) / float(self.transition_episodes)))
-
-    def _reward_weight(self, name: str) -> float:
-        rewards = getattr(self, "_usr_conf_ref", {}).get("rewards", {})
-        return float(rewards.get(name, {}).get("weight", 0.0))
-
-    def _log_initial_alignment(self, usr_conf):
-        rewards = usr_conf.get("rewards", {})
-        mismatches = []
-        for name, initial_value in self.reward_initial.items():
-            reward_conf = rewards.get(name)
-            if not isinstance(reward_conf, dict) or "weight" not in reward_conf:
-                mismatches.append(f"{name}:missing_static->{float(initial_value):.6g}")
-                continue
-            static_value = float(reward_conf.get("weight", 0.0))
-            initial_value = float(initial_value)
-            if abs(static_value - initial_value) > 1.0e-9:
-                mismatches.append(f"{name}:{static_value:.6g}->{initial_value:.6g}")
-        if mismatches:
-            self.logger.warning(
-                "[FineTuneSchedule] static reward weights differ from reward_initial; "
-                f"startup reset will apply reward_initial. mismatches={mismatches}"
-            )
-        else:
-            self.logger.warning("[FineTuneSchedule] static reward weights match reward_initial.")
-
-    def _apply_rewards(self, usr_conf, values):
-        self._usr_conf_ref = usr_conf
-        rewards = usr_conf.setdefault("rewards", {})
-        for key, value in values.items():
-            rewards.setdefault(key, {})["weight"] = float(value)
-
-    def _apply_commands(self, usr_conf, values):
-        if not values:
-            return False
-        ranges = usr_conf.setdefault("commands", {}).setdefault("ranges", {})
-        limits = usr_conf.setdefault("commands", {}).setdefault("limit", {})
-        changed = False
-        for key, value in values.items():
-            value = [float(value[0]), float(value[1])]
-            if list(ranges.get(key, [])) != value:
-                changed = True
-            ranges[key] = value
-            limit_key = "ang_vel_z" if key == "ang_vel_yaw" else key
-            if limit_key in limits:
-                limits[limit_key] = [float(value[0]), float(value[1])]
-        self._current_command_ranges = dict(ranges)
-        return changed
-
-    def _apply_terrain_phase(self, usr_conf, phase):
-        if not phase:
-            return False
-        terrain = usr_conf.setdefault("terrain", {})
-        standard = terrain.setdefault("standard", {})
-        changed = False
-
-        if "difficulty_range" in phase:
-            value = [float(phase["difficulty_range"][0]), float(phase["difficulty_range"][1])]
-            if list(terrain.get("difficulty_range", [])) != value:
-                changed = True
-            terrain["difficulty_range"] = value
-
-        if "max_init_terrain_level" in phase:
-            value = int(phase["max_init_terrain_level"])
-            if int(terrain.get("max_init_terrain_level", -1)) != value:
-                changed = True
-            terrain["max_init_terrain_level"] = value
-
-        for key in (
-            "pyramid_slope",
-            "pyramid_slope_inv",
-            "pyramid_stairs",
-            "pyramid_stairs_inv",
-            "maze",
-        ):
-            if key not in phase:
-                continue
-            value = float(phase[key])
-            current = float(standard.get(key, {}).get("proportion", -1.0))
-            if abs(current - value) > 1.0e-9:
-                changed = True
-            standard.setdefault(key, {})["proportion"] = value
-
-        return changed
-
-    def _apply_rewards_runtime(self, env, values):
-        isaac_env = _get_isaac_env(env)
-        if isaac_env is None:
-            return {
-                "ok": False,
-                "reason": "isaac_env_unavailable",
-                "candidates": _describe_env_unwrap_candidates(env, max_items=8),
-            }
-        reward_manager = getattr(isaac_env, "reward_manager", None)
-        if reward_manager is None:
-            return {"ok": False, "reason": "reward_manager_unavailable"}
-
-        result = {}
-        for name, value in values.items():
-            try:
-                cfg = reward_manager.get_term_cfg(name)
-                if cfg is None:
-                    result[name] = {"ok": False, "reason": "term_missing"}
-                    continue
-                old_weight = float(getattr(cfg, "weight", 0.0))
-                cfg.weight = float(value)
-                set_term_cfg = getattr(reward_manager, "set_term_cfg", None)
-                if callable(set_term_cfg):
-                    set_term_cfg(name, cfg)
-                readback_cfg = reward_manager.get_term_cfg(name)
-                readback = float(getattr(readback_cfg, "weight", float(value)))
-                self._runtime_reward_weights[name] = readback
-                result[name] = {
-                    "ok": abs(readback - float(value)) <= 1.0e-6,
-                    "old": round(old_weight, 6),
-                    "target": round(float(value), 6),
-                    "readback": round(readback, 6),
-                }
-            except Exception as exc:
-                result[name] = {"ok": False, "reason": type(exc).__name__, "detail": str(exc)[:160]}
-        return result
-
-    @staticmethod
-    def _runtime_update_ok(result):
-        if not isinstance(result, dict):
-            return False
-        if result.get("ok") is False:
-            return False
-        if result.get("ok") is True:
-            return True
-        term_results = [value for value in result.values() if isinstance(value, dict)]
-        if not term_results:
-            return False
-        return all(bool(value.get("ok", False)) for value in term_results)
-
-    def _needs_reset_for_schedule_apply(self, reward_runtime, command_runtime):
-        return not (
-            self._runtime_update_ok(reward_runtime)
-            and self._runtime_update_ok(command_runtime)
-        )
-
-    def _apply_commands_runtime(self, env, values):
-        if not values:
-            return {"ok": True, "reason": "no_values"}
-        isaac_env = _get_isaac_env(env)
-        if isaac_env is None:
-            return {
-                "ok": False,
-                "reason": "isaac_env_unavailable",
-                "candidates": _describe_env_unwrap_candidates(env, max_items=8),
-            }
-        command_manager = getattr(isaac_env, "command_manager", None)
-        if command_manager is None:
-            return {"ok": False, "reason": "command_manager_unavailable"}
-        try:
-            command_term = command_manager.get_term("base_velocity")
-        except Exception as exc:
-            return {"ok": False, "reason": type(exc).__name__, "detail": str(exc)[:160]}
-        cfg = getattr(command_term, "cfg", None)
-        if cfg is None:
-            return {"ok": False, "reason": "command_cfg_unavailable"}
-
-        mapping = {"lin_vel_x": "lin_vel_x", "lin_vel_y": "lin_vel_y", "ang_vel_yaw": "ang_vel_z"}
-        applied_ranges = {}
-        applied_limits = {}
-        try:
-            ranges = getattr(cfg, "ranges", None)
-            limit_ranges = getattr(cfg, "limit_ranges", None)
-            for key, value in values.items():
-                attr = mapping.get(key)
-                if attr is None:
-                    continue
-                pair = (float(value[0]), float(value[1]))
-                if ranges is not None and hasattr(ranges, attr):
-                    setattr(ranges, attr, pair)
-                    applied_ranges[key] = list(pair)
-                if limit_ranges is not None and hasattr(limit_ranges, attr):
-                    setattr(limit_ranges, attr, pair)
-                    applied_limits[key] = list(pair)
-            self._runtime_command_ranges = applied_ranges
-            self._runtime_command_limits = applied_limits
-            return {"ok": True, "ranges": applied_ranges, "limits": applied_limits}
-        except Exception as exc:
-            return {"ok": False, "reason": type(exc).__name__, "detail": str(exc)[:160]}
-
-    def _normalize_command_ranges(self, values):
-        out = {}
-        for key, value in values.items():
-            if isinstance(value, (list, tuple)) and len(value) >= 2:
-                out[key] = [float(value[0]), float(value[1])]
-        return out
-
-    def _normalize_terrain_phases(self, phases):
-        out = []
-        if not isinstance(phases, list):
-            return out
+    terrain_mode = usr_conf.get("terrain", {}).get("mode", "standard")
+    if terrain_mode == "standard":
+        terrain_conf = usr_conf.get("terrain", {}).get("standard", {})
         terrain_keys = (
             "pyramid_slope",
             "pyramid_slope_inv",
@@ -762,137 +338,16 @@ class FineTuneSchedule:
             "pyramid_stairs_inv",
             "maze",
         )
-        for idx, phase in enumerate(phases):
-            if not isinstance(phase, dict):
-                continue
-            normalized = {"alpha": float(phase.get("alpha", 0.0 if idx == 0 else 1.0))}
-            if "difficulty_range" in phase and len(phase["difficulty_range"]) >= 2:
-                normalized["difficulty_range"] = [
-                    float(phase["difficulty_range"][0]),
-                    float(phase["difficulty_range"][1]),
-                ]
-            if "max_init_terrain_level" in phase:
-                normalized["max_init_terrain_level"] = int(phase["max_init_terrain_level"])
-            for key in terrain_keys:
-                if key in phase:
-                    normalized[key] = float(phase[key])
-            total = sum(float(normalized.get(key, 0.0)) for key in terrain_keys)
-            if any(key in normalized for key in terrain_keys) and abs(total - 1.0) > 1e-6:
-                self.logger.warning(
-                    f"[FineTuneSchedule] terrain phase idx={idx} proportion sum={total:.6f}, "
-                    "expected 1.0; phase will still be applied for debugging."
-                )
-            out.append(normalized)
-        out.sort(key=lambda item: item.get("alpha", 0.0))
-        return out
-
-    def _terrain_phase_for_alpha(self, alpha):
-        if not self.terrain_phases:
-            self._current_terrain_phase_idx = None
-            return {}
-        selected_idx = 0
-        for idx, phase in enumerate(self.terrain_phases):
-            if alpha + 1.0e-9 >= float(phase.get("alpha", 0.0)):
-                selected_idx = idx
-            else:
-                break
-        self._current_terrain_phase_idx = selected_idx
-        return dict(self.terrain_phases[selected_idx])
-
-    def _interpolate_dict(self, initial, target, alpha):
-        keys = set(initial) | set(target)
-        out = {}
-        for key in keys:
-            start = float(initial.get(key, target.get(key, 0.0)))
-            end = float(target.get(key, start))
-            out[key] = start + (end - start) * alpha
-        return out
-
-    def _interpolate_commands(self, initial, target, alpha):
-        keys = set(initial) | set(target)
-        out = {}
-        for key in keys:
-            start = initial.get(key, target.get(key, [0.0, 0.0]))
-            end = target.get(key, start)
-            out[key] = [
-                float(start[0]) + (float(end[0]) - float(start[0])) * alpha,
-                float(start[1]) + (float(end[1]) - float(start[1])) * alpha,
-            ]
-        return out
-
-    def _log_reward_registration(self, usr_conf):
-        rewards = usr_conf.get("rewards", {})
-        for name in (
-            "track_lin_vel_xy",
-            "command_direction_progress",
-            "command_direction_deviation",
-            "command_path_progress",
-            "commanded_stall_penalty",
-            "track_ang_vel_z",
-            "feet_clearance",
-            "height_scan_feet_clearance",
-            "stair_forward_foot_placement",
-            "stair_over_clearance_penalty",
-            "stair_swing_step_targeting",
-            "stair_stride_length_penalty",
-            "stair_support_continuity_penalty",
-            "stair_base_clearance_penalty",
-            "stair_edge_normal_alignment",
-            "down_stair_speed_safety",
-            "down_stair_touchdown_safety",
-            "uncommanded_yaw_rate",
-            "uncommanded_heading_drift",
-            "ang_vel_xy",
-            "correct_base_height",
-            "feet_air_time",
-            "air_time_variance_penalty",
-            "base_lateral_vel",
-            "pivot_turning",
-        ):
-            if name in rewards:
-                self.logger.warning(
-                    f"[RewardDebug] {name} configured weight={rewards[name].get('weight')} "
-                    f"params={rewards[name].get('params', {})}"
-                )
-            else:
-                self.logger.warning(
-                    f"[RewardDebug] {name} not configured in TOML; no reward will be computed."
-                )
-
-
-def _initialize_training_state(env, agent, logger):
-    """
-    Initialize training state including storage, buffers, and observations.
-    初始化训练状态，包括存储、缓冲区和观测。
-
-    Returns:
-        tuple: (storage, obs, critic_obs, ep_infos, rewbuffer, lenbuffer,
-                cur_reward_sum, cur_episode_length, reward_keys, usr_conf)
-        返回值：(storage, obs, critic_obs, ep_infos, rewbuffer, lenbuffer,
-                cur_reward_sum, cur_episode_length, reward_keys, usr_conf)
-    """
-    usr_conf, usr_conf_file, is_eval, stage = Config.load_conf(logger)
-
-    terrain_conf = usr_conf.get("terrain", {}).get("standard", {})
-    terrain_keys = (
-        "pyramid_slope",
-        "pyramid_slope_inv",
-        "pyramid_stairs",
-        "pyramid_stairs_inv",
-        "maze",
-    )
-    terrain_total = sum(float(terrain_conf.get(key, {}).get("proportion", 0.0)) for key in terrain_keys)
-    if abs(terrain_total - 1.0) > 1e-6:
-        message = (
-            f"Invalid standard terrain proportions: sum={terrain_total:.6f}, expected 1.0. "
-            f"Please check {usr_conf_file}."
-        )
-        logger.error(message)
-        raise ValueError(message)
+        terrain_total = sum(float(terrain_conf.get(key, {}).get("proportion", 0.0)) for key in terrain_keys)
+        if abs(terrain_total - 1.0) > 1e-6:
+            message = (
+                f"Invalid standard terrain proportions: sum={terrain_total:.6f}, expected 1.0. "
+                f"Please check {usr_conf_file}."
+            )
+            logger.error(message)
+            raise ValueError(message)
 
     # Validate configuration before proceeding
-    # 在继续之前校验配置
-    from tools.train_env_conf_validate import check_usr_conf
 
     valid, message = check_usr_conf(usr_conf, is_eval=False, logger=logger)
     if not valid:
@@ -900,11 +355,9 @@ def _initialize_training_state(env, agent, logger):
         raise Exception(message)
 
     # Set model to training mode
-    # 设置模型为训练模式
-    agent.algorithm.actor_critic.train()
 
     # Initialize buffers and statistics
-    # 初始化缓冲区和统计信息
+    agent.algorithm.actor_critic.train()
     ep_infos = []
     rewbuffer = deque(maxlen=100)
     lenbuffer = deque(maxlen=100)
@@ -912,11 +365,10 @@ def _initialize_training_state(env, agent, logger):
     cur_episode_length = torch.zeros(agent.num_envs, dtype=torch.float, device=agent.device)
 
     # Use algorithm's internal storage (same object used by learn())
-    # 使用算法内部的 storage（与 learn() 使用同一个对象）
+    # 浣跨敤绠楁硶鍐呴儴鐨?storage锛堜笌 learn() 浣跨敤鍚屼竴涓璞★級
     storage = agent.algorithm.storage
 
     # Reset environment and get initial observations
-    # 重置环境并获取初始观测
     data = env.reset(usr_conf)
     if data is None:
         error_message = "reset failed, please check"
@@ -926,13 +378,12 @@ def _initialize_training_state(env, agent, logger):
     obs, critic_obs = data
     if critic_obs is None:
         critic_obs = obs
-    obs, critic_obs = apply_command_mix_to_obs_pair(env, obs, critic_obs, usr_conf, site="reset")
     obs = torch.clone(obs)
     critic_obs = torch.clone(critic_obs)
     logger.info(f"obs.shape:{obs.shape}, critic_obs.shape:{critic_obs.shape}")
 
     # Load reward keys from monitor config
-    # 从 monitor 配置加载 reward_keys
+    # 浠?monitor 閰嶇疆鍔犺浇 reward_keys
     reward_keys = load_reward_keys_from_monitor_config()
     logger.info(f"reward_keys list is {reward_keys}")
 
@@ -953,13 +404,11 @@ def _initialize_training_state(env, agent, logger):
 def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     """
     Main training workflow.
-    主训练工作流。
-    """
+    涓昏缁冨伐浣滄祦銆?    """
     agent = agents[0]
     env = envs[0]
 
     # Initialize training state
-    # 初始化训练状态
     (
         storage,
         obs,
@@ -981,33 +430,26 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     # terrain difficulty spans the full [0, 1.0] band via difficulty_range in TOML,
     # with 10 curriculum rows and initial placement capped at level 0;
     # velocity stages expand independently via VelocityCurriculum.
-    # 速度课程：独立于地形课程扩大速度指令范围。
-    # 地形难度由 TOML difficulty_range=[0,1.0] + 10 个课程档位独立限制，
-    # 初始放置等级上限为 0；速度范围由 VelocityCurriculum 逐阶扩大。
-    vel_curriculum = VelocityCurriculum(logger, usr_conf)
-    fine_tune_schedule = FineTuneSchedule(logger, usr_conf)
-    if fine_tune_schedule.enabled:
-        data = env.reset(usr_conf)
-        if data is None:
-            logger.error("[FineTuneSchedule] initial env.reset failed after applying initial schedule config!")
-            raise RuntimeError("FineTuneSchedule initial env.reset failed")
-        obs, critic_obs = data
-        if critic_obs is None:
-            critic_obs = obs
-        obs, critic_obs = apply_command_mix_to_obs_pair(env, obs, critic_obs, usr_conf, site="schedule_reset")
-        last_obs, last_critic_obs = torch.clone(obs), torch.clone(critic_obs)
-        cur_reward_sum.zero_()
-        cur_episode_length.zero_()
-        logger.warning("[FineTuneSchedule] initial reward/command config applied by env.reset before rollout.")
+    # 閫熷害璇剧▼锛氱嫭绔嬩簬鍦板舰璇剧▼鎵╁ぇ閫熷害鎸囦护鑼冨洿銆?    # 鍦板舰闅惧害鐢?TOML difficulty_range=[0,1.0] + 10 涓绋嬫。浣嶇嫭绔嬮檺鍒讹紝
+    # 鍒濆鏀剧疆绛夌骇涓婇檺涓?0锛涢€熷害鑼冨洿鐢?VelocityCurriculum 閫愰樁鎵╁ぇ銆?
+    vel_curriculum = None
+    if "velocity_curriculum" in usr_conf:
+        vel_curriculum = VelocityCurriculum(logger, usr_conf)
+
+    nav_controller = None
+    nav_conf = usr_conf.get("navigation", {})
+    if bool(nav_conf.get("enabled", False)):
+        logger.warning(
+            "[Navigation] Ignored navigation.enabled=true because this PPO stage "
+            "uses pure-RL maze navigation. No local planner will override commands."
+        )
 
     # Main Training Loop
-    # 主训练循环
     while True:
         logger.info(f"Episode {episode} start, usr_conf is {usr_conf}")
         start_time = time.time()
 
         # Phase 1: Data Collection
-        # 阶段1：数据收集
         last_obs, last_critic_obs, storage_stats = run_episodes_(
             env,
             agent,
@@ -1022,61 +464,50 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             rewbuffer,
             lenbuffer,
             usr_conf,
+            nav_controller=nav_controller,
         )
 
         episode += 1
 
         # Phase 1.5: Velocity Curriculum Check (performance-based, before ep_infos.clear)
-        # 阶段1.5：速度课程检查（性能驱动，必须在 ep_infos.clear() 之前调用）
-        last_obs, last_critic_obs, vel_reset = vel_curriculum.check_and_update(
-            ep_infos, usr_conf, env, last_obs, last_critic_obs, rollout_stats=storage_stats
-        )
+        # 闃舵1.5锛氶€熷害璇剧▼妫€鏌ワ紙鎬ц兘椹卞姩锛屽繀椤诲湪 ep_infos.clear() 涔嬪墠璋冪敤锛?
+        vel_reset = False
+        if vel_curriculum is not None:
+            last_obs, last_critic_obs, vel_reset = vel_curriculum.check_and_update(
+                ep_infos, usr_conf, env, last_obs, last_critic_obs, rollout_stats=storage_stats
+            )
         # If env.reset was triggered by a stage change, stale accumulated rewards
         # from interrupted episodes must be discarded to prevent corrupting rewbuffer.
-        # 若阶段切换触发了 env.reset，必须清零未完成 episode 的累计统计，
-        # 防止旧值在下次 dones 触发时污染 rewbuffer。
         if vel_reset:
             cur_reward_sum.zero_()
             cur_episode_length.zero_()
-
-        last_obs, last_critic_obs, schedule_reset = fine_tune_schedule.check_and_update(
-            usr_conf, env, last_obs, last_critic_obs, episode
-        )
-        if schedule_reset:
-            cur_reward_sum.zero_()
-            cur_episode_length.zero_()
+            if nav_controller is not None:
+                nav_controller.reset(agent.num_envs, agent.device)
 
         # Phase 2: Policy Update
-        # 阶段2：策略更新
-        # framework=True lets the framework directly call back to the business layer,
+        # 闃舵2锛氱瓥鐣ユ洿鏂?        # framework=True lets the framework directly call back to the business layer,
         # skipping the sample data guard.
-        # framework=True 让框架层直接回调业务层，跳过 sample data guard
+        # framework=True 璁╂鏋跺眰鐩存帴鍥炶皟涓氬姟灞傦紝璺宠繃 sample data guard
         agent.learn(list_sample_data=None)
         # Reset buffer pointer for next data collection
-        # 重置 buffer 指针，为下一轮数据收集做准备
+        # 閲嶇疆 buffer 鎸囬拡锛屼负涓嬩竴杞暟鎹敹闆嗗仛鍑嗗
         storage.clear()
         total_cost_time = round(time.time() - start_time, 2)
         logger.info(f"Episode {episode} end, cost_time is {total_cost_time} s")
 
         # Phase 3: Monitoring Metrics Processing
-        # 阶段3：监控指标处理
         now = time.time()
         if now - last_report_monitor_time >= 60:
             report_monitor_data(ep_infos, reward_keys, agent, monitor, episode, storage_stats,
-                                vel_stage=vel_curriculum.stage,
-                                vel_tracking_ratio=vel_curriculum.last_tracking_ratio,
-                                vel_tracking_reward=vel_curriculum.last_tracking_reward,
-                                schedule_stats={
-                                    **fine_tune_schedule.monitor_stats(),
-                                    **vel_curriculum.monitor_stats(),
-                                },
+                                vel_stage=vel_curriculum.stage if vel_curriculum is not None else 0,
+                                vel_tracking_ratio=vel_curriculum.last_tracking_ratio if vel_curriculum is not None else 0.0,
+                                vel_tracking_reward=vel_curriculum.last_tracking_reward if vel_curriculum is not None else 0.0,
                                 lenbuffer=lenbuffer, rewbuffer=rewbuffer)
             last_report_monitor_time = now
 
         ep_infos.clear()
 
         # Phase 4: Model Saving
-        # 阶段4：模型保存
         if episode % agent.save_interval == 0:
             agent.save_model()
 
@@ -1086,8 +517,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
 def _extract_metric_value(ep_info, key, device):
     """Extract and convert metric value to tensor.
 
-    提取指标值并转换为 tensor。
-    """
+    鎻愬彇鎸囨爣鍊煎苟杞崲涓?tensor銆?    """
     if key not in ep_info:
         return torch.tensor(0.0, device=device, dtype=torch.float32)
     metric = ep_info[key]
@@ -1099,8 +529,7 @@ def _extract_metric_value(ep_info, key, device):
 def _aggregate_metrics(generic_metrics):
     """Aggregate metrics by computing mean values.
 
-    通过计算均值汇总指标。
-    """
+    閫氳繃璁＄畻鍧囧€兼眹鎬绘寚鏍囥€?    """
     aggregated = {}
     for metric_key, values in generic_metrics.items():
         if values:
@@ -1113,8 +542,7 @@ def _aggregate_metrics(generic_metrics):
 def _collect_episode_metrics(ep_infos, reward_keys, device):
     """Collect metrics from episode infos.
 
-    从 episode info 中收集指标。
-    """
+    浠?episode info 涓敹闆嗘寚鏍囥€?    """
     generic_metrics = defaultdict(list)
     for ep_info in ep_infos:
         for key in reward_keys:
@@ -1125,12 +553,10 @@ def _collect_episode_metrics(ep_infos, reward_keys, device):
 
 def report_monitor_data(ep_infos, reward_keys, agent, monitor, episode, storage_stats=None,
                         vel_stage: int = 0, vel_tracking_ratio: float = 0.0,
-                        vel_tracking_reward: float = 0.0, schedule_stats=None,
-                        lenbuffer=None, rewbuffer=None):
+                        vel_tracking_reward: float = 0.0, lenbuffer=None, rewbuffer=None):
     """
     Report monitoring data to monitor system.
-    上报监控数据到监控系统。
-    """
+    涓婃姤鐩戞帶鏁版嵁鍒扮洃鎺х郴缁熴€?    """
     monitor_data = {
         "episode_cnt": episode,
         "vel_curriculum_stage": vel_stage,
@@ -1139,14 +565,10 @@ def report_monitor_data(ep_infos, reward_keys, agent, monitor, episode, storage_
     }
 
     # Merge all storage stats: reward_mean/reward_std AND physics obs_ keys.
-    # 将所有 storage_stats 合并写入，包含 reward 统计和物理量观测 obs_ 键。
     if storage_stats:
         monitor_data.update(storage_stats)
-    if schedule_stats:
-        monitor_data.update(schedule_stats)
 
     # Episode health metrics: episode length and cumulative reward per episode.
-    # 训练进展指标：episode 存活步数和每 episode 累计奖励（与权重无关）。
     if lenbuffer:
         monitor_data["mean_episode_length"] = float(sum(lenbuffer) / len(lenbuffer))
     if rewbuffer:
@@ -1159,9 +581,6 @@ def report_monitor_data(ep_infos, reward_keys, agent, monitor, episode, storage_
         # obs_*; _collect_episode_metrics returns 0 for keys absent from ep_info.
         # If blindly updated, those valid workflow/storage values become flat 0
         # on the dashboard.
-        # 不允许 episode 聚合结果覆盖 workflow/storage 级指标。对于 ep_info 中不存在的
-        # vel_curriculum_* / obs_*，_collect_episode_metrics 会返回 0；盲目 update
-        # 会把真实上报值覆盖成 0。
         for key, value in metrics.items():
             if key not in monitor_data:
                 monitor_data[key] = value
@@ -1177,39 +596,6 @@ def report_monitor_data(ep_infos, reward_keys, agent, monitor, episode, storage_
             f"has_obs_lin_vel_x_error={'obs_lin_vel_x_error' in monitor_data}, "
             f"has_obs_base_height={'obs_base_height' in monitor_data}"
         )
-        logger.warning(
-            "[LongTrainGate] "
-            f"episode={episode}, "
-            f"up={monitor_data.get('hs_up_ratio', 0.0):.4f}, "
-            f"down={monitor_data.get('hs_down_ratio', 0.0):.4f}, "
-            f"wall={monitor_data.get('hs_wall_ratio', 0.0):.4f}, "
-            f"flat={monitor_data.get('hs_flat_ratio', 0.0):.4f}, "
-            f"step_score={monitor_data.get('hs_step_score', 0.0):.4f}, "
-            f"wall_score={monitor_data.get('hs_wall_score', 0.0):.4f}, "
-            f"probe_available={monitor_data.get('hs_probe_available', 0.0):.4f}, "
-            f"probe_reason={monitor_data.get('hs_probe_reason_code', 0.0):.0f}, "
-            f"clear_active={monitor_data.get('hs_clear_active', 0.0):.4f}, "
-            f"place_active={monitor_data.get('hs_place_active', 0.0):.4f}, "
-            f"yaw_active={monitor_data.get('uncommanded_yaw_active', 0.0):.4f}, "
-            f"yaw_stair={monitor_data.get('uncommanded_yaw_stair', 0.0):.4f}"
-        )
-        logger.warning(
-            "[CommandMixMonitor] "
-            f"episode={episode}, "
-            f"enabled={monitor_data.get('command_mix_enabled', 0.0):.0f}, "
-            f"runtime_seen={monitor_data.get('command_mix_runtime_seen', 0.0):.0f}, "
-            f"reason={_command_mix_reason_name(monitor_data.get('command_mix_reason_code', -1.0))}, "
-            f"target=({monitor_data.get('command_mix_target_spin', 0.0):.3f}, "
-            f"{monitor_data.get('command_mix_target_vx_only', 0.0):.3f}, "
-            f"{monitor_data.get('command_mix_target_vx_vy', 0.0):.3f}, "
-            f"{monitor_data.get('command_mix_target_full', 0.0):.3f}), "
-            f"spin={monitor_data.get('command_mix_spin_ratio', 0.0):.3f}, "
-            f"vx_only={monitor_data.get('command_mix_vx_only_ratio', 0.0):.3f}, "
-            f"vx_vy={monitor_data.get('command_mix_vx_vy_ratio', 0.0):.3f}, "
-            f"full={monitor_data.get('command_mix_full_ratio', 0.0):.3f}, "
-            f"abs_vy={monitor_data.get('command_mix_cmd_vy_abs_mean', 0.0):.3f}, "
-            f"abs_wz={monitor_data.get('command_mix_cmd_wz_abs_mean', 0.0):.3f}"
-        )
 
     monitor.put_data({os.getpid(): monitor_data})
 
@@ -1217,14 +603,38 @@ def report_monitor_data(ep_infos, reward_keys, agent, monitor, episode, storage_
 def _process_env_step_result(data, episode, logger):
     """
     Process environment step result.
-    处理环境交互结果。
-    """
+    澶勭悊鐜浜や簰缁撴灉銆?    """
     if data is None:
         error_message = "step failed, please check"
         logger.error(error_message)
         raise Exception(error_message)
 
-    frame_no, obs, rewards, terminated, truncated, (infos, privileged_obs) = data
+    if not isinstance(data, (tuple, list)):
+        raise TypeError(f"Unexpected env.step return type: {type(data).__name__}")
+
+    if len(data) == 6:
+        frame_no, obs, rewards, terminated, truncated, extra = data
+        if isinstance(extra, (tuple, list)):
+            if len(extra) < 2:
+                raise ValueError(f"Unexpected env.step extra length: {len(extra)}")
+            infos, privileged_obs = extra[0], extra[1]
+        elif isinstance(extra, dict):
+            infos = extra
+            privileged_obs = extra.get("privileged_obs", extra.get("critic_obs", None))
+        else:
+            raise TypeError(f"Unexpected env.step extra type: {type(extra).__name__}")
+    elif len(data) >= 7:
+        frame_no, obs, rewards, terminated, truncated = data[:5]
+        infos_or_extra = data[5]
+        if isinstance(infos_or_extra, (tuple, list)) and len(infos_or_extra) >= 2:
+            infos, privileged_obs = infos_or_extra[0], infos_or_extra[1]
+        else:
+            infos, privileged_obs = infos_or_extra, data[6]
+    else:
+        raise ValueError(f"Unexpected env.step return length: {len(data)}")
+
+    if infos is None:
+        infos = {}
 
     if privileged_obs is not None:
         critic_obs = torch.clone(privileged_obs)
@@ -1243,8 +653,7 @@ def _process_env_step_result(data, episode, logger):
 def _move_tensors_to_device(obs, critic_obs, rewards, dones, device):
     """Move tensors to specified device.
 
-    将张量移动到指定设备。
-    """
+    灏嗗紶閲忕Щ鍔ㄥ埌鎸囧畾璁惧銆?    """
     return (
         obs.to(device),
         critic_obs.to(device),
@@ -1266,11 +675,12 @@ def _update_transition_data(
     dones,
     infos,
     agent,
+    hidden_states=None,
+    timeout_bootstrap_values=None,
 ):
     """
     Update transition with step data.
-    使用步骤数据更新 transition。
-    """
+    浣跨敤姝ラ鏁版嵁鏇存柊 transition銆?    """
     transition.actions = actions
     transition.values = values
     transition.actions_log_prob = actions_log_prob
@@ -1280,12 +690,24 @@ def _update_transition_data(
     transition.critic_observations = critic_obs
     transition.rewards = rewards.clone()
     transition.dones = dones
+    transition.hidden_states = hidden_states
 
     # Bootstrapping on time outs
-    # 处理 timeouts
+    # 澶勭悊 timeouts
     if "time_outs" in infos:
+        bootstrap_values = (
+            timeout_bootstrap_values
+            if timeout_bootstrap_values is not None
+            else transition.values
+        )
+        bootstrap_values = torch.nan_to_num(
+            bootstrap_values.detach(), nan=0.0, posinf=0.0, neginf=0.0
+        )
+        timeout_mask = infos["time_outs"].unsqueeze(1).to(
+            device=agent.device, dtype=bootstrap_values.dtype
+        )
         transition.rewards += agent.algorithm.gamma * torch.squeeze(
-            transition.values * infos["time_outs"].unsqueeze(1).to(agent.device), 1
+            bootstrap_values * timeout_mask, 1
         )
 
 
@@ -1301,8 +723,7 @@ def _update_episode_statistics(
 ):
     """Update episode statistics and buffers.
 
-    更新 episode 统计和缓冲区。
-    """
+    鏇存柊 episode 缁熻鍜岀紦鍐插尯銆?    """
     if "episode" in infos:
         ep_infos.append(infos["episode"])
 
@@ -1317,13 +738,44 @@ def _update_episode_statistics(
     cur_episode_length[new_ids] = 0
 
 
-def _compute_advantages_and_returns(storage, agent, critic_obs, logger):
+def _compute_advantages_and_returns(
+    storage,
+    agent,
+    obs,
+    critic_obs,
+    logger,
+    env=None,
+    nav_controller=None,
+    usr_conf=None,
+):
     """
     Compute advantage function and returns.
-    计算优势函数和回报。
-    """
-    last_critic_obs = torch.clone(critic_obs)
-    last_values = agent.algorithm.actor_critic.evaluate(last_critic_obs.detach()).detach()
+    璁＄畻浼樺娍鍑芥暟鍜屽洖鎶ャ€?    """
+    last_obs = obs
+    last_critic_obs = critic_obs
+    if nav_controller is not None and last_obs is not None:
+        last_obs, last_critic_obs, _ = _apply_navigation_command(
+            last_obs,
+            last_critic_obs,
+            env,
+            nav_controller,
+            logger,
+            update_nav_state=False,
+            update_env_command=False,
+        )
+    if usr_conf is not None and last_obs is not None:
+        last_obs, last_critic_obs, _ = _apply_rl_phase_command(
+            last_obs,
+            last_critic_obs,
+            env,
+            usr_conf,
+            logger,
+            update_state=False,
+            update_env_command=False,
+        )
+
+    value_obs = last_critic_obs if last_critic_obs is not None else last_obs
+    last_values = agent.algorithm.actor_critic.evaluate(value_obs.detach()).detach()
     storage.compute_returns(last_values, agent.algorithm.gamma, agent.algorithm.lam)
 
     storage_stats = {
@@ -1379,17 +831,10 @@ def _sample_rollout_tracking_stats(storage, usr_conf, logger=None):
 def _get_isaac_env(env):
     """Try to unwrap the KaiwuDRL env wrapper to the underlying Isaac Lab env.
 
-    尝试解包 KaiwuDRL 包装层，获取底层的 Isaac Lab 环境对象。
-    Returns the first object that exposes a `command_manager` attribute,
+    灏濊瘯瑙ｅ寘 KaiwuDRL 鍖呰灞傦紝鑾峰彇搴曞眰鐨?Isaac Lab 鐜瀵硅薄銆?    Returns the first object that exposes a `command_manager` attribute,
     or None if none is found.
-    返回第一个带有 command_manager 属性的对象，找不到则返回 None。
-    """
-    direct = _get_robot_gym_unwrapped(env)
-    if direct is not None:
-        return direct
-
+    杩斿洖绗竴涓甫鏈?command_manager 灞炴€х殑瀵硅薄锛屾壘涓嶅埌鍒欒繑鍥?None銆?    """
     # Walk common wrapper chains recursively instead of assuming one fixed depth.
-    # 递归遍历常见 wrapper 链，避免假设包装层只有固定一层。
     seen_ids = set()
     pending = [env]
     while pending:
@@ -1400,88 +845,21 @@ def _get_isaac_env(env):
         if hasattr(candidate, "command_manager") and hasattr(candidate, "scene"):
             return candidate
         for attr_name in (
-            "env_object",
-            "_env_object",
             "env",
             "_env",
-            "gym_env",
-            "_gym_env",
-            "envs",
-            "_envs",
             "unwrapped",
             "wrapped_env",
             "_wrapped_env",
             "venv",
-            "_venv",
             "isaac_env",
             "_isaac_env",
             "sim_env",
             "_sim_env",
-            "base_env",
-            "_base_env",
-            "robot_env",
-            "_robot_env",
-            "rl_env",
-            "_rl_env",
-            "gym",
-            "_gym",
             "task",
             "_task",
         ):
-            try:
-                child = getattr(candidate, attr_name, None)
-            except Exception:
-                child = None
-            if child is not None:
-                pending.append(child)
-        if hasattr(candidate, "__dict__"):
-            try:
-                for key, child in vars(candidate).items():
-                    if key.startswith("__"):
-                        continue
-                    if key in ("command_manager", "scene"):
-                        continue
-                    if child is not None and not isinstance(child, (str, bytes, int, float, bool, tuple, list, dict)):
-                        pending.append(child)
-            except Exception:
-                pass
+            pending.append(getattr(candidate, attr_name, None))
     return None
-
-
-def _get_robot_gym_unwrapped(env):
-    """Fast path for tools.base_env.base_env.Robot: env._gym_env.unwrapped."""
-    try:
-        gym_env = getattr(env, "_gym_env", None)
-        unwrapped = getattr(gym_env, "unwrapped", None) if gym_env is not None else None
-        if unwrapped is not None and hasattr(unwrapped, "command_manager") and hasattr(unwrapped, "scene"):
-            return unwrapped
-    except Exception:
-        return None
-    return None
-
-
-def _describe_env_unwrap_candidates(env, max_items: int = 16) -> str:
-    parts = []
-    seen_ids = set()
-    pending = [("root", env)]
-    while pending and len(parts) < max_items:
-        path, candidate = pending.pop(0)
-        if candidate is None or id(candidate) in seen_ids:
-            continue
-        seen_ids.add(id(candidate))
-        try:
-            keys = list(vars(candidate).keys())[:12] if hasattr(candidate, "__dict__") else []
-        except Exception:
-            keys = []
-        parts.append(f"{path}:{type(candidate).__module__}.{type(candidate).__name__} keys={keys}")
-        for attr_name in ("env_object", "_env_object", "_gym_env", "env", "_env", "unwrapped", "venv", "_venv"):
-            try:
-                child = getattr(candidate, attr_name, None)
-            except Exception:
-                child = None
-            if child is not None:
-                pending.append((f"{path}.{attr_name}", child))
-    return " | ".join(parts)
 
 
 def _has_robot_state(asset) -> bool:
@@ -1497,9 +875,7 @@ def _has_robot_state(asset) -> bool:
 def _get_robot_asset_from_env(isaac_env):
     """Best-effort robot asset lookup across common Isaac Lab scene layouts.
 
-    奖励模块通过平台基类间接取 robot asset，这里无法复用闭源 helper，
-    因此改为遍历常见 scene 容器布局做稳健查找。
-    """
+    濂栧姳妯″潡閫氳繃骞冲彴鍩虹被闂存帴鍙?robot asset锛岃繖閲屾棤娉曞鐢ㄩ棴婧?helper锛?    鍥犳鏀逛负閬嶅巻甯歌 scene 瀹瑰櫒甯冨眬鍋氱ǔ鍋ユ煡鎵俱€?    """
     if isaac_env is None:
         return None
 
@@ -1570,52 +946,38 @@ def _sample_physics_stats_from_critic_obs(critic_obs):
 
     actual_vx = critic_obs[:, 0]
     actual_vy = critic_obs[:, 1]
+    actual_yaw = critic_obs[:, 5]
     cmd_vx = critic_obs[:, 9]
     cmd_vy = critic_obs[:, 10]
-    cmd_wz = critic_obs[:, 11]
-    eps = 1.0e-4
-    vx_active = torch.abs(cmd_vx) > eps
-    vy_active = torch.abs(cmd_vy) > eps
-    wz_active = torch.abs(cmd_wz) > eps
-    spin_like = (~vx_active) & (~vy_active) & wz_active
-    vx_only_like = vx_active & (~vy_active) & (~wz_active)
-    vx_vy_like = vx_active & vy_active & (~wz_active)
-    full_like = vx_active & vy_active & wz_active
+    cmd_yaw = critic_obs[:, 11]
 
     return {
+        "obs_cmd_vel_x": cmd_vx.mean().item(),
+        "obs_cmd_vel_y": cmd_vy.mean().item(),
+        "obs_cmd_yaw": cmd_yaw.mean().item(),
         "obs_lin_vel_x_error": torch.abs(actual_vx - cmd_vx).mean().item(),
         "obs_lin_vel_y_error": torch.abs(actual_vy - cmd_vy).mean().item(),
+        "obs_yaw_error": torch.abs(actual_yaw - cmd_yaw).mean().item(),
         "obs_actual_vel_x": actual_vx.mean().item(),
+        "obs_actual_vel_y": actual_vy.mean().item(),
+        "obs_actual_yaw": actual_yaw.mean().item(),
         "obs_ang_vel_xy": torch.norm(critic_obs[:, 3:5], dim=1).mean().item(),
-        "command_mix_enabled": float(
-            (spin_like | vx_only_like | vx_vy_like | full_like).float().mean().item() > 0.0
-        ),
-        "command_mix_spin_ratio": spin_like.float().mean().item(),
-        "command_mix_vx_only_ratio": vx_only_like.float().mean().item(),
-        "command_mix_vx_vy_ratio": vx_vy_like.float().mean().item(),
-        "command_mix_full_ratio": full_like.float().mean().item(),
-        "command_mix_only_vx_like": vx_only_like.float().mean().item(),
-        "command_mix_spin_like": spin_like.float().mean().item(),
-        "command_mix_cmd_vy_abs_mean": torch.abs(cmd_vy).mean().item(),
-        "command_mix_cmd_wz_abs_mean": torch.abs(cmd_wz).mean().item(),
     }
 
 
 def _sample_physics_stats(env, logger=None, critic_obs=None):
     """Take a point-in-time snapshot of key physical quantities across all envs.
 
-    在所有并行环境上对关键物理量做一次快照（均值）。
-    这些指标与 reward 权重无关，是判断策略真实收敛情况的第一手依据：
-      obs_lin_vel_x_error — 前向速度追踪误差 |cmd_vx - actual_vx| (m/s)
-      obs_lin_vel_y_error — 侧向速度追踪误差 |cmd_vy - actual_vy| (m/s)
-      obs_actual_vel_x    — 机体前向实际速度均值 (m/s)
-      obs_base_height     — 机身高度均值 (m)，目标 0.38 m
-      obs_ang_vel_xy      — pitch/roll 角速度幅值均值 (rad/s)
+    鍦ㄦ墍鏈夊苟琛岀幆澧冧笂瀵瑰叧閿墿鐞嗛噺鍋氫竴娆″揩鐓э紙鍧囧€硷級銆?    杩欎簺鎸囨爣涓?reward 鏉冮噸鏃犲叧锛屾槸鍒ゆ柇绛栫暐鐪熷疄鏀舵暃鎯呭喌鐨勭涓€鎵嬩緷鎹細
+      obs_lin_vel_x_error 鈥?鍓嶅悜閫熷害杩借釜璇樊 |cmd_vx - actual_vx| (m/s)
+      obs_lin_vel_y_error 鈥?渚у悜閫熷害杩借釜璇樊 |cmd_vy - actual_vy| (m/s)
+      obs_actual_vel_x    鈥?鏈轰綋鍓嶅悜瀹為檯閫熷害鍧囧€?(m/s)
+      obs_base_height     鈥?鏈鸿韩楂樺害鍧囧€?(m)锛岀洰鏍?0.38 m
+      obs_ang_vel_xy      鈥?pitch/roll 瑙掗€熷害骞呭€煎潎鍊?(rad/s)
 
     Falls back to critic_obs for metrics that are available there if the
     underlying Isaac Lab env is not accessible.
-    如果访问不到底层 Isaac Lab 环境，则从 critic_obs 中兜底计算可用指标。
-    """
+    濡傛灉璁块棶涓嶅埌搴曞眰 Isaac Lab 鐜锛屽垯浠?critic_obs 涓厹搴曡绠楀彲鐢ㄦ寚鏍囥€?    """
     try:
         isaac_env = _get_isaac_env(env)
         if isaac_env is None:
@@ -1623,12 +985,10 @@ def _sample_physics_stats(env, logger=None, critic_obs=None):
                 env._physics_stats_error_logged = True
                 logger.warning(
                     "[PhysicsStats] Failed to unwrap Isaac Lab env; "
-                    "falling back to critic_obs for partial physics metrics. "
-                    f"candidates={_describe_env_unwrap_candidates(env, max_items=8)}"
+                    "falling back to critic_obs for partial physics metrics."
                 )
             return _sample_physics_stats_from_critic_obs(critic_obs)
 
-        critic_stats = _sample_physics_stats_from_critic_obs(critic_obs)
         cmd = isaac_env.command_manager.get_command("base_velocity")  # (N, 3)
         asset = _get_robot_asset_from_env(isaac_env)
         if asset is None:
@@ -1638,25 +998,29 @@ def _sample_physics_stats(env, logger=None, critic_obs=None):
                     "[PhysicsStats] Failed to locate robot asset in scene; "
                     "falling back to critic_obs for partial physics metrics."
                 )
-            return critic_stats
+            return _sample_physics_stats_from_critic_obs(critic_obs)
 
         actual_vx = asset.data.root_lin_vel_b[:, 0]
         actual_vy = asset.data.root_lin_vel_b[:, 1]
+        actual_yaw = asset.data.root_ang_vel_b[:, 2]
         cmd_vx    = cmd[:, 0]
         cmd_vy    = cmd[:, 1]
+        cmd_yaw   = cmd[:, 2]
 
         stats = {
+            "obs_cmd_vel_x":       cmd_vx.mean().item(),
+            "obs_cmd_vel_y":       cmd_vy.mean().item(),
+            "obs_cmd_yaw":         cmd_yaw.mean().item(),
             "obs_lin_vel_x_error": torch.abs(actual_vx - cmd_vx).mean().item(),
             "obs_lin_vel_y_error": torch.abs(actual_vy - cmd_vy).mean().item(),
+            "obs_yaw_error":       torch.abs(actual_yaw - cmd_yaw).mean().item(),
             "obs_actual_vel_x":    actual_vx.mean().item(),
+            "obs_actual_vel_y":    actual_vy.mean().item(),
+            "obs_actual_yaw":      actual_yaw.mean().item(),
             "obs_base_height":     asset.data.root_pos_w[:, 2].mean().item(),
             "obs_ang_vel_xy":      torch.norm(
                 asset.data.root_ang_vel_b[:, :2], dim=1).mean().item(),
         }
-        if critic_stats:
-            base_height = stats.get("obs_base_height")
-            stats.update(critic_stats)
-            stats["obs_base_height"] = base_height
         return stats
     except Exception as exc:
         if logger is not None and not getattr(env, "_physics_stats_error_logged", False):
@@ -1666,6 +1030,422 @@ def _sample_physics_stats(env, logger=None, critic_obs=None):
                 "falling back to critic_obs for partial physics metrics."
             )
         return _sample_physics_stats_from_critic_obs(critic_obs)
+
+
+def _set_env_base_velocity_command(env, command, logger=None):
+    """Best-effort override of Isaac Lab's sampled base_velocity command."""
+    isaac_env = _get_isaac_env(env)
+    if isaac_env is None or not hasattr(isaac_env, "command_manager"):
+        if logger is not None and not getattr(env, "_nav_command_error_logged", False):
+            env._nav_command_error_logged = True
+            logger.warning("[Navigation] Cannot unwrap Isaac env; only observation command will be overridden.")
+        return False
+
+    try:
+        current_command = isaac_env.command_manager.get_command("base_velocity")
+        if current_command.shape != command.shape:
+            if logger is not None and not getattr(env, "_nav_command_error_logged", False):
+                env._nav_command_error_logged = True
+                logger.warning(
+                    "[Navigation] base_velocity command shape mismatch: "
+                    f"env={tuple(current_command.shape)}, nav={tuple(command.shape)}."
+                )
+            return False
+        current_command.copy_(command.to(device=current_command.device, dtype=current_command.dtype))
+        return True
+    except Exception as exc:
+        if logger is not None and not getattr(env, "_nav_command_error_logged", False):
+            env._nav_command_error_logged = True
+            logger.warning(f"[Navigation] Failed to override base_velocity command: {exc}")
+        return False
+
+
+def _range_midpoint(range_values, default_value: float) -> float:
+    if not isinstance(range_values, (list, tuple)) or len(range_values) != 2:
+        return default_value
+    return 0.5 * (float(range_values[0]) + float(range_values[1]))
+
+
+def _sample_uniform_range(range_values, shape, device, dtype):
+    low = float(range_values[0])
+    high = float(range_values[1])
+    if high < low:
+        low, high = high, low
+    if abs(high - low) <= 1e-8:
+        return torch.full(shape, low, device=device, dtype=dtype)
+    return low + (high - low) * torch.rand(shape, device=device, dtype=dtype)
+
+
+def _estimate_maze_phase_from_obs(obs, usr_conf):
+    """Best-effort track phase estimate from goal distance in policy obs.
+
+    Track navigation appends goal features at obs[301:304]:
+      local goal x/y normalized by 10m, and goal distance normalized by 20m.
+    The existing reward gate treats the final maze phase as goal_dist < 14m;
+    using the same threshold keeps command scheduling aligned with rewards.
+    """
+    if obs is None or not hasattr(obs, "shape") or obs.shape[-1] < 304:
+        return None
+
+    rl_nav_conf = usr_conf.get("rl_navigation", {})
+    goal_start = int(rl_nav_conf.get("goal_start", 301))
+    if obs.shape[-1] < goal_start + 3:
+        return None
+
+    goal_dist_gate = float(rl_nav_conf.get("phase_maze_goal_dist_gate", 14.0))
+    goal_dist = torch.clamp(obs[:, goal_start + 2], 0.0, 1.0) * 20.0
+    return goal_dist < goal_dist_gate
+
+
+def _height_grid_from_obs(obs, usr_conf):
+    if obs is None or not hasattr(obs, "shape"):
+        return None
+    rl_nav_conf = usr_conf.get("rl_navigation", {})
+    scan_start = int(rl_nav_conf.get("scan_start", 45))
+    scan_size = int(rl_nav_conf.get("scan_size", 256))
+    if obs.shape[-1] < scan_start + scan_size:
+        return None
+    side = int(scan_size ** 0.5)
+    if side * side != scan_size:
+        return None
+    return obs[:, scan_start:scan_start + scan_size].view(obs.shape[0], side, side)
+
+
+def _estimate_pre_maze_terrain_from_obs(obs, usr_conf):
+    """Classify non-maze front terrain into flat / slope / stairs from height scan."""
+    grid = _height_grid_from_obs(obs, usr_conf)
+    if grid is None:
+        return None
+
+    rl_nav_conf = usr_conf.get("rl_navigation", {})
+    row_start = max(int(rl_nav_conf.get("terrain_row_start", 3)), 0)
+    row_end = min(int(rl_nav_conf.get("terrain_row_end", 13)), grid.shape[1])
+    front_cols = min(int(rl_nav_conf.get("terrain_front_cols", 8)), grid.shape[2])
+    if row_end <= row_start or front_cols <= 1:
+        return None
+
+    sector = grid[:, row_start:row_end, :front_cols]
+    if sector.shape[1] == 0 or sector.shape[2] <= 1:
+        return None
+
+    lateral_std = sector.std(dim=1, unbiased=False).mean(dim=1)
+    dx = sector[:, :, 1:] - sector[:, :, :-1]
+    abs_dx = dx.abs()
+    if abs_dx.numel() == 0:
+        return None
+
+    q = float(rl_nav_conf.get("terrain_step_quantile", 0.85))
+    q = min(max(q, 0.0), 1.0)
+    step_strength = torch.quantile(abs_dx.flatten(1), q, dim=1)
+    sign_consistency = dx.mean(dim=(1, 2)).abs() / (abs_dx.mean(dim=(1, 2)) + 1e-6)
+    if dx.shape[2] > 1:
+        second_diff = (dx[:, :, 1:] - dx[:, :, :-1]).abs().mean(dim=(1, 2))
+    else:
+        second_diff = torch.zeros(obs.shape[0], device=obs.device, dtype=obs.dtype)
+
+    is_uniform = lateral_std < float(rl_nav_conf.get("terrain_lateral_std_threshold", 0.18))
+    not_wall = sector.amin(dim=(1, 2)) > float(rl_nav_conf.get("terrain_wall_height_threshold", -1.05))
+    terrain_like = is_uniform & not_wall & (
+        step_strength > float(rl_nav_conf.get("terrain_slope_delta_threshold", 0.035))
+    )
+    stair_like = terrain_like & (
+        (step_strength > float(rl_nav_conf.get("terrain_stair_delta_threshold", 0.10)))
+        | (second_diff > float(rl_nav_conf.get("terrain_stair_second_diff_threshold", 0.055)))
+    )
+    slope_like = terrain_like & ~stair_like & (
+        sign_consistency > float(rl_nav_conf.get("terrain_slope_sign_consistency_threshold", 0.55))
+    )
+
+    terrain_id = torch.zeros(obs.shape[0], dtype=torch.long, device=obs.device)
+    terrain_id = torch.where(slope_like, torch.ones_like(terrain_id), terrain_id)
+    terrain_id = torch.where(stair_like, torch.full_like(terrain_id, 2), terrain_id)
+    return terrain_id
+
+
+def _maze_wall_anticipation_from_obs(obs, usr_conf):
+    grid = _height_grid_from_obs(obs, usr_conf)
+    if grid is None:
+        return None, None
+
+    rl_nav_conf = usr_conf.get("rl_navigation", {})
+    obstacle_threshold = float(rl_nav_conf.get("maze_anticipate_obstacle_threshold", -0.72))
+    temperature = max(float(rl_nav_conf.get("maze_anticipate_temperature", 0.18)), 1e-6)
+    front_cols = max(1, min(int(rl_nav_conf.get("maze_anticipate_front_cols", 8)), grid.shape[2]))
+    body_y_start = max(0, int(rl_nav_conf.get("maze_anticipate_body_y_start", 3)))
+    body_y_end = min(int(rl_nav_conf.get("maze_anticipate_body_y_end", 13)), grid.shape[1])
+    side_width = max(1, min(int(rl_nav_conf.get("maze_anticipate_side_width", 4)), grid.shape[1] // 2))
+    if body_y_end <= body_y_start:
+        return None, None
+
+    wall_prob = torch.sigmoid((obstacle_threshold - grid[:, :, :front_cols]) / temperature)
+    center_wall = wall_prob[:, body_y_start:body_y_end, :].mean(dim=(1, 2))
+    left_open = 1.0 - wall_prob[:, :side_width, :].mean(dim=(1, 2))
+    right_open = 1.0 - wall_prob[:, -side_width:, :].mean(dim=(1, 2))
+    open_delta = right_open - left_open
+    turn_sign = torch.sign(open_delta)
+    goal_start = int(rl_nav_conf.get("goal_start", 301))
+    if obs.shape[-1] > goal_start + 1:
+        goal_turn = torch.sign(obs[:, goal_start + 1])
+        turn_sign = torch.where(torch.abs(open_delta) > 0.06, turn_sign, goal_turn)
+
+    wall_start = float(rl_nav_conf.get("maze_anticipate_wall_start", 0.20))
+    wall_full = float(rl_nav_conf.get("maze_anticipate_wall_full", 0.72))
+    wall_gate = torch.clamp((center_wall - wall_start) / max(wall_full - wall_start, 1e-6), 0.0, 1.0)
+    return wall_gate, turn_sign
+
+
+def _phase_command_midpoint(obs, maze_phase, usr_conf, dtype):
+    rl_nav_conf = usr_conf.get("rl_navigation", {})
+    pre_range = rl_nav_conf.get("pre_maze_lin_vel_x", [0.75, 1.0])
+    slope_range = rl_nav_conf.get("slope_lin_vel_x", pre_range)
+    stairs_range = rl_nav_conf.get("stairs_lin_vel_x", pre_range)
+    maze_range = rl_nav_conf.get("maze_lin_vel_x", [0.45, 0.65])
+    terrain_phase_speed_enabled = bool(rl_nav_conf.get("terrain_phase_speed_enabled", False))
+    pre_vx = _range_midpoint(pre_range, 0.875)
+    slope_vx = _range_midpoint(slope_range, pre_vx)
+    stairs_vx = _range_midpoint(stairs_range, pre_vx)
+    maze_vx = _range_midpoint(maze_range, 0.55)
+    command = torch.zeros(maze_phase.shape[0], 3, device=maze_phase.device, dtype=dtype)
+    pre_command = torch.full_like(command[:, 0], pre_vx)
+    if terrain_phase_speed_enabled and obs is not None:
+        terrain_id = _estimate_pre_maze_terrain_from_obs(obs, usr_conf)
+        if terrain_id is not None:
+            pre_command = torch.where(
+                terrain_id == 1,
+                torch.full_like(pre_command, slope_vx),
+                pre_command,
+            )
+            pre_command = torch.where(
+                terrain_id == 2,
+                torch.full_like(pre_command, stairs_vx),
+                pre_command,
+            )
+    maze_command = torch.full_like(command[:, 0], maze_vx)
+    wall_gate, _ = _maze_wall_anticipation_from_obs(obs, usr_conf)
+    if wall_gate is not None:
+        min_scale = float(rl_nav_conf.get("maze_anticipate_min_speed_scale", 1.0))
+        speed_scale = 1.0 - torch.clamp(wall_gate, 0.0, 1.0) * (1.0 - min_scale)
+        maze_command = maze_command * speed_scale
+    command[:, 0] = torch.where(maze_phase, maze_command, pre_command)
+    return command
+
+
+def _get_phase_command_state(env, num_envs, device, dtype):
+    state = getattr(env, "_rl_phase_command_state", None)
+    if (
+        state is None
+        or state["command"].shape[0] != num_envs
+        or state["command"].device != device
+        or state["command"].dtype != dtype
+    ):
+        state = {
+            "command": torch.zeros(num_envs, 3, device=device, dtype=dtype),
+            "timer": torch.zeros(num_envs, dtype=torch.long, device=device),
+            "maze_phase": torch.zeros(num_envs, dtype=torch.bool, device=device),
+            "terrain_id": torch.zeros(num_envs, dtype=torch.long, device=device),
+        }
+        setattr(env, "_rl_phase_command_state", state)
+    return state
+
+
+def _reset_phase_command_state(env, dones):
+    state = getattr(env, "_rl_phase_command_state", None)
+    if state is None or dones is None:
+        return
+    done_mask = dones.bool().view(-1)
+    if done_mask.any() and state["timer"].shape[0] == done_mask.shape[0]:
+        state["timer"][done_mask] = 0
+        state["command"][done_mask] = 0.0
+        state["maze_phase"][done_mask] = False
+        if "terrain_id" in state:
+            state["terrain_id"][done_mask] = 0
+
+
+def _apply_rl_phase_command(
+    obs,
+    critic_obs,
+    env,
+    usr_conf,
+    logger=None,
+    update_state=True,
+    update_env_command=True,
+):
+    """Override the locomotion anchor speed before/after the maze phase.
+
+    This is intentionally separate from the rule-based navigation controller:
+    it changes only the velocity command observation/reward anchor while the
+    PPO policy still controls all joints directly.
+    """
+    rl_nav_conf = usr_conf.get("rl_navigation", {})
+    if not bool(rl_nav_conf.get("phase_command_enabled", False)):
+        return obs, critic_obs, {}
+
+    maze_phase = _estimate_maze_phase_from_obs(obs, usr_conf)
+    if maze_phase is None:
+        return obs, critic_obs, {}
+
+    state = _get_phase_command_state(env, obs.shape[0], obs.device, obs.dtype)
+    resample_steps = max(int(rl_nav_conf.get("phase_command_resample_steps", 96)), 1)
+    pre_range = rl_nav_conf.get("pre_maze_lin_vel_x", [0.75, 1.0])
+    slope_range = rl_nav_conf.get("slope_lin_vel_x", pre_range)
+    stairs_range = rl_nav_conf.get("stairs_lin_vel_x", pre_range)
+    maze_range = rl_nav_conf.get("maze_lin_vel_x", [0.45, 0.65])
+    terrain_phase_speed_enabled = bool(rl_nav_conf.get("terrain_phase_speed_enabled", False))
+    terrain_id = _estimate_pre_maze_terrain_from_obs(obs, usr_conf)
+    if terrain_id is None:
+        terrain_id = torch.zeros(obs.shape[0], dtype=torch.long, device=obs.device)
+
+    command = state["command"]
+    if update_state:
+        timer = torch.clamp(state["timer"] - 1, min=0)
+        wall_gate, turn_sign = _maze_wall_anticipation_from_obs(obs, usr_conf)
+        wall_active = torch.zeros(obs.shape[0], dtype=torch.bool, device=obs.device)
+        if wall_gate is not None:
+            wall_active = maze_phase & (wall_gate > 0.05)
+        phase_changed = maze_phase != state["maze_phase"]
+        terrain_changed = terrain_phase_speed_enabled & (~maze_phase) & (terrain_id != state["terrain_id"])
+        yaw_cleanup = (~wall_active) & (torch.abs(command[:, 2]) > 1e-4)
+        needs_sample = (timer <= 0) | phase_changed | terrain_changed | (command[:, 0] <= 0.0)
+
+        if needs_sample.any():
+            sampled_pre = _sample_uniform_range(pre_range, (obs.shape[0],), obs.device, obs.dtype)
+            sampled_slope = _sample_uniform_range(slope_range, (obs.shape[0],), obs.device, obs.dtype)
+            sampled_stairs = _sample_uniform_range(stairs_range, (obs.shape[0],), obs.device, obs.dtype)
+            sampled_maze = _sample_uniform_range(maze_range, (obs.shape[0],), obs.device, obs.dtype)
+            sampled_non_maze = sampled_pre
+            if terrain_phase_speed_enabled:
+                sampled_non_maze = torch.where(terrain_id == 1, sampled_slope, sampled_non_maze)
+                sampled_non_maze = torch.where(terrain_id == 2, sampled_stairs, sampled_non_maze)
+            if wall_gate is not None:
+                min_scale = float(rl_nav_conf.get("maze_anticipate_min_speed_scale", 1.0))
+                speed_scale = 1.0 - torch.clamp(wall_gate, 0.0, 1.0) * (1.0 - min_scale)
+                sampled_maze = sampled_maze * speed_scale
+            sampled_vx = torch.where(maze_phase, sampled_maze, sampled_non_maze)
+            command = command.clone()
+            command[needs_sample, 0] = sampled_vx[needs_sample]
+            command[needs_sample, 1] = 0.0
+            command[needs_sample, 2] = 0.0
+            state["command"] = command
+
+        if wall_active.any() or yaw_cleanup.any():
+            command = command.clone()
+            if wall_gate is not None and turn_sign is not None and wall_active.any():
+                max_yaw = float(rl_nav_conf.get("maze_anticipate_yaw_cmd", 0.85))
+                yaw_cmd = torch.clamp(wall_gate * turn_sign * max_yaw, -max_yaw, max_yaw)
+                command[wall_active, 2] = yaw_cmd[wall_active]
+            command[yaw_cleanup, 2] = 0.0
+            state["command"] = command
+
+        state["timer"] = torch.where(
+            needs_sample,
+            torch.full_like(timer, resample_steps),
+            timer,
+        )
+        state["maze_phase"] = maze_phase.detach().clone()
+        state["terrain_id"] = terrain_id.detach().clone()
+    else:
+        command = command.clone()
+        phase_changed = maze_phase != state["maze_phase"]
+        invalid = command[:, 0] <= 0.0
+        fallback = _phase_command_midpoint(obs, maze_phase, usr_conf, obs.dtype)
+        command[phase_changed | invalid] = fallback[phase_changed | invalid]
+
+    obs = obs.clone()
+    if obs.shape[-1] >= 9:
+        obs[:, 6:9] = command
+
+    if critic_obs is not None:
+        critic_obs = critic_obs.clone()
+        if critic_obs.shape[-1] >= 12:
+            critic_obs[:, 9:12] = command.to(device=critic_obs.device, dtype=critic_obs.dtype)
+
+    if update_env_command:
+        _set_env_base_velocity_command(env, command, logger)
+
+    return obs, critic_obs, {
+        "rl_phase_command_vx": command[:, 0].detach(),
+        "rl_phase_maze_ratio": maze_phase.float().detach(),
+        "rl_phase_slope_ratio": (terrain_id == 1).float().detach(),
+        "rl_phase_stairs_ratio": (terrain_id == 2).float().detach(),
+    }
+
+
+def _apply_navigation_command(
+    obs,
+    critic_obs,
+    env,
+    nav_controller,
+    logger=None,
+    update_nav_state=True,
+    update_env_command=True,
+):
+    """Patch policy/critic observations and env command with navigation output."""
+    if nav_controller is None:
+        return obs, critic_obs, {}
+
+    command, nav_stats = nav_controller.compute(obs, update_state=update_nav_state)
+    command = command.to(device=obs.device, dtype=obs.dtype)
+
+    obs = obs.clone()
+    if obs.shape[-1] >= 9:
+        obs[:, 6:9] = command
+
+    if critic_obs is not None:
+        critic_obs = critic_obs.clone()
+        if critic_obs.shape[-1] >= 12:
+            critic_obs[:, 9:12] = command.to(device=critic_obs.device, dtype=critic_obs.dtype)
+
+    if update_env_command:
+        _set_env_base_velocity_command(env, command, logger)
+    return obs, critic_obs, nav_stats
+
+
+def _compute_timeout_bootstrap_values(obs, critic_obs, env, nav_controller, agent, infos, logger=None, usr_conf=None):
+    """Evaluate V(s_{t+1}) for timeout bootstrapping using rollout-consistent obs."""
+    if "time_outs" not in infos:
+        return None
+
+    timeouts = infos["time_outs"]
+    if not torch.is_tensor(timeouts):
+        timeouts = torch.as_tensor(timeouts, device=agent.device)
+    else:
+        timeouts = timeouts.to(agent.device)
+    if not timeouts.bool().any():
+        return None
+
+    value_obs = obs
+    value_critic_obs = critic_obs
+    if nav_controller is not None:
+        value_obs, value_critic_obs, _ = _apply_navigation_command(
+            obs,
+            critic_obs,
+            env,
+            nav_controller,
+            logger,
+            update_nav_state=False,
+            update_env_command=False,
+        )
+    if usr_conf is not None:
+        value_obs, value_critic_obs, _ = _apply_rl_phase_command(
+            value_obs,
+            value_critic_obs,
+            env,
+            usr_conf,
+            logger,
+            update_state=False,
+            update_env_command=False,
+        )
+
+    value_input = value_critic_obs if value_critic_obs is not None else value_obs
+    return agent.algorithm.actor_critic.evaluate(value_input.detach()).detach()
+
+
+def _aggregate_navigation_stats(nav_metric_values):
+    aggregated = {}
+    for key, values in nav_metric_values.items():
+        if values:
+            aggregated[key] = torch.stack(values).mean().item()
+    return aggregated
 
 
 def run_episodes_(
@@ -1682,62 +1462,101 @@ def run_episodes_(
     rewbuffer,
     lenbuffer,
     usr_conf,
+    nav_controller=None,
 ):
     """
     Run episodes to collect trajectory data.
-    运行 episodes 收集轨迹数据。
-
+    杩愯 episodes 鏀堕泦杞ㄨ抗鏁版嵁銆?
     Returns:
         tuple: (last_obs, last_critic_obs, storage_stats)
-        返回值：(last_obs, last_critic_obs, storage_stats)
+        杩斿洖鍊硷細(last_obs, last_critic_obs, storage_stats)
     """
     transition = RolloutStorage.Transition()
     obs, critic_obs = last_obs, last_critic_obs
+    nav_metric_values = defaultdict(list)
 
     # TODO: for hierarchical training, handle the mismatch between env action and
     # PPO storage action on your own.
-    # TODO：如需分层训练，自行处理 env action 与 PPO storage action 不一致的问题。
-
+    # TODO锛氬闇€鍒嗗眰璁粌锛岃嚜琛屽鐞?env action 涓?PPO storage action 涓嶄竴鑷寸殑闂銆?
     # Policy execution loop
-    # 策略执行循环
+    # 绛栫暐鎵ц寰幆
     with torch.inference_mode():
         for i in range(agent.num_steps_per_env):
+            policy_obs, policy_critic_obs, nav_stats = _apply_navigation_command(
+                obs, critic_obs, env, nav_controller, logger
+            )
+            policy_obs, policy_critic_obs, phase_stats = _apply_rl_phase_command(
+                policy_obs,
+                policy_critic_obs,
+                env,
+                usr_conf,
+                logger,
+            )
+            for key, value in nav_stats.items():
+                nav_metric_values[key].append(value.float().mean())
+            for key, value in phase_stats.items():
+                nav_metric_values[key].append(value.float().mean())
+
             # Predict actions
-            # 预测动作
-            predict_data = (obs, critic_obs)
+            # 棰勬祴鍔ㄤ綔
+            predict_data = (policy_obs, policy_critic_obs)
             predict_result = agent.predict(predict_data)
 
-            (
-                actions,
-                values,
-                actions_log_prob,
-                action_mean,
-                action_sigma,
-                detach_obs,
-                detach_critic_obs,
-            ) = predict_result
+            if len(predict_result) == 8:
+                (
+                    actions,
+                    values,
+                    actions_log_prob,
+                    action_mean,
+                    action_sigma,
+                    detach_obs,
+                    detach_critic_obs,
+                    hidden_states,
+                ) = predict_result
+            elif len(predict_result) == 7:
+                (
+                    actions,
+                    values,
+                    actions_log_prob,
+                    action_mean,
+                    action_sigma,
+                    detach_obs,
+                    detach_critic_obs,
+                ) = predict_result
+                hidden_states = None
+            else:
+                raise ValueError(f"Unexpected agent.predict return length: {len(predict_result)}")
             joint_actions = actions
 
             # Clip joint actions for env
-            # 裁剪关节动作
+            # 瑁佸壀鍏宠妭鍔ㄤ綔
             command_actions = torch.clip(joint_actions, -6.0, 6.0).to(agent.device)
             if i == 0:
                 logger.info(f"clipped_action:{command_actions}")
 
             # Environment interaction
-            # 环境交互
+            # 鐜浜や簰
             data = env.step(command_actions)
             frame_no, obs, critic_obs, rewards, dones, infos = _process_env_step_result(data, episode, logger)
 
             # Move tensors to device
-            # 将张量移动到设备
+            # 灏嗗紶閲忕Щ鍔ㄥ埌璁惧
             obs, critic_obs, rewards, dones = _move_tensors_to_device(obs, critic_obs, rewards, dones, agent.device)
-            obs, critic_obs = apply_command_mix_to_obs_pair(
-                env, obs, critic_obs, usr_conf, site="rollout_step"
+            timeout_bootstrap_values = _compute_timeout_bootstrap_values(
+                obs,
+                critic_obs,
+                env,
+                nav_controller,
+                agent,
+                infos,
+                logger,
+                usr_conf=usr_conf,
             )
+            if nav_controller is not None:
+                nav_controller.reset(dones=dones)
+            _reset_phase_command_state(env, dones)
 
             # Update episode statistics (always, regardless of decimation)
-            # 更新 episode 统计（始终执行，不受降频影响）
             _update_episode_statistics(
                 dones,
                 rewards,
@@ -1750,7 +1569,6 @@ def run_episodes_(
             )
 
             # Write transition to storage every step (flat PPO)
-            # 每步写入 storage（扁平 PPO）
             _update_transition_data(
                 transition,
                 actions,
@@ -1764,732 +1582,34 @@ def run_episodes_(
                 dones,
                 infos,
                 agent,
+                hidden_states,
+                timeout_bootstrap_values=timeout_bootstrap_values,
             )
             storage.add_transitions(transition)
             transition.clear()
+            if hasattr(agent.algorithm.actor_critic, "reset"):
+                agent.algorithm.actor_critic.reset(dones)
 
         # Compute advantages and returns
-        # 计算优势函数和回报
-        storage_stats = _compute_advantages_and_returns(storage, agent, critic_obs, logger)
+        storage_stats = _compute_advantages_and_returns(
+            storage,
+            agent,
+            obs,
+            critic_obs,
+            logger,
+            env=env,
+            nav_controller=nav_controller,
+            usr_conf=usr_conf,
+        )
         storage_stats.update(_sample_rollout_tracking_stats(storage, usr_conf, logger))
+        storage_stats.update(_aggregate_navigation_stats(nav_metric_values))
         last_obs = torch.clone(obs)
 
     # Note: batch generation now handled by AlgorithmPPO.learn()
     # Storage will be cleared after learning
-    # 注：batch 生成已由 AlgorithmPPO.learn() 处理，
-    # storage 将在训练完成后被清空。
-
+    # 娉細batch 鐢熸垚宸茬敱 AlgorithmPPO.learn() 澶勭悊锛?    # storage 灏嗗湪璁粌瀹屾垚鍚庤娓呯┖銆?
     # Append a physics snapshot (averaged across all envs).
     # Wrapped in try/except inside _sample_physics_stats, so always safe.
-    # 追加物理量快照（跨所有并行环境取均值）。
-    # _sample_physics_stats 内部已有 try/except，调用总是安全的。
     storage_stats.update(_sample_physics_stats(env, logger, critic_obs=critic_obs))
-    storage_stats.update(_sample_command_mix_config_stats(usr_conf))
-    storage_stats.update(_sample_command_mix_runtime_stats(env))
-    storage_stats.update(_sample_stair_gate_debug_stats(env))
-    storage_stats.update(_sample_rollout_height_scan_probe_stats(critic_obs, logger))
 
     return last_obs, critic_obs, storage_stats
-
-
-def _sample_command_mix_config_stats(usr_conf):
-    conf = usr_conf.get("command_mix", {}) if isinstance(usr_conf, dict) else {}
-    if not isinstance(conf, dict):
-        conf = {}
-    enabled = bool(conf.get("enabled", False))
-    return {
-        "command_mix_enabled": 1.0 if enabled else 0.0,
-        "command_mix_target_spin": float(conf.get("spin_only_ratio", 0.0) or 0.0),
-        "command_mix_target_vx_only": float(conf.get("vx_only_ratio", 0.0) or 0.0),
-        "command_mix_target_vx_vy": float(conf.get("vx_vy_only_ratio", 0.0) or 0.0),
-        "command_mix_target_full": float(conf.get("full_ratio", 0.0) or 0.0),
-    }
-
-
-def _sample_command_mix_runtime_stats(env):
-    debug = _find_command_mix_debug(env)
-    if not isinstance(debug, dict):
-        return {
-            "command_mix_runtime_seen": 0.0,
-            "command_mix_reason_code": _command_mix_reason_code("debug_missing"),
-        }
-
-    reason = str(debug.get("reason", "unknown"))
-    return {
-        "command_mix_runtime_seen": 1.0,
-        "command_mix_enabled": float(debug.get("enabled", 0.0) or 0.0),
-        "command_mix_reason_code": _command_mix_reason_code(reason),
-        "command_mix_target_spin": float(debug.get("target_spin_ratio", 0.0) or 0.0),
-        "command_mix_target_vx_only": float(debug.get("target_vx_only_ratio", 0.0) or 0.0),
-        "command_mix_target_vx_vy": float(debug.get("target_vx_vy_ratio", 0.0) or 0.0),
-        "command_mix_target_full": float(debug.get("target_full_ratio", 0.0) or 0.0),
-        "command_mix_spin_ratio": float(debug.get("spin_ratio", 0.0) or 0.0),
-        "command_mix_vx_only_ratio": float(debug.get("vx_only_ratio", 0.0) or 0.0),
-        "command_mix_vx_vy_ratio": float(debug.get("vx_vy_ratio", 0.0) or 0.0),
-        "command_mix_full_ratio": float(debug.get("full_ratio", 0.0) or 0.0),
-        "command_mix_only_vx_like": float(debug.get("vx_only_ratio", 0.0) or 0.0),
-        "command_mix_spin_like": float(debug.get("spin_ratio", 0.0) or 0.0),
-        "command_mix_cmd_vy_abs_mean": float(debug.get("mixed_cmd_vy_abs_mean", 0.0) or 0.0),
-        "command_mix_cmd_wz_abs_mean": float(debug.get("mixed_cmd_wz_abs_mean", 0.0) or 0.0),
-    }
-
-
-def _command_mix_reason_code(reason: str) -> float:
-    mapping = {
-        "ok": 0,
-        "disabled": 1,
-        "invalid_command": 2,
-        "debug_missing": 3,
-        "unknown": 9,
-    }
-    return float(mapping.get(str(reason), 9))
-
-
-def _command_mix_reason_name(code) -> str:
-    try:
-        code_int = int(float(code))
-    except (TypeError, ValueError):
-        code_int = 9
-    mapping = {
-        0: "ok",
-        1: "disabled",
-        2: "invalid_command",
-        3: "debug_missing",
-        9: "unknown",
-    }
-    return mapping.get(code_int, "unknown")
-
-
-def _find_command_mix_debug(env):
-    """Find runtime debug emitted by agent_ppo.feature.command_mix.
-
-    Kaiwu wrappers can hold the observation-process env at a different wrapper
-    level than the workflow env, so scan common child attributes and object
-    fields instead of assuming one fixed owner.
-    """
-    seen_ids = set()
-    pending = [env]
-    while pending:
-        candidate = pending.pop(0)
-        if candidate is None or id(candidate) in seen_ids:
-            continue
-        seen_ids.add(id(candidate))
-
-        try:
-            debug = getattr(candidate, "_command_mix_debug", None)
-        except Exception:
-            debug = None
-        if isinstance(debug, dict):
-            return debug
-
-        for attr_name in (
-            "env_object",
-            "_env_object",
-            "env",
-            "_env",
-            "gym_env",
-            "_gym_env",
-            "envs",
-            "_envs",
-            "unwrapped",
-            "wrapped_env",
-            "_wrapped_env",
-            "venv",
-            "_venv",
-            "isaac_env",
-            "_isaac_env",
-            "sim_env",
-            "_sim_env",
-            "base_env",
-            "_base_env",
-        ):
-            try:
-                child = getattr(candidate, attr_name, None)
-            except Exception:
-                child = None
-            if child is not None:
-                pending.append(child)
-
-        if hasattr(candidate, "__dict__"):
-            try:
-                for key, child in vars(candidate).items():
-                    if key.startswith("__") or child is None:
-                        continue
-                    if isinstance(child, (str, bytes, int, float, bool, tuple, list, dict)):
-                        continue
-                    pending.append(child)
-            except Exception:
-                pass
-    return None
-
-
-def _sample_rollout_height_scan_probe_stats(critic_obs, logger=None):
-    """Compute stair-gate probe metrics directly from rollout critic observations.
-
-    Reward-side debug attributes can be hidden behind Kaiwu/Isaac wrappers or
-    process boundaries.  The critic observation is already available in the PPO
-    workflow, so these metrics are used as the reliable monitor source for
-    height-scan gate validation.  Critic layout is:
-
-        [critic_proprio(60) | height_scan(256)]
-
-    The height scan is a scaled distance-to-ground signal.  For local geometry
-    deltas we convert it to a ground-height proxy by negating and unscaling it,
-    so positive front-minus-near deltas mean higher terrain ahead.
-    """
-    zero_stats = _empty_height_scan_probe_stats()
-    try:
-        if critic_obs is None or not isinstance(critic_obs, torch.Tensor):
-            zero_stats["hs_probe_reason_code"] = 91.0
-            return zero_stats
-        if critic_obs.dim() != 2 or critic_obs.shape[1] < 316:
-            zero_stats["hs_probe_reason_code"] = 92.0
-            return zero_stats
-
-        height_scan = critic_obs[:, 60:316].detach().float()
-        if height_scan.shape[1] < 256:
-            zero_stats["hs_probe_reason_code"] = 92.0
-            return zero_stats
-
-        # Observation height scan uses distance-to-ground.  Local ground-height
-        # proxy is enough for step detection because only deltas are used.
-        grid = (-height_scan[:, :256] / 2.5).view(height_scan.shape[0], 16, 16)
-        grid = torch.nan_to_num(grid, nan=0.0, posinf=0.0, neginf=0.0)
-
-        threshold_sets = {
-            "current": (0.025, 0.200, 0.240, 0.020, 0.080),
-        }
-        methods = {
-            "mean_x": (0.0, grid, "mean"),
-            "mean_y": (1.0, grid.transpose(1, 2), "mean"),
-            "edge_x": (2.0, grid, "edge"),
-            "edge_y": (3.0, grid.transpose(1, 2), "edge"),
-        }
-
-        stats = dict(zero_stats)
-        threshold_outputs = {}
-        for name, thresholds in threshold_sets.items():
-            outputs = [
-                _height_scan_probe_method_from_grid(
-                    method_grid,
-                    mode=mode,
-                    thresholds=thresholds,
-                )
-                for _method_id, method_grid, mode in methods.values()
-            ]
-            threshold_outputs[name] = {
-                "up": torch.stack([out["up"].float() for out in outputs], dim=1).amax(dim=1),
-                "down": torch.stack([out["down"].float() for out in outputs], dim=1).amax(dim=1),
-                "wall": torch.stack([out["wall"].float() for out in outputs], dim=1).amax(dim=1),
-                "step_delta": torch.stack([out["step_delta"] for out in outputs], dim=1).mean(dim=1),
-                "step_score": torch.stack([out["step_score"] for out in outputs], dim=1).amax(dim=1),
-                "wall_score": torch.stack([out["wall_score"] for out in outputs], dim=1).amax(dim=1),
-                "up_evidence": torch.stack([out["up_evidence"] for out in outputs], dim=1).amax(dim=1),
-                "down_evidence": torch.stack([out["down_evidence"] for out in outputs], dim=1).amax(dim=1),
-            }
-
-        current_probe = threshold_outputs["current"]
-        structure = _height_scan_structure_tensors_from_grid(grid)
-        wall = current_probe["wall"].bool() | structure["wall_like"]
-        base = (
-            (current_probe["step_score"] > 0.02)
-            & (current_probe["wall_score"] < 0.08)
-            & (~wall)
-        )
-        diff = current_probe["up_evidence"] - current_probe["down_evidence"]
-        stair_gate = structure["stair_like"] & (~structure["slope_like"]) & (~wall)
-        up_step = stair_gate & base & (diff > 0.02)
-        down_step = stair_gate & base & (diff < -0.02)
-        command = critic_obs[:, 9:12].detach().float()
-        command_speed = torch.linalg.norm(command[:, :2], dim=1)
-        moving_command = command_speed > 0.10
-        no_yaw_command = torch.abs(command[:, 2]) < 0.08
-        uncommanded_yaw_active = moving_command & no_yaw_command
-
-        stats.update(
-            {
-                "hs_probe_available": 1.0,
-                "hs_probe_reason_code": 10.0,
-                "hs_up_ratio": _tensor_ratio(current_probe["up"]),
-                "hs_down_ratio": _tensor_ratio(current_probe["down"]),
-                "hs_wall_ratio": _tensor_ratio(current_probe["wall"]),
-                "hs_flat_ratio": _tensor_ratio(
-                    ~(current_probe["up"].bool() | current_probe["down"].bool() | current_probe["wall"].bool())
-                ),
-                "hs_step_delta": _tensor_mean(current_probe["step_delta"]),
-                "hs_step_score": _tensor_mean(current_probe["step_score"]),
-                "hs_wall_score": _tensor_mean(current_probe["wall_score"]),
-                # Stable rollout-side aliases for reward activation rates.  The
-                # reward-side debug dict can be hidden behind Kaiwu/Isaac worker
-                # wrappers, but critic_obs is available in the PPO workflow.
-                "hs_clear_active": _tensor_ratio(up_step & moving_command),
-                "hs_place_active": _tensor_ratio(up_step & moving_command),
-                "uncommanded_yaw_active": _tensor_ratio(uncommanded_yaw_active),
-                "uncommanded_yaw_stair": _tensor_ratio(uncommanded_yaw_active & stair_gate),
-                "hs_reward_up_step": _tensor_ratio(up_step),
-                "hs_reward_down_step": _tensor_ratio(down_step),
-                "hs_reward_stair_gate": _tensor_ratio(stair_gate),
-            }
-        )
-        stats.update(_height_scan_dominant_direction_stats(current_probe, min_step_score=0.02, max_wall_score=0.08))
-        stats.update(_height_scan_stair_slope_structure_stats(grid))
-        return stats
-    except Exception as exc:
-        zero_stats["hs_probe_reason_code"] = 93.0
-        if logger is not None:
-            logger.warning(f"[HeightScanRolloutProbe] failed: {exc}")
-        return zero_stats
-
-
-def _empty_height_scan_probe_stats():
-    keys = (
-        "hs_probe_available",
-        "hs_probe_reason_code",
-        "hs_up_ratio",
-        "hs_down_ratio",
-        "hs_wall_ratio",
-        "hs_flat_ratio",
-        "hs_step_delta",
-        "hs_step_score",
-        "hs_wall_score",
-        "g_dom_up_02",
-        "g_dom_down_02",
-        "g_dom_conf_02",
-        "g_dom_both_02",
-        "g_dom_none_02",
-        "g_step_edge_sharpness",
-        "g_step_edge_locality",
-        "g_slope_smoothness",
-        "g_struct_wall",
-        "g_stair_noslope_m",
-        "hs_clear_active",
-        "hs_place_active",
-        "uncommanded_yaw_active",
-        "uncommanded_yaw_stair",
-        "hs_reward_up_step",
-        "hs_reward_down_step",
-        "hs_reward_stair_gate",
-    )
-    stats = {key: 0.0 for key in keys}
-    stats["hs_probe_reason_code"] = 90.0
-    return stats
-
-
-def _height_scan_dominant_direction_stats(probe, min_step_score: float, max_wall_score: float):
-    """Return monitor-only mutually-exclusive up/down direction probes.
-
-    The broad threshold probes intentionally answer "can any method see a stair
-    edge?".  These probes answer the stricter reward-gate question: whether the
-    up or down evidence dominates enough that both directions should not be
-    considered active at the same time.
-    """
-    up_evidence = probe["up_evidence"].float()
-    down_evidence = probe["down_evidence"].float()
-    step_score = probe["step_score"].float()
-    wall_score = probe["wall_score"].float()
-    wall = probe["wall"].bool()
-    base = (step_score > float(min_step_score)) & (wall_score < float(max_wall_score)) & (~wall)
-    diff = up_evidence - down_evidence
-    abs_diff = torch.abs(diff)
-    stats = {}
-    for label, margin in (("02", 0.02), ("05", 0.05), ("08", 0.08)):
-        dominant_up = base & (diff > margin)
-        dominant_down = base & (diff < -margin)
-        ambiguous_both = base & (up_evidence > float(min_step_score)) & (down_evidence > float(min_step_score)) & (abs_diff <= margin)
-        no_direction = (~dominant_up) & (~dominant_down) & (~wall)
-        conf = torch.where(
-            base,
-            torch.clamp((abs_diff - margin) / max(1.0 - margin, 1e-6), min=0.0, max=1.0),
-            torch.zeros_like(abs_diff),
-        )
-        stats[f"g_dom_up_{label}"] = _tensor_ratio(dominant_up)
-        stats[f"g_dom_down_{label}"] = _tensor_ratio(dominant_down)
-        stats[f"g_dom_conf_{label}"] = _tensor_mean(conf)
-        stats[f"g_dom_both_{label}"] = _tensor_ratio(ambiguous_both)
-        stats[f"g_dom_none_{label}"] = _tensor_ratio(no_direction)
-    return stats
-
-
-def _height_scan_stair_slope_structure_stats(grid):
-    """Return monitor-only probes that separate discrete stairs from smooth slopes.
-
-    A slope and a stair can both produce a positive/negative height trend.  The
-    useful distinction is distribution: a stair concentrates height change in a
-    small number of neighboring scan columns, while a slope spreads smaller
-    changes across many columns.
-    """
-    num_envs = grid.shape[0]
-    window = grid[:, 5:11, 0:10]
-    if window.shape[1] < 2 or window.shape[2] < 2:
-        return _height_scan_empty_structure_stats()
-
-    dx = window[:, :, 1:] - window[:, :, :-1]
-    dy = window[:, 1:, :] - window[:, :-1, :]
-    abs_edges = torch.cat(
-        [torch.abs(dx).reshape(num_envs, -1), torch.abs(dy).reshape(num_envs, -1)],
-        dim=1,
-    )
-    if abs_edges.numel() == 0:
-        return _height_scan_empty_structure_stats()
-
-    edge_sharpness = abs_edges.amax(dim=1)
-    edge_mean = abs_edges.mean(dim=1)
-    slope_smoothness = torch.clamp(edge_mean / (edge_sharpness + 1e-6), min=0.0, max=1.0)
-    edge_locality = torch.clamp(1.0 - slope_smoothness, min=0.0, max=1.0)
-    wall_like = edge_sharpness > 0.30
-
-    stats = {
-        "g_step_edge_sharpness": _tensor_mean(edge_sharpness),
-        "g_step_edge_locality": _tensor_mean(edge_locality),
-        "g_slope_smoothness": _tensor_mean(slope_smoothness),
-        "g_struct_wall": _tensor_ratio(wall_like),
-    }
-    threshold_sets = {
-        "l": {
-            "edge_min": 0.025,
-            "local_min": 0.20,
-            "smooth_max": 0.55,
-            "slope_mean_min": 0.004,
-            "slope_smooth_min": 0.50,
-            "slope_sharp_max": 0.080,
-        },
-        "m": {
-            "edge_min": 0.040,
-            "local_min": 0.30,
-            "smooth_max": 0.45,
-            "slope_mean_min": 0.006,
-            "slope_smooth_min": 0.60,
-            "slope_sharp_max": 0.070,
-        },
-        "s": {
-            "edge_min": 0.060,
-            "local_min": 0.40,
-            "smooth_max": 0.35,
-            "slope_mean_min": 0.008,
-            "slope_smooth_min": 0.70,
-            "slope_sharp_max": 0.060,
-        },
-    }
-    for label, thresholds in threshold_sets.items():
-        stair_like = (
-            (edge_sharpness >= thresholds["edge_min"])
-            & (edge_locality >= thresholds["local_min"])
-            & (slope_smoothness <= thresholds["smooth_max"])
-            & (~wall_like)
-        )
-        slope_like = (
-            (edge_mean >= thresholds["slope_mean_min"])
-            & (slope_smoothness >= thresholds["slope_smooth_min"])
-            & (edge_sharpness <= thresholds["slope_sharp_max"])
-            & (~wall_like)
-        )
-        stats[f"g_stair_{label}"] = _tensor_ratio(stair_like)
-        stats[f"g_slope_{label}"] = _tensor_ratio(slope_like)
-        stats[f"g_stair_noslope_{label}"] = _tensor_ratio(stair_like & (~slope_like))
-    return stats
-
-
-def _height_scan_structure_tensors_from_grid(grid):
-    """Return reward-matching stair/slope structure tensors from a height grid."""
-    num_envs = grid.shape[0]
-    zeros = torch.zeros(num_envs, device=grid.device, dtype=grid.dtype)
-    window = grid[:, 5:11, 0:10]
-    if window.shape[1] < 2 or window.shape[2] < 2:
-        return {
-            "edge_sharpness": zeros,
-            "edge_locality": zeros,
-            "slope_smoothness": zeros,
-            "wall_like": zeros.bool(),
-            "stair_like": zeros.bool(),
-            "slope_like": zeros.bool(),
-        }
-
-    dx = window[:, :, 1:] - window[:, :, :-1]
-    dy = window[:, 1:, :] - window[:, :-1, :]
-    abs_edges = torch.cat(
-        [torch.abs(dx).reshape(num_envs, -1), torch.abs(dy).reshape(num_envs, -1)],
-        dim=1,
-    )
-    if abs_edges.numel() == 0:
-        return {
-            "edge_sharpness": zeros,
-            "edge_locality": zeros,
-            "slope_smoothness": zeros,
-            "wall_like": zeros.bool(),
-            "stair_like": zeros.bool(),
-            "slope_like": zeros.bool(),
-        }
-
-    edge_sharpness = abs_edges.amax(dim=1)
-    edge_mean = abs_edges.mean(dim=1)
-    slope_smoothness = torch.clamp(edge_mean / (edge_sharpness + 1e-6), min=0.0, max=1.0)
-    edge_locality = torch.clamp(1.0 - slope_smoothness, min=0.0, max=1.0)
-    wall_like = edge_sharpness > 0.30
-    stair_like = (
-        (edge_sharpness >= 0.040)
-        & (edge_locality >= 0.30)
-        & (slope_smoothness <= 0.45)
-        & (~wall_like)
-    )
-    slope_like = (
-        (edge_mean >= 0.006)
-        & (slope_smoothness >= 0.60)
-        & (edge_sharpness <= 0.070)
-        & (~wall_like)
-    )
-    return {
-        "edge_sharpness": edge_sharpness,
-        "edge_locality": edge_locality,
-        "slope_smoothness": slope_smoothness,
-        "wall_like": wall_like,
-        "stair_like": stair_like,
-        "slope_like": slope_like,
-    }
-
-
-def _height_scan_empty_structure_stats():
-    return {
-        "g_step_edge_sharpness": 0.0,
-        "g_step_edge_locality": 0.0,
-        "g_slope_smoothness": 0.0,
-        "g_struct_wall": 0.0,
-        "g_stair_l": 0.0,
-        "g_stair_m": 0.0,
-        "g_stair_s": 0.0,
-        "g_slope_l": 0.0,
-        "g_slope_m": 0.0,
-        "g_slope_s": 0.0,
-        "g_stair_noslope_l": 0.0,
-        "g_stair_noslope_m": 0.0,
-        "g_stair_noslope_s": 0.0,
-    }
-
-
-def _height_scan_probe_method_from_grid(
-    grid,
-    *,
-    mode: str,
-    thresholds,
-    body_y_start: int = 5,
-    body_y_end: int = 11,
-    near_x_start: int = 0,
-    near_x_end: int = 4,
-    front_x_start: int = 4,
-    front_x_end: int = 10,
-):
-    min_h, max_h, wall_h, min_score, max_wall = thresholds
-    num_envs = grid.shape[0]
-    zeros = torch.zeros(num_envs, device=grid.device, dtype=grid.dtype)
-    y0 = max(0, min(int(body_y_start), 15))
-    y1 = max(y0 + 1, min(int(body_y_end), 16))
-    x0 = max(0, min(int(near_x_start), 15))
-    x_near = max(x0 + 1, min(int(near_x_end), 16))
-    x_front0 = max(0, min(int(front_x_start), 15))
-    x_front1 = max(x_front0 + 1, min(int(front_x_end), 16))
-    x1 = max(x0 + 2, min(int(front_x_end), 16))
-
-    window = grid[:, y0:y1, x0:x1]
-    if window.shape[1] < 1 or window.shape[2] < 2:
-        return {
-            "up": zeros.bool(),
-            "down": zeros.bool(),
-            "wall": zeros.bool(),
-            "step_delta": zeros,
-            "step_score": zeros,
-            "wall_score": zeros,
-            "up_evidence": zeros,
-            "down_evidence": zeros,
-        }
-
-    deltas = window[:, :, 1:] - window[:, :, :-1]
-    abs_delta = torch.abs(deltas)
-    pos_like = (deltas >= min_h) & (deltas <= max_h)
-    neg_like = (deltas <= -min_h) & (deltas >= -max_h)
-    wall_like = abs_delta >= wall_h
-    up_evidence = pos_like.float().mean(dim=(1, 2))
-    down_evidence = neg_like.float().mean(dim=(1, 2))
-    step_score = (pos_like | neg_like).float().mean(dim=(1, 2))
-    wall_score = wall_like.float().mean(dim=(1, 2))
-
-    if mode == "mean":
-        near = grid[:, y0:y1, x0:x_near].mean(dim=(1, 2))
-        front = grid[:, y0:y1, x_front0:x_front1].mean(dim=(1, 2))
-        step_delta = front - near
-        up = (step_score > min_score) & (wall_score < max_wall) & (step_delta >= min_h) & (step_delta <= max_h)
-        down = (step_score > min_score) & (wall_score < max_wall) & (step_delta <= -min_h) & (step_delta >= -max_h)
-    else:
-        positive_edge = torch.where(pos_like, deltas, torch.zeros_like(deltas)).amax(dim=(1, 2))
-        negative_edge = torch.where(neg_like, -deltas, torch.zeros_like(deltas)).amax(dim=(1, 2))
-        step_delta = positive_edge - negative_edge
-        up = (up_evidence > min_score) & (wall_score < max_wall) & (positive_edge >= min_h)
-        down = (down_evidence > min_score) & (wall_score < max_wall) & (negative_edge >= min_h)
-    wall = wall_score >= max_wall
-    return {
-        "up": up,
-        "down": down,
-        "wall": wall,
-        "step_delta": step_delta,
-        "step_score": step_score,
-        "wall_score": wall_score,
-        "up_evidence": up_evidence,
-        "down_evidence": down_evidence,
-    }
-
-
-def _tensor_mean(value):
-    if not isinstance(value, torch.Tensor) or value.numel() == 0:
-        return 0.0
-    return float(value.detach().float().mean().item())
-
-
-def _tensor_ratio(value):
-    if not isinstance(value, torch.Tensor) or value.numel() == 0:
-        return 0.0
-    return float(value.detach().float().mean().item())
-
-
-def _sample_stair_gate_debug_stats(env):
-    stats = {}
-    try:
-        for source in _iter_stair_gate_debug_sources(env):
-            if not isinstance(source, dict):
-                continue
-            for key, value in source.items():
-                try:
-                    stats[key] = float(value)
-                except (TypeError, ValueError):
-                    pass
-    except Exception:
-        return stats
-
-    # Stable short aliases for monitor panels. Keep the raw keys too.
-    aliases = {
-        "hs_up_ratio": "height_scan_up_step_mean",
-        "hs_down_ratio": "height_scan_down_step_mean",
-        "hs_wall_ratio": "height_scan_wall_mean",
-        "hs_flat_ratio": "height_scan_flat_mean",
-        "hs_step_delta": "height_scan_step_delta_mean",
-        "hs_step_score": "height_scan_step_score_mean",
-        "hs_wall_score": "height_scan_wall_score_mean",
-        "feet_clear_active": "feet_clearance_active_ratio",
-        "feet_clear_height": "feet_clearance_height_mean",
-        "feet_clear_target": "feet_clearance_target_mean",
-        "hs_clear_active": "height_scan_feet_clearance_active_ratio",
-        "hs_clear_reward": "height_scan_feet_clearance_reward_mean",
-        "hs_place_active": "stair_forward_foot_placement_active_ratio",
-        "hs_place_reward": "stair_forward_foot_placement_reward_mean",
-        "hs_place_contact": "stair_forward_foot_placement_first_contact_ratio",
-        "uncommanded_yaw_active": "uncommanded_yaw_active_ratio",
-        "uncommanded_yaw_stair": "uncommanded_yaw_stair_ratio",
-        "uncommanded_yaw_abs": "uncommanded_yaw_abs_mean",
-        "heading_drift_active": "heading_drift_active_ratio",
-        "heading_drift_abs_deg": "heading_drift_abs_deg_mean",
-        "heading_drift_reward": "heading_drift_reward_mean",
-        "cmd_progress_active": "cmd_progress_active_ratio",
-        "cmd_progress_vel": "cmd_progress_vel_mean",
-        "cmd_progress_reward": "cmd_progress_reward_mean",
-        "cmd_dir_dev_active": "cmd_dir_dev_active_ratio",
-        "cmd_dir_dev_angle": "cmd_dir_dev_angle_deg_mean",
-        "cmd_dir_dev_reward": "cmd_dir_dev_reward_mean",
-        "cmd_path_active": "cmd_path_progress_active_ratio",
-        "cmd_path_full": "cmd_path_full_active_ratio",
-        "cmd_path_delta": "cmd_path_delta_progress_mean",
-        "cmd_path_dist": "cmd_path_projected_dist_mean",
-        "cmd_path_cap": "cmd_path_segment_factor_mean",
-        "cmd_path_reward": "cmd_path_reward_mean",
-        "cmd_stall_active": "commanded_stall_active_ratio",
-        "cmd_stall_penalty": "commanded_stall_penalty_mean",
-        "cmd_stall_time": "commanded_stall_time_mean",
-        "over_clear_active": "stair_over_clearance_active_ratio",
-        "over_clear_penalty": "stair_over_clearance_penalty_mean",
-        "stair_swing_active": "stair_swing_step_targeting_active_ratio",
-        "stair_swing_reward": "stair_swing_step_targeting_reward_mean",
-        "stair_swing_forward": "stair_swing_step_targeting_forward_mean",
-        "stair_swing_clearance": "stair_swing_step_targeting_clearance_mean",
-        "stair_stride_active": "stair_stride_length_active_ratio",
-        "stair_stride_penalty": "stair_stride_length_penalty_mean",
-        "stair_stride_span": "stair_stride_span_mean",
-        "stair_stride_reach": "stair_stride_front_reach_mean",
-        "stair_support_active": "stair_support_continuity_active_ratio",
-        "stair_support_penalty": "stair_support_continuity_penalty_mean",
-        "stair_support_contacts": "stair_support_contact_count_mean",
-        "stair_support_balance": "stair_support_balance_loss_mean",
-        "base_clear_active": "stair_base_clearance_active_ratio",
-        "base_clearance": "stair_base_clearance_mean",
-        "base_clear_deficit": "stair_base_clearance_deficit_mean",
-        "base_clear_penalty": "stair_base_clearance_penalty_mean",
-        "edge_align_active": "stair_edge_align_active_ratio",
-        "edge_align_cos": "stair_edge_align_cos_mean",
-        "edge_lateral_ratio": "stair_edge_lateral_ratio_mean",
-        "edge_strength": "stair_edge_strength_mean",
-        "edge_align_penalty": "stair_edge_normal_alignment_penalty_mean",
-        "down_speed_active": "down_stair_speed_safety_active_ratio",
-        "down_speed_penalty": "down_stair_speed_safety_penalty_mean",
-        "down_touch_active": "down_stair_touchdown_safety_active_ratio",
-        "down_touch_penalty": "down_stair_touchdown_safety_penalty_mean",
-        "hs_probe_available": "hs_probe_available",
-        "hs_probe_reason_code": "hs_probe_reason_code",
-    }
-    for alias, source_key in aliases.items():
-        if source_key in stats:
-            stats[alias] = float(stats[source_key])
-    return stats
-
-
-def _iter_stair_gate_debug_sources(env, max_items: int = 64):
-    """Yield every discovered _stair_gate_debug dict in wrapper/object chains."""
-    seen_ids = set()
-    pending = [env]
-    attr_names = (
-        "env_object",
-        "_env_object",
-        "env",
-        "_env",
-        "gym_env",
-        "_gym_env",
-        "envs",
-        "_envs",
-        "unwrapped",
-        "wrapped_env",
-        "_wrapped_env",
-        "venv",
-        "_venv",
-        "isaac_env",
-        "_isaac_env",
-        "sim_env",
-        "_sim_env",
-        "base_env",
-        "_base_env",
-        "robot_env",
-        "_robot_env",
-        "rl_env",
-        "_rl_env",
-        "gym",
-        "_gym",
-        "task",
-        "_task",
-    )
-    while pending and len(seen_ids) < max_items:
-        candidate = pending.pop(0)
-        if candidate is None or id(candidate) in seen_ids:
-            continue
-        seen_ids.add(id(candidate))
-        source = getattr(candidate, "_stair_gate_debug", None)
-        if isinstance(source, dict):
-            yield source
-        for attr_name in attr_names:
-            try:
-                child = getattr(candidate, attr_name, None)
-            except Exception:
-                child = None
-            if child is not None:
-                pending.append(child)
-        if hasattr(candidate, "__dict__"):
-            try:
-                for key, child in vars(candidate).items():
-                    if key.startswith("__"):
-                        continue
-                    if child is not None and not isinstance(child, (str, bytes, int, float, bool, tuple, list, dict)):
-                        pending.append(child)
-            except Exception:
-                pass
