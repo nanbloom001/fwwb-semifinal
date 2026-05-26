@@ -49,7 +49,7 @@ arena_frontend_monitor/manual_metric_recorder.sh '<monitor-url>'
 arena_frontend_monitor/manual_metric_recorder.sh -c
 ```
 
-The wrapper opens the monitor URL with a headed `agent-browser` session, waits
+The wrapper opens the monitor URL in a new headed `agent-browser` tab, waits
 for Enter in the terminal, then starts `manual_metric_recorder.py` with
 `--no-clear-network`. This is useful for live training pages: manually expand,
 scroll, or refresh cards first, then press Enter so already-loaded curve

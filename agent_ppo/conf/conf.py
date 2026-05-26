@@ -159,7 +159,7 @@ class TrackNavConfig(StageConfig):
     init_noise_std = 0.60
     min_normalized_std = [0.05, 0.025, 0.05] * 4
     max_normalized_std = [0.20, 0.12, 0.20] * 4
-    model_save_interval = 20
+    model_save_interval = 10
 
 
 class Config:
@@ -222,6 +222,9 @@ class Config:
             logger.error(error_msg)
             raise Exception(error_msg)
 
+        if is_eval:
+            usr_conf = _filter_train_only_rewards_for_eval(usr_conf, stage, logger)
+
         logger.info(f"Stage: {stage.name}, task_type: {task_type}, model: {stage.model_class}")
 
         return usr_conf, usr_conf_file, is_eval, stage
@@ -246,6 +249,78 @@ def _deep_merge(base, override):
         else:
             merged[key] = value
     return merged
+
+
+def _as_string_list(value):
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(item) for item in value if isinstance(item, str)]
+
+
+def _train_only_reward_filter(stage, logger):
+    train_conf_file = f"agent_ppo/conf/train_env_conf_{stage.task_type}_{stage.name}.toml"
+    if not os.path.exists(train_conf_file):
+        return set(), []
+    try:
+        train_conf = _load_toml(train_conf_file)
+    except Exception as exc:
+        logger.warning(f"Cannot load train-only reward filter from {train_conf_file}: {exc}")
+        return set(), []
+
+    params = train_conf.get("custom_parameters", {})
+    if not isinstance(params, dict):
+        params = {}
+    names = set(_as_string_list(params.get("train_only_reward_names", [])))
+    prefixes = _as_string_list(params.get("train_only_reward_prefixes", []))
+    if bool(params.get("all_train_rewards_train_only", False)):
+        rewards = train_conf.get("rewards", {}) or {}
+        if isinstance(rewards, dict):
+            names.update(str(name) for name in rewards.keys())
+    return names, prefixes
+
+
+def _filter_train_only_rewards_for_eval(usr_conf, stage, logger):
+    params = usr_conf.get("custom_parameters", {})
+    if not isinstance(params, dict):
+        params = {}
+    if bool(params.get("keep_train_only_rewards_in_eval", False)):
+        return usr_conf
+
+    rewards = usr_conf.get("rewards", {}) or {}
+    if not isinstance(rewards, dict) or not rewards:
+        return usr_conf
+
+    names, prefixes = _train_only_reward_filter(stage, logger)
+    extra_names = set(_as_string_list(params.get("train_only_reward_names", [])))
+    extra_prefixes = _as_string_list(params.get("train_only_reward_prefixes", []))
+    names.update(extra_names)
+    prefixes.extend(extra_prefixes)
+    if not names and not prefixes:
+        return usr_conf
+
+    kept = {}
+    removed = []
+    for name, reward_conf in rewards.items():
+        reward_name = str(name)
+        train_only = reward_name in names or any(reward_name.startswith(prefix) for prefix in prefixes)
+        if train_only:
+            removed.append(reward_name)
+        else:
+            kept[name] = reward_conf
+
+    if not removed:
+        return usr_conf
+
+    filtered = usr_conf.copy()
+    if kept:
+        filtered["rewards"] = kept
+    else:
+        filtered.pop("rewards", None)
+    logger.info(
+        "Eval mode: stripped train-only reward terms from usr_conf: "
+        f"count={len(removed)}, names={removed[:20]}"
+    )
+    return filtered
 
 
 def _load_toml(path):

@@ -145,16 +145,15 @@ class Agent(BaseAgent):
             self.eval_phase_maze_goal_dist_gate = float(
                 rl_nav_conf.get("phase_maze_goal_dist_gate", 14.0)
             )
-            pre_range = rl_nav_conf.get("pre_maze_lin_vel_x", [0.75, 1.0])
-            slope_range = rl_nav_conf.get("slope_lin_vel_x", pre_range)
-            stairs_range = rl_nav_conf.get("stairs_lin_vel_x", pre_range)
+            fallback_vx = float(rl_nav_conf.get("fallback_lin_vel_x", 0.90))
+            slope_range = rl_nav_conf.get("slope_lin_vel_x", [fallback_vx, fallback_vx])
+            stairs_range = rl_nav_conf.get("stairs_lin_vel_x", [fallback_vx, fallback_vx])
             maze_range = rl_nav_conf.get("maze_lin_vel_x", [0.45, 0.65])
-            if len(pre_range) == 2:
-                self.eval_pre_maze_command = torch.tensor(
-                    [0.5 * (float(pre_range[0]) + float(pre_range[1])), 0.0, 0.0],
-                    device=self.device,
-                    dtype=torch.float32,
-                )
+            self.eval_pre_maze_command = torch.tensor(
+                [fallback_vx, 0.0, 0.0],
+                device=self.device,
+                dtype=torch.float32,
+            )
             if len(slope_range) == 2:
                 self.eval_slope_command = torch.tensor(
                     [0.5 * (float(slope_range[0]) + float(slope_range[1])), 0.0, 0.0],

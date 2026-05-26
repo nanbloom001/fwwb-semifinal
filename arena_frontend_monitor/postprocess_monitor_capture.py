@@ -22,6 +22,14 @@ from pathlib import Path
 from typing import Any
 
 
+DEPRECATED_EMPTY_METRICS = {
+    "reward_deadend_escape",
+    "reward_heuristic_navigation",
+    "reward_obstacle_evasion",
+    "reward_wall_proximity_brake",
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("capture_dir", type=Path, help="monitor capture session directory")
@@ -552,7 +560,10 @@ def _fmt(value: Any) -> str:
 
 def build_markdown_report(capture_dir: Path, summary: dict[str, dict[str, Any]], overview: dict[str, Any]) -> str:
     non_empty = {name: item for name, item in summary.items() if item.get("count", 0) > 0}
-    zero_metrics = sorted(name for name, item in summary.items() if item.get("count", 0) == 0)
+    zero_metrics = sorted(
+        name for name, item in summary.items()
+        if item.get("count", 0) == 0 and name not in DEPRECATED_EMPTY_METRICS
+    )
     recent_delta = sorted(non_empty.items(), key=lambda kv: abs(float(kv[1].get("last20_delta") or 0.0)), reverse=True)[:12]
     latest = sorted(non_empty.items(), key=lambda kv: str(kv[1].get("end_time", "")), reverse=True)[:12]
 

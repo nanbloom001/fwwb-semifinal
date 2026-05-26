@@ -10,7 +10,7 @@ Usage:
   arena_frontend_monitor/manual_metric_recorder.sh --clipboard [recorder args...]
   arena_frontend_monitor/manual_metric_recorder.sh -c [recorder args...]
 
-Opens the Tencent Arena monitor page in a headed agent-browser session, waits
+Opens the Tencent Arena monitor page in a new headed agent-browser tab, waits
 for Enter, then starts manual_metric_recorder.py with --no-clear-network.
 
 Examples:
@@ -72,12 +72,12 @@ if ! command -v agent-browser >/dev/null 2>&1; then
   exit 127
 fi
 
-echo "[manual_metric_recorder] opening headed browser session=${AGENT_BROWSER_SESSION}"
+echo "[manual_metric_recorder] opening new headed browser tab session=${AGENT_BROWSER_SESSION}"
 # Clear stale requests before opening the target page.  The recorder itself
 # still runs with --no-clear-network, so requests loaded between page open and
 # pressing Enter are preserved.
 agent-browser network requests --clear >/dev/null || true
-agent-browser open "$MONITOR_URL"
+agent-browser tab new "$MONITOR_URL"
 
 cat <<EOF
 

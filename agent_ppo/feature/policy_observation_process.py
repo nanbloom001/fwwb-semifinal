@@ -7,6 +7,7 @@
 import torch
 
 from agent_ppo.conf.conf import Config
+from agent_ppo.feature.terrain_gate import apply_worker_gate_command
 from tools.base_env.observation_process import ObservationProcess
 
 
@@ -54,6 +55,7 @@ class PolicyObservationProcess(ObservationProcess):
                 f"Policy observation dim mismatch: expected base {self._BASE_OBS_DIM}, got {obs.shape[-1]}."
             )
 
+        obs = apply_worker_gate_command(self.env, obs, "policy")
         goal_features = self._goal_features()
         if goal_features is not None:
             obs = self.concatenate_terms(obs, goal_features)

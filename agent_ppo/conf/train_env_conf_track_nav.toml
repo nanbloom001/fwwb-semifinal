@@ -64,15 +64,49 @@ ang_vel_yaw = [0.0, 0.0]
 [navigation]
 enabled = false
 
+[custom_parameters]
+# Evaluation should use the platform scorer, not the training reward/probe graph.
+# Config.load_conf reads this training file in eval mode and strips these reward
+# terms from any eval TOML that accidentally carries them over.
+all_train_rewards_train_only = true
+train_only_reward_prefixes = ["gate_"]
+train_only_reward_names = []
+keep_train_only_rewards_in_eval = false
+
 [rl_navigation]
 phase_command_enabled = true
-pre_maze_lin_vel_x = [1.20, 1.44]
-slope_lin_vel_x = [1.10, 1.32]
-stairs_lin_vel_x = [0.86, 1.06]
-maze_lin_vel_x = [1.24, 1.48]
-phase_maze_goal_dist_gate = 14.0
+worker_phase_command_enabled = true
+gate_test_mode = "sticky"
+shadow_selected_gate = "sticky"
+terrain_sticky_source = "raw_fused"
+command_override_probe = true
+gate_speed_advice_enabled = true
+worker_gate_diagnostics_enabled = true
+eval_worker_gate_enabled = false
+fallback_lin_vel_x = 0.90
+slope_lin_vel_x = [0.72, 1.20]
+stairs_lin_vel_x = [0.65, 1.00]
+phase_command_linear_speed_enabled = true
+phase_command_jitter = 0.015
+track_difficulty_cache_enabled = true
+maze_lin_vel_x = [0.72, 0.92]
+phase_maze_goal_dist_gate = 8.0
+phase_maze_distance_mode = "longitudinal"
+phase_maze_goal_longitudinal_min = -1.0
+phase_maze_confirm_steps = 3
+phase_maze_release_margin = 2.0
+phase_maze_sticky_until_done = true
 phase_command_resample_steps = 160
 terrain_phase_speed_enabled = true
+terrain_sticky_confirm_steps = 4
+terrain_sticky_flat_release_steps = 10
+terrain_sticky_slope_hold_steps = 30
+terrain_sticky_stairs_hold_steps = 50
+terrain_sticky_wall_hold_steps = 40
+terrain_flat_release_edge_max = 0.025
+terrain_flat_release_delta_max = 0.025
+terrain_flat_release_pitch_max = 0.10
+terrain_updown_full_delta = 0.12
 terrain_row_start = 3
 terrain_row_end = 13
 terrain_front_cols = 8
@@ -83,6 +117,46 @@ terrain_slope_delta_threshold = 0.035
 terrain_stair_delta_threshold = 0.10
 terrain_stair_second_diff_threshold = 0.055
 terrain_slope_sign_consistency_threshold = 0.55
+terrain_difficulty_mid_threshold = 0.16
+terrain_difficulty_high_threshold = 0.28
+raw_terrain_gate_enabled = true
+fused_gate_stair_edge_threshold = 0.040
+fused_gate_stair_locality_threshold = 0.30
+fused_gate_stair_smoothness_max = 0.45
+fused_gate_slope_edge_mean_min = 0.006
+fused_gate_slope_smoothness_min = 0.60
+fused_gate_slope_edge_max = 0.080
+fused_gate_wall_edge_threshold = 0.30
+fused_gate_direction_margin = 0.02
+fused_gate_difficulty_low_threshold = 0.09
+fused_gate_difficulty_high_threshold = 0.16
+nan_gate_body_y_start = 5
+nan_gate_body_y_end = 11
+nan_gate_x_start = 0
+nan_gate_x_end = 10
+nan_gate_stair_edge_threshold = 0.040
+nan_gate_stair_locality_threshold = 0.30
+nan_gate_stair_smoothness_max = 0.45
+nan_gate_slope_edge_mean_min = 0.006
+nan_gate_slope_smoothness_min = 0.60
+nan_gate_slope_edge_max = 0.070
+nan_gate_wall_edge_threshold = 0.30
+nan_gate_direction_margin = 0.02
+nan_gate_difficulty_low_threshold = 0.09
+nan_gate_difficulty_high_threshold = 0.16
+stairs_difficulty_low_threshold = 0.09
+stairs_difficulty_high_threshold = 0.16
+slope_difficulty_low_threshold = 0.05
+slope_difficulty_high_threshold = 0.11
+nav_gate_wall_edge_threshold = 0.30
+nav_wall_body_y_start = 3
+nav_wall_body_y_end = 10
+nav_wall_front_cols = 6
+nav_wall_side_width = 3
+nav_wall_height_threshold = 0.24
+nav_wall_temperature = 0.08
+nav_wall_score_threshold = 0.35
+nav_wall_gate_in_maze_only = true
 maze_anticipate_obstacle_threshold = -0.72
 maze_anticipate_temperature = 0.18
 maze_anticipate_front_cols = 8
@@ -99,7 +173,7 @@ maze_anticipate_yaw_cmd = 0.85
 # The maze policy should not chase those random commands; it uses goal + scan
 # for navigation and sees this stable forward command as a gait anchor.
 eval_command_override = true
-eval_command = [1.22, 0.0, 0.0]
+eval_command = [0.85, 0.0, 0.0]
 
 # -----------------------------------------------------------------------------
 # Locomotion preservation: keep enough of the old walking objective so the
@@ -128,6 +202,291 @@ weight = 0.12
 [rewards.track_ang_vel_z.params]
 std = 0.35
 command_name = "base_velocity"
+
+# Worker-side terrain gate probe.  The tiny weights keep these diagnostic
+# reward terms from shaping learning; monitor expressions scale them back up.
+[rewards.gate_current_available]
+weight = 1.0e-9
+[rewards.gate_current_flat]
+weight = 1.0e-9
+[rewards.gate_current_slope]
+weight = 1.0e-9
+[rewards.gate_current_stairs]
+weight = 1.0e-9
+[rewards.gate_current_wall]
+weight = 1.0e-9
+[rewards.gate_current_active]
+weight = 1.0e-9
+[rewards.gate_current_terrain_sum]
+weight = 1.0e-9
+[rewards.gate_current_difficulty]
+weight = 1.0e-9
+[rewards.gate_current_difficulty_low]
+weight = 1.0e-9
+[rewards.gate_current_difficulty_mid]
+weight = 1.0e-9
+[rewards.gate_current_difficulty_high]
+weight = 1.0e-9
+[rewards.gate_current_difficulty_sum]
+weight = 1.0e-9
+[rewards.gate_current_active_difficulty_low]
+weight = 1.0e-9
+[rewards.gate_current_active_difficulty_mid]
+weight = 1.0e-9
+[rewards.gate_current_active_difficulty_high]
+weight = 1.0e-9
+[rewards.gate_current_active_difficulty_sum]
+weight = 1.0e-9
+[rewards.gate_nan_available]
+weight = 1.0e-9
+[rewards.gate_nan_flat]
+weight = 1.0e-9
+[rewards.gate_nan_slope]
+weight = 1.0e-9
+[rewards.gate_nan_stairs]
+weight = 1.0e-9
+[rewards.gate_nan_wall]
+weight = 1.0e-9
+[rewards.gate_nan_active]
+weight = 1.0e-9
+[rewards.gate_nan_terrain_sum]
+weight = 1.0e-9
+[rewards.gate_nan_difficulty]
+weight = 1.0e-9
+[rewards.gate_nan_difficulty_low]
+weight = 1.0e-9
+[rewards.gate_nan_difficulty_mid]
+weight = 1.0e-9
+[rewards.gate_nan_difficulty_high]
+weight = 1.0e-9
+[rewards.gate_nan_difficulty_sum]
+weight = 1.0e-9
+[rewards.gate_nan_active_difficulty_low]
+weight = 1.0e-9
+[rewards.gate_nan_active_difficulty_mid]
+weight = 1.0e-9
+[rewards.gate_nan_active_difficulty_high]
+weight = 1.0e-9
+[rewards.gate_nan_active_difficulty_sum]
+weight = 1.0e-9
+[rewards.gate_raw_available]
+weight = 1.0e-9
+[rewards.gate_raw_nav_available]
+weight = 1.0e-9
+[rewards.gate_raw_flat]
+weight = 1.0e-9
+[rewards.gate_raw_slope]
+weight = 1.0e-9
+[rewards.gate_raw_stairs]
+weight = 1.0e-9
+[rewards.gate_raw_wall]
+weight = 1.0e-9
+[rewards.gate_raw_active]
+weight = 1.0e-9
+[rewards.gate_raw_terrain_sum]
+weight = 1.0e-9
+[rewards.gate_raw_difficulty]
+weight = 1.0e-9
+[rewards.gate_raw_difficulty_low]
+weight = 1.0e-9
+[rewards.gate_raw_difficulty_mid]
+weight = 1.0e-9
+[rewards.gate_raw_difficulty_high]
+weight = 1.0e-9
+[rewards.gate_raw_difficulty_sum]
+weight = 1.0e-9
+[rewards.gate_raw_active_difficulty_low]
+weight = 1.0e-9
+[rewards.gate_raw_active_difficulty_mid]
+weight = 1.0e-9
+[rewards.gate_raw_active_difficulty_high]
+weight = 1.0e-9
+[rewards.gate_raw_active_difficulty_sum]
+weight = 1.0e-9
+[rewards.gate_raw_edge_sharpness]
+weight = 1.0e-9
+[rewards.gate_raw_edge_locality]
+weight = 1.0e-9
+[rewards.gate_raw_slope_smoothness]
+weight = 1.0e-9
+[rewards.gate_raw_step_delta]
+weight = 1.0e-9
+[rewards.gate_raw_difficulty_signal]
+weight = 1.0e-9
+[rewards.gate_raw_nav_front_wall_score]
+weight = 1.0e-9
+[rewards.gate_raw_nav_left_wall_score]
+weight = 1.0e-9
+[rewards.gate_raw_nav_right_wall_score]
+weight = 1.0e-9
+[rewards.gate_raw_nav_front_blocked]
+weight = 1.0e-9
+[rewards.gate_raw_nav_open_side]
+weight = 1.0e-9
+[rewards.gate_selected_source]
+weight = 1.0e-9
+[rewards.gate_selected_available]
+weight = 1.0e-9
+[rewards.gate_selected_flat]
+weight = 1.0e-9
+[rewards.gate_selected_slope]
+weight = 1.0e-9
+[rewards.gate_selected_stairs]
+weight = 1.0e-9
+[rewards.gate_selected_wall]
+weight = 1.0e-9
+[rewards.gate_selected_maze]
+weight = 1.0e-9
+[rewards.gate_selected_terrain_sum]
+weight = 1.0e-9
+[rewards.gate_selected_up]
+weight = 1.0e-9
+[rewards.gate_selected_down]
+weight = 1.0e-9
+[rewards.gate_mode_shadow]
+weight = 1.0e-9
+[rewards.gate_mode_control]
+weight = 1.0e-9
+[rewards.gate_maze_instant]
+weight = 1.0e-9
+[rewards.gate_maze_phase]
+weight = 1.0e-9
+[rewards.gate_maze_confirm_count]
+weight = 1.0e-9
+[rewards.gate_selected_difficulty]
+weight = 1.0e-9
+[rewards.gate_selected_difficulty_low]
+weight = 1.0e-9
+[rewards.gate_selected_difficulty_mid]
+weight = 1.0e-9
+[rewards.gate_selected_difficulty_high]
+weight = 1.0e-9
+[rewards.gate_selected_difficulty_sum]
+weight = 1.0e-9
+[rewards.gate_final_flat]
+weight = 1.0e-9
+[rewards.gate_final_slope]
+weight = 1.0e-9
+[rewards.gate_final_stairs]
+weight = 1.0e-9
+[rewards.gate_final_maze]
+weight = 1.0e-9
+[rewards.gate_final_invalid]
+weight = 1.0e-9
+[rewards.gate_final_terrain_sum]
+weight = 1.0e-9
+[rewards.gate_final_non_maze_sum]
+weight = 1.0e-9
+[rewards.gate_final_active]
+weight = 1.0e-9
+[rewards.gate_final_difficulty]
+weight = 1.0e-9
+[rewards.gate_final_difficulty_low]
+weight = 1.0e-9
+[rewards.gate_final_difficulty_mid]
+weight = 1.0e-9
+[rewards.gate_final_difficulty_high]
+weight = 1.0e-9
+[rewards.gate_final_difficulty_unknown]
+weight = 1.0e-9
+[rewards.gate_final_difficulty_sum]
+weight = 1.0e-9
+[rewards.gate_final_source_current]
+weight = 1.0e-9
+[rewards.gate_final_source_nan]
+weight = 1.0e-9
+[rewards.gate_final_source_raw]
+weight = 1.0e-9
+[rewards.gate_final_source_sticky]
+weight = 1.0e-9
+[rewards.gate_final_gate_valid]
+weight = 1.0e-9
+[rewards.gate_terrain_switch]
+weight = 1.0e-9
+[rewards.gate_difficulty_switch]
+weight = 1.0e-9
+[rewards.gate_sticky_hold_steps]
+weight = 1.0e-9
+[rewards.gate_sticky_pending_count]
+weight = 1.0e-9
+[rewards.gate_sticky_flat_release_count]
+weight = 1.0e-9
+[rewards.gate_sticky_flat_confident]
+weight = 1.0e-9
+[rewards.gate_sticky_early_flat_release]
+weight = 1.0e-9
+[rewards.gate_sticky_active_preempt_switch]
+weight = 1.0e-9
+[rewards.gate_stair_up]
+weight = 1.0e-9
+[rewards.gate_stair_down]
+weight = 1.0e-9
+[rewards.gate_stair_unknown_dir]
+weight = 1.0e-9
+[rewards.gate_pitch_abs]
+weight = 1.0e-9
+[rewards.gate_updown_confidence]
+weight = 1.0e-9
+[rewards.gate_high_stair_active]
+weight = 1.0e-9
+[rewards.gate_slope_time_pressure_active]
+weight = 1.0e-9
+[rewards.gate_low_mid_stair_time_pressure_active]
+weight = 1.0e-9
+[rewards.gate_high_difficulty_pressure_active]
+weight = 1.0e-9
+[rewards.gate_command_written]
+weight = 1.0e-9
+[rewards.gate_worker_cmd_vx]
+weight = 1.0e-9
+[rewards.gate_target_cmd_vx]
+weight = 1.0e-9
+[rewards.gate_policy_cmd_error]
+weight = 1.0e-9
+[rewards.gate_critic_cmd_error]
+weight = 1.0e-9
+[rewards.gate_actual_minus_cmd_vx]
+weight = 1.0e-9
+[rewards.gate_track_cache_valid]
+weight = 1.0e-9
+[rewards.gate_track_cache_unknown]
+weight = 1.0e-9
+[rewards.gate_track_cache_low]
+weight = 1.0e-9
+[rewards.gate_track_cache_mid]
+weight = 1.0e-9
+[rewards.gate_track_cache_high]
+weight = 1.0e-9
+[rewards.gate_track_cache_difficulty]
+weight = 1.0e-9
+[rewards.gate_track_cache_factor]
+weight = 1.0e-9
+[rewards.gate_track_cache_source_slope]
+weight = 1.0e-9
+[rewards.gate_track_cache_source_stairs]
+weight = 1.0e-9
+[rewards.gate_maze_using_cached_difficulty]
+weight = 1.0e-9
+[rewards.gate_current_nan_stair_disagree]
+weight = 1.0e-9
+[rewards.gate_current_raw_stair_disagree]
+weight = 1.0e-9
+[rewards.gate_nan_raw_stair_disagree]
+weight = 1.0e-9
+[rewards.gate_current_nan_slope_disagree]
+weight = 1.0e-9
+[rewards.gate_current_raw_slope_disagree]
+weight = 1.0e-9
+[rewards.gate_nan_raw_slope_disagree]
+weight = 1.0e-9
+[rewards.gate_current_nan_wall_disagree]
+weight = 1.0e-9
+[rewards.gate_current_raw_wall_disagree]
+weight = 1.0e-9
+[rewards.gate_nan_raw_wall_disagree]
+weight = 1.0e-9
+[rewards.gate_raw_wall_non_maze]
+weight = 1.0e-9
 
 [rewards.lin_vel_z]
 weight = -0.56
@@ -170,7 +529,7 @@ weight = -5.0
 weight = -1.45
 
 [rewards.pose_score_formula]
-weight = 1.35
+weight = 1.45
 
 [rewards.hip_to_default]
 weight = -0.15
@@ -301,6 +660,15 @@ delta_quantile = 0.85
 min_delta = 0.025
 full_delta = 0.12
 
+[rewards.high_difficulty_pose_pressure]
+weight = -0.045
+
+[rewards.high_difficulty_ang_vel_xy]
+weight = -0.018
+
+[rewards.high_difficulty_energy]
+weight = -6.0e-6
+
 # -----------------------------------------------------------------------------
 # Pure RL navigation objective.
 # 主目标：完成完整 track；辅助目标：头朝前走、朝目标推进。
@@ -332,6 +700,15 @@ weight = -3.0
 [rewards.goal_backtrack_penalty.params]
 deadband = 0.02
 
+[rewards.goal_near_wrong_direction_penalty]
+weight = -0.28
+[rewards.goal_near_wrong_direction_penalty.params]
+near_dist = 2.2
+complete_threshold = 0.6
+speed_deadband = 0.25
+required_projection = 0.25
+max_penalty = 1.5
+
 [rewards.approach_goal]
 weight = 13.0
 
@@ -350,8 +727,22 @@ weight = 155.0
 [rewards.task_complete.params]
 threshold = 0.6
 
+[rewards.goal_miss_penalty]
+weight = -0.35
+[rewards.goal_miss_penalty.params]
+near_dist = 1.8
+miss_margin = 0.18
+max_penalty_dist = 1.2
+complete_threshold = 0.6
+
 [rewards.navigation_time]
-weight = -0.026
+weight = -0.020
+
+[rewards.slope_time_pressure]
+weight = -0.006
+
+[rewards.low_mid_stair_time_pressure]
+weight = -0.008
 
 [rewards.maze_context_gate]
 weight = 0.0
@@ -392,6 +783,34 @@ impact_speed = 0.55
 impact_penalty = 1.60
 maze_goal_dist_gate = 14.0
 maze_gate_obstacle_threshold = -0.80
+
+[rewards.nav_wall_impact_penalty]
+weight = -0.18
+[rewards.nav_wall_impact_penalty.params]
+obstacle_threshold = -0.24
+front_cols = 6
+body_y_start = 3
+body_y_end = 10
+wall_score_threshold = 0.35
+temperature = 0.08
+decel_deadband = 0.18
+speed_start = 0.25
+speed_full = 1.10
+maze_goal_dist_gate = 14.0
+
+[rewards.nav_wall_stuck_push_penalty]
+weight = -0.12
+[rewards.nav_wall_stuck_push_penalty.params]
+obstacle_threshold = -0.24
+front_cols = 6
+body_y_start = 3
+body_y_end = 10
+wall_score_threshold = 0.42
+temperature = 0.08
+still_speed = 0.12
+goal_dist_threshold = 0.8
+min_command = 0.05
+maze_goal_dist_gate = 14.0
 
 [rewards.wall_stall_penalty]
 weight = -1.2

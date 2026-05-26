@@ -13,6 +13,7 @@ import time
 from typing import Optional, Tuple
 from agent_ppo.conf.conf import Config
 from agent_ppo.feature.definition import RolloutStorage
+from agent_ppo.feature.terrain_gate import worker_gate_monitor_stats
 from tools.train_env_conf_validate import check_usr_conf
 from tools.utils import load_reward_keys_from_monitor_config
 import torch
@@ -385,6 +386,11 @@ def _initialize_training_state(env, agent, logger):
     # Load reward keys from monitor config
     # 浠?monitor 閰嶇疆鍔犺浇 reward_keys
     reward_keys = load_reward_keys_from_monitor_config()
+    for term_name in usr_conf.get("rewards", {}):
+        if str(term_name).startswith("gate_"):
+            metric_key = f"reward_{term_name}"
+            if metric_key not in reward_keys:
+                reward_keys.append(metric_key)
     logger.info(f"reward_keys list is {reward_keys}")
 
     return (
@@ -1111,6 +1117,257 @@ def _height_grid_from_obs(obs, usr_conf):
     return obs[:, scan_start:scan_start + scan_size].view(obs.shape[0], side, side)
 
 
+def _infer_ray_grid_shape(num_rays: int):
+    if num_rays == 256:
+        return 16, 16
+    if num_rays == 143:
+        return 13, 11
+    side = int(num_rays ** 0.5)
+    if side * side == num_rays:
+        return side, side
+    for rows in range(side + 1, 1, -1):
+        if num_rays % rows == 0:
+            return rows, num_rays // rows
+    return None
+
+
+def _raw_ground_grid_from_sensor(isaac_env, sensor_name: str):
+    scene = getattr(isaac_env, "scene", None)
+    sensors = getattr(scene, "sensors", None)
+    if sensors is None or sensor_name not in sensors:
+        return None
+    sensor = sensors.get(sensor_name)
+    data = getattr(sensor, "data", None)
+    if data is None or not hasattr(data, "pos_w") or not hasattr(data, "ray_hits_w"):
+        return None
+    try:
+        scan = data.pos_w[:, 2:3] - data.ray_hits_w[..., 2]
+        scan = torch.nan_to_num(scan, nan=0.0, posinf=0.0, neginf=0.0)
+        shape = _infer_ray_grid_shape(scan.shape[-1])
+        if shape is None:
+            return None
+        return (-scan).view(scan.shape[0], shape[0], shape[1])
+    except Exception:
+        return None
+
+
+def _terrain_structure_from_ground_grid(grid, usr_conf, prefix: str = "fused_gate"):
+    if grid is None:
+        return None
+    num_envs = grid.shape[0]
+    zeros = torch.zeros(num_envs, device=grid.device, dtype=grid.dtype)
+    false = torch.zeros(num_envs, device=grid.device, dtype=torch.bool)
+    if grid.shape[1] < 2 or grid.shape[2] < 2:
+        return None
+
+    rl_nav_conf = usr_conf.get("rl_navigation", {})
+    body_y_start = max(0, int(rl_nav_conf.get(f"{prefix}_body_y_start", max(0, grid.shape[1] // 2 - 3))))
+    body_y_end = min(int(rl_nav_conf.get(f"{prefix}_body_y_end", min(grid.shape[1], grid.shape[1] // 2 + 3))), grid.shape[1])
+    x_start = max(0, int(rl_nav_conf.get(f"{prefix}_x_start", 0)))
+    x_end = min(int(rl_nav_conf.get(f"{prefix}_x_end", min(grid.shape[2], 10))), grid.shape[2])
+    if body_y_end <= body_y_start or x_end - x_start < 2:
+        return None
+
+    window = grid[:, body_y_start:body_y_end, x_start:x_end]
+    dx = window[:, :, 1:] - window[:, :, :-1]
+    dy = window[:, 1:, :] - window[:, :-1, :]
+    abs_edges = torch.cat(
+        [torch.abs(dx).reshape(num_envs, -1), torch.abs(dy).reshape(num_envs, -1)],
+        dim=1,
+    )
+    if abs_edges.numel() == 0:
+        return None
+
+    edge_sharpness = abs_edges.amax(dim=1)
+    edge_mean = abs_edges.mean(dim=1)
+    slope_smoothness = torch.clamp(edge_mean / (edge_sharpness + 1.0e-6), min=0.0, max=1.0)
+    edge_locality = torch.clamp(1.0 - slope_smoothness, min=0.0, max=1.0)
+
+    near_x_end = min(int(rl_nav_conf.get(f"{prefix}_near_x_end", 4)), grid.shape[2])
+    front_x_start = min(int(rl_nav_conf.get(f"{prefix}_front_x_start", 4)), grid.shape[2] - 1)
+    front_x_end = min(int(rl_nav_conf.get(f"{prefix}_front_x_end", min(grid.shape[2], 10))), grid.shape[2])
+    if near_x_end <= 0 or front_x_end <= front_x_start:
+        step_delta = zeros
+    else:
+        near_z = grid[:, body_y_start:body_y_end, :near_x_end].mean(dim=(1, 2))
+        front_z = grid[:, body_y_start:body_y_end, front_x_start:front_x_end].mean(dim=(1, 2))
+        step_delta = front_z - near_z
+
+    wall_like = edge_sharpness > float(rl_nav_conf.get(f"{prefix}_wall_edge_threshold", 0.30))
+    stair_like = (
+        (edge_sharpness >= float(rl_nav_conf.get(f"{prefix}_stair_edge_threshold", 0.040)))
+        & (edge_locality >= float(rl_nav_conf.get(f"{prefix}_stair_locality_threshold", 0.30)))
+        & (slope_smoothness <= float(rl_nav_conf.get(f"{prefix}_stair_smoothness_max", 0.45)))
+        & (~wall_like)
+    )
+    slope_like = (
+        (edge_mean >= float(rl_nav_conf.get(f"{prefix}_slope_edge_mean_min", 0.006)))
+        & (slope_smoothness >= float(rl_nav_conf.get(f"{prefix}_slope_smoothness_min", 0.60)))
+        & (edge_sharpness <= float(rl_nav_conf.get(f"{prefix}_slope_edge_max", 0.080)))
+        & (~wall_like)
+        & (~stair_like)
+    )
+    direction_margin = float(rl_nav_conf.get(f"{prefix}_direction_margin", 0.02))
+    up_step = stair_like & (step_delta > direction_margin)
+    down_step = stair_like & (step_delta < -direction_margin)
+    difficulty_signal = torch.where(stair_like, edge_sharpness, torch.abs(step_delta))
+    low_thr = float(rl_nav_conf.get(f"{prefix}_difficulty_low_threshold", 0.09))
+    high_thr = float(rl_nav_conf.get(f"{prefix}_difficulty_high_threshold", 0.16))
+    difficulty_band = torch.zeros(num_envs, dtype=torch.long, device=grid.device)
+    terrain_active = stair_like | slope_like
+    difficulty_band = torch.where(
+        terrain_active & (difficulty_signal >= low_thr),
+        torch.ones_like(difficulty_band),
+        difficulty_band,
+    )
+    difficulty_band = torch.where(
+        terrain_active & (difficulty_signal >= high_thr),
+        torch.full_like(difficulty_band, 2),
+        difficulty_band,
+    )
+
+    return {
+        "available": torch.ones_like(edge_sharpness),
+        "wall_like": wall_like,
+        "stair_like": stair_like,
+        "slope_like": slope_like,
+        "up_step": up_step,
+        "down_step": down_step,
+        "edge_sharpness": edge_sharpness,
+        "edge_mean": edge_mean,
+        "edge_locality": edge_locality,
+        "slope_smoothness": slope_smoothness,
+        "step_delta": step_delta,
+        "difficulty_signal": difficulty_signal,
+        "difficulty_band": difficulty_band,
+    }
+
+
+def _raw_fused_terrain_gate(env, obs, usr_conf, logger=None):
+    rl_nav_conf = usr_conf.get("rl_navigation", {})
+    if not bool(rl_nav_conf.get("raw_terrain_gate_enabled", True)):
+        return None
+
+    isaac_env = _get_isaac_env(env)
+    if isaac_env is None:
+        if logger is not None and not getattr(env, "_raw_terrain_gate_unwrap_logged", False):
+            env._raw_terrain_gate_unwrap_logged = True
+            logger.warning("[TerrainGate] raw scanner unavailable: cannot unwrap Isaac env; using obs gate fallback.")
+        return None
+
+    height_grid = _raw_ground_grid_from_sensor(isaac_env, "height_scanner")
+    if height_grid is None:
+        if logger is not None and not getattr(env, "_raw_terrain_gate_sensor_logged", False):
+            env._raw_terrain_gate_sensor_logged = True
+            logger.warning("[TerrainGate] height_scanner unavailable; using obs gate fallback.")
+        return None
+
+    height = _terrain_structure_from_ground_grid(height_grid, usr_conf, "fused_gate")
+    if height is None:
+        return None
+    nav_grid = _raw_ground_grid_from_sensor(isaac_env, "nav_scanner")
+    nav = _terrain_structure_from_ground_grid(nav_grid, usr_conf, "nav_gate") if nav_grid is not None else None
+
+    wall_like = height["wall_like"]
+    if nav is not None:
+        wall_like = wall_like | nav["wall_like"]
+
+    stair_like = height["stair_like"] & (~wall_like)
+    slope_like = height["slope_like"] & (~wall_like) & (~stair_like)
+    up_step = height["up_step"] & stair_like
+    down_step = height["down_step"] & stair_like
+
+    terrain_id = torch.zeros(obs.shape[0], dtype=torch.long, device=obs.device)
+    terrain_id = torch.where(slope_like.to(obs.device), torch.ones_like(terrain_id), terrain_id)
+    terrain_id = torch.where(stair_like.to(obs.device), torch.full_like(terrain_id, 2), terrain_id)
+    terrain_id = torch.where(wall_like.to(obs.device), torch.full_like(terrain_id, 3), terrain_id)
+    difficulty_band = height["difficulty_band"].to(obs.device)
+
+    gate = {
+        "terrain_id": terrain_id,
+        "difficulty_band": difficulty_band,
+        "available": height["available"].to(obs.device),
+        "flat": (terrain_id == 0),
+        "slope": slope_like.to(obs.device),
+        "stairs": stair_like.to(obs.device),
+        "wall": wall_like.to(obs.device),
+        "up": up_step.to(obs.device),
+        "down": down_step.to(obs.device),
+        "edge_sharpness": height["edge_sharpness"].to(obs.device),
+        "edge_mean": height["edge_mean"].to(obs.device),
+        "edge_locality": height["edge_locality"].to(obs.device),
+        "slope_smoothness": height["slope_smoothness"].to(obs.device),
+        "step_delta": height["step_delta"].to(obs.device),
+        "difficulty_signal": height["difficulty_signal"].to(obs.device),
+        "nav_available": torch.full_like(height["available"].to(obs.device), 1.0 if nav is not None else 0.0),
+    }
+
+    try:
+        isaac_env._terrain_gate_state = {
+            "terrain_id": terrain_id.detach(),
+            "difficulty_band": difficulty_band.detach(),
+            "source": "raw_fused",
+        }
+    except Exception:
+        pass
+    return gate
+
+
+def _obs_terrain_gate(obs, usr_conf):
+    terrain_id = _estimate_pre_maze_terrain_from_obs(obs, usr_conf)
+    if terrain_id is None:
+        return None
+    difficulty_band = torch.zeros_like(terrain_id)
+    nan_gate = _nan_stair_gate_from_obs(obs, usr_conf)
+    if nan_gate is not None:
+        stair_signal = nan_gate["edge_sharpness"]
+        slope_signal = torch.abs(nan_gate["step_delta"])
+        difficulty_signal = torch.where(nan_gate["stair_like"], stair_signal, slope_signal)
+        low_thr = float(usr_conf.get("rl_navigation", {}).get("fused_gate_difficulty_low_threshold", 0.09))
+        high_thr = float(usr_conf.get("rl_navigation", {}).get("fused_gate_difficulty_high_threshold", 0.16))
+        active = terrain_id > 0
+        difficulty_band = torch.where(active & (difficulty_signal >= low_thr), torch.ones_like(difficulty_band), difficulty_band)
+        difficulty_band = torch.where(active & (difficulty_signal >= high_thr), torch.full_like(difficulty_band, 2), difficulty_band)
+    return {
+        "terrain_id": terrain_id,
+        "difficulty_band": difficulty_band,
+        "available": torch.ones(terrain_id.shape[0], device=terrain_id.device, dtype=torch.float32),
+        "flat": terrain_id == 0,
+        "slope": terrain_id == 1,
+        "stairs": terrain_id == 2,
+        "wall": torch.zeros_like(terrain_id, dtype=torch.bool),
+        "up": torch.zeros_like(terrain_id, dtype=torch.bool),
+        "down": torch.zeros_like(terrain_id, dtype=torch.bool),
+    }
+
+
+def _select_terrain_gate(obs, env, usr_conf, logger=None):
+    raw_gate = _raw_fused_terrain_gate(env, obs, usr_conf, logger)
+    if raw_gate is not None:
+        raw_gate["source_id"] = torch.ones(obs.shape[0], device=obs.device, dtype=obs.dtype)
+        try:
+            env._terrain_gate_state = {
+                "terrain_id": raw_gate["terrain_id"].detach(),
+                "difficulty_band": raw_gate["difficulty_band"].detach(),
+                "source": "raw_fused",
+            }
+        except Exception:
+            pass
+        return raw_gate
+    obs_gate = _obs_terrain_gate(obs, usr_conf)
+    if obs_gate is not None:
+        obs_gate["source_id"] = torch.zeros(obs.shape[0], device=obs.device, dtype=obs.dtype)
+        try:
+            env._terrain_gate_state = {
+                "terrain_id": obs_gate["terrain_id"].detach(),
+                "difficulty_band": obs_gate["difficulty_band"].detach(),
+                "source": "obs_fallback",
+            }
+        except Exception:
+            pass
+    return obs_gate
+
+
 def _estimate_pre_maze_terrain_from_obs(obs, usr_conf):
     """Classify non-maze front terrain into flat / slope / stairs from height scan."""
     grid = _height_grid_from_obs(obs, usr_conf)
@@ -1162,6 +1419,102 @@ def _estimate_pre_maze_terrain_from_obs(obs, usr_conf):
     return terrain_id
 
 
+def _nan_stair_gate_from_obs(obs, usr_conf):
+    """Observation-side copy of nan's stair/slope structure gate for monitoring."""
+    grid = _height_grid_from_obs(obs, usr_conf)
+    if grid is None:
+        return None
+
+    grid = torch.nan_to_num(-grid, nan=0.0, posinf=0.0, neginf=0.0)
+    num_envs = grid.shape[0]
+    zeros = torch.zeros(num_envs, device=grid.device, dtype=grid.dtype)
+    false = torch.zeros(num_envs, device=grid.device, dtype=torch.bool)
+
+    rl_nav_conf = usr_conf.get("rl_navigation", {})
+    body_y_start = max(0, int(rl_nav_conf.get("nan_gate_body_y_start", 5)))
+    body_y_end = min(int(rl_nav_conf.get("nan_gate_body_y_end", 11)), grid.shape[1])
+    x_end = min(int(rl_nav_conf.get("nan_gate_x_end", 10)), grid.shape[2])
+    if body_y_end <= body_y_start or x_end < 2:
+        return {
+            "available": zeros,
+            "stair_like": false,
+            "slope_like": false,
+            "wall_like": false,
+            "up_step": false,
+            "down_step": false,
+            "edge_sharpness": zeros,
+            "edge_locality": zeros,
+            "slope_smoothness": zeros,
+            "step_delta": zeros,
+        }
+
+    window = grid[:, body_y_start:body_y_end, :x_end]
+    if window.shape[1] < 2 or window.shape[2] < 2:
+        return {
+            "available": zeros,
+            "stair_like": false,
+            "slope_like": false,
+            "wall_like": false,
+            "up_step": false,
+            "down_step": false,
+            "edge_sharpness": zeros,
+            "edge_locality": zeros,
+            "slope_smoothness": zeros,
+            "step_delta": zeros,
+        }
+
+    dx = window[:, :, 1:] - window[:, :, :-1]
+    dy = window[:, 1:, :] - window[:, :-1, :]
+    abs_edges = torch.cat(
+        [torch.abs(dx).reshape(num_envs, -1), torch.abs(dy).reshape(num_envs, -1)],
+        dim=1,
+    )
+    edge_sharpness = abs_edges.amax(dim=1)
+    edge_mean = abs_edges.mean(dim=1)
+    slope_smoothness = torch.clamp(edge_mean / (edge_sharpness + 1.0e-6), min=0.0, max=1.0)
+    edge_locality = torch.clamp(1.0 - slope_smoothness, min=0.0, max=1.0)
+
+    wall_like = edge_sharpness > float(rl_nav_conf.get("nan_gate_wall_edge_threshold", 0.30))
+    stair_like = (
+        (edge_sharpness >= float(rl_nav_conf.get("nan_gate_stair_edge_threshold", 0.040)))
+        & (edge_locality >= float(rl_nav_conf.get("nan_gate_stair_locality_threshold", 0.30)))
+        & (slope_smoothness <= float(rl_nav_conf.get("nan_gate_stair_smoothness_max", 0.45)))
+        & (~wall_like)
+    )
+    slope_like = (
+        (edge_mean >= float(rl_nav_conf.get("nan_gate_slope_edge_mean_min", 0.006)))
+        & (slope_smoothness >= float(rl_nav_conf.get("nan_gate_slope_smoothness_min", 0.60)))
+        & (edge_sharpness <= float(rl_nav_conf.get("nan_gate_slope_edge_max", 0.070)))
+        & (~wall_like)
+    )
+
+    near_x_end = min(int(rl_nav_conf.get("nan_gate_near_x_end", 4)), grid.shape[2])
+    front_x_start = min(int(rl_nav_conf.get("nan_gate_front_x_start", 4)), grid.shape[2] - 1)
+    front_x_end = min(int(rl_nav_conf.get("nan_gate_front_x_end", 10)), grid.shape[2])
+    if near_x_end <= 0 or front_x_end <= front_x_start:
+        step_delta = zeros
+    else:
+        near_z = grid[:, body_y_start:body_y_end, :near_x_end].mean(dim=(1, 2))
+        front_z = grid[:, body_y_start:body_y_end, front_x_start:front_x_end].mean(dim=(1, 2))
+        step_delta = front_z - near_z
+    direction_margin = float(rl_nav_conf.get("nan_gate_direction_margin", 0.02))
+    up_step = stair_like & (step_delta > direction_margin)
+    down_step = stair_like & (step_delta < -direction_margin)
+
+    return {
+        "available": torch.ones_like(edge_sharpness),
+        "stair_like": stair_like,
+        "slope_like": slope_like,
+        "wall_like": wall_like,
+        "up_step": up_step,
+        "down_step": down_step,
+        "edge_sharpness": edge_sharpness,
+        "edge_locality": edge_locality,
+        "slope_smoothness": slope_smoothness,
+        "step_delta": step_delta,
+    }
+
+
 def _maze_wall_anticipation_from_obs(obs, usr_conf):
     grid = _height_grid_from_obs(obs, usr_conf)
     if grid is None:
@@ -1196,17 +1549,16 @@ def _maze_wall_anticipation_from_obs(obs, usr_conf):
 
 def _phase_command_midpoint(obs, maze_phase, usr_conf, dtype):
     rl_nav_conf = usr_conf.get("rl_navigation", {})
-    pre_range = rl_nav_conf.get("pre_maze_lin_vel_x", [0.75, 1.0])
-    slope_range = rl_nav_conf.get("slope_lin_vel_x", pre_range)
-    stairs_range = rl_nav_conf.get("stairs_lin_vel_x", pre_range)
+    fallback_vx = float(rl_nav_conf.get("fallback_lin_vel_x", 0.90))
+    slope_range = rl_nav_conf.get("slope_lin_vel_x", [fallback_vx, fallback_vx])
+    stairs_range = rl_nav_conf.get("stairs_lin_vel_x", [fallback_vx, fallback_vx])
     maze_range = rl_nav_conf.get("maze_lin_vel_x", [0.45, 0.65])
     terrain_phase_speed_enabled = bool(rl_nav_conf.get("terrain_phase_speed_enabled", False))
-    pre_vx = _range_midpoint(pre_range, 0.875)
-    slope_vx = _range_midpoint(slope_range, pre_vx)
-    stairs_vx = _range_midpoint(stairs_range, pre_vx)
+    slope_vx = _range_midpoint(slope_range, fallback_vx)
+    stairs_vx = _range_midpoint(stairs_range, fallback_vx)
     maze_vx = _range_midpoint(maze_range, 0.55)
     command = torch.zeros(maze_phase.shape[0], 3, device=maze_phase.device, dtype=dtype)
-    pre_command = torch.full_like(command[:, 0], pre_vx)
+    pre_command = torch.full_like(command[:, 0], fallback_vx)
     if terrain_phase_speed_enabled and obs is not None:
         terrain_id = _estimate_pre_maze_terrain_from_obs(obs, usr_conf)
         if terrain_id is not None:
@@ -1243,6 +1595,7 @@ def _get_phase_command_state(env, num_envs, device, dtype):
             "timer": torch.zeros(num_envs, dtype=torch.long, device=device),
             "maze_phase": torch.zeros(num_envs, dtype=torch.bool, device=device),
             "terrain_id": torch.zeros(num_envs, dtype=torch.long, device=device),
+            "difficulty_band": torch.zeros(num_envs, dtype=torch.long, device=device),
         }
         setattr(env, "_rl_phase_command_state", state)
     return state
@@ -1259,6 +1612,8 @@ def _reset_phase_command_state(env, dones):
         state["maze_phase"][done_mask] = False
         if "terrain_id" in state:
             state["terrain_id"][done_mask] = 0
+        if "difficulty_band" in state:
+            state["difficulty_band"][done_mask] = 0
 
 
 def _apply_rl_phase_command(
@@ -1279,6 +1634,8 @@ def _apply_rl_phase_command(
     rl_nav_conf = usr_conf.get("rl_navigation", {})
     if not bool(rl_nav_conf.get("phase_command_enabled", False)):
         return obs, critic_obs, {}
+    if bool(rl_nav_conf.get("worker_phase_command_enabled", False)):
+        return obs, critic_obs, worker_gate_monitor_stats(env)
 
     maze_phase = _estimate_maze_phase_from_obs(obs, usr_conf)
     if maze_phase is None:
@@ -1286,14 +1643,18 @@ def _apply_rl_phase_command(
 
     state = _get_phase_command_state(env, obs.shape[0], obs.device, obs.dtype)
     resample_steps = max(int(rl_nav_conf.get("phase_command_resample_steps", 96)), 1)
-    pre_range = rl_nav_conf.get("pre_maze_lin_vel_x", [0.75, 1.0])
-    slope_range = rl_nav_conf.get("slope_lin_vel_x", pre_range)
-    stairs_range = rl_nav_conf.get("stairs_lin_vel_x", pre_range)
+    fallback_vx = float(rl_nav_conf.get("fallback_lin_vel_x", 0.90))
+    slope_range = rl_nav_conf.get("slope_lin_vel_x", [fallback_vx, fallback_vx])
+    stairs_range = rl_nav_conf.get("stairs_lin_vel_x", [fallback_vx, fallback_vx])
     maze_range = rl_nav_conf.get("maze_lin_vel_x", [0.45, 0.65])
     terrain_phase_speed_enabled = bool(rl_nav_conf.get("terrain_phase_speed_enabled", False))
-    terrain_id = _estimate_pre_maze_terrain_from_obs(obs, usr_conf)
-    if terrain_id is None:
+    terrain_gate = _select_terrain_gate(obs, env, usr_conf, logger)
+    if terrain_gate is None:
         terrain_id = torch.zeros(obs.shape[0], dtype=torch.long, device=obs.device)
+        difficulty_band = torch.zeros_like(terrain_id)
+    else:
+        terrain_id = terrain_gate["terrain_id"]
+        difficulty_band = terrain_gate["difficulty_band"]
 
     command = state["command"]
     if update_state:
@@ -1303,12 +1664,15 @@ def _apply_rl_phase_command(
         if wall_gate is not None:
             wall_active = maze_phase & (wall_gate > 0.05)
         phase_changed = maze_phase != state["maze_phase"]
-        terrain_changed = terrain_phase_speed_enabled & (~maze_phase) & (terrain_id != state["terrain_id"])
+        difficulty_changed = difficulty_band != state.get("difficulty_band", torch.zeros_like(difficulty_band))
+        terrain_changed = terrain_phase_speed_enabled & (~maze_phase) & (
+            (terrain_id != state["terrain_id"]) | difficulty_changed
+        )
         yaw_cleanup = (~wall_active) & (torch.abs(command[:, 2]) > 1e-4)
         needs_sample = (timer <= 0) | phase_changed | terrain_changed | (command[:, 0] <= 0.0)
 
         if needs_sample.any():
-            sampled_pre = _sample_uniform_range(pre_range, (obs.shape[0],), obs.device, obs.dtype)
+            sampled_pre = torch.full((obs.shape[0],), fallback_vx, device=obs.device, dtype=obs.dtype)
             sampled_slope = _sample_uniform_range(slope_range, (obs.shape[0],), obs.device, obs.dtype)
             sampled_stairs = _sample_uniform_range(stairs_range, (obs.shape[0],), obs.device, obs.dtype)
             sampled_maze = _sample_uniform_range(maze_range, (obs.shape[0],), obs.device, obs.dtype)
@@ -1316,6 +1680,7 @@ def _apply_rl_phase_command(
             if terrain_phase_speed_enabled:
                 sampled_non_maze = torch.where(terrain_id == 1, sampled_slope, sampled_non_maze)
                 sampled_non_maze = torch.where(terrain_id == 2, sampled_stairs, sampled_non_maze)
+                sampled_non_maze = torch.where(terrain_id == 3, sampled_stairs, sampled_non_maze)
             if wall_gate is not None:
                 min_scale = float(rl_nav_conf.get("maze_anticipate_min_speed_scale", 1.0))
                 speed_scale = 1.0 - torch.clamp(wall_gate, 0.0, 1.0) * (1.0 - min_scale)
@@ -1343,6 +1708,7 @@ def _apply_rl_phase_command(
         )
         state["maze_phase"] = maze_phase.detach().clone()
         state["terrain_id"] = terrain_id.detach().clone()
+        state["difficulty_band"] = difficulty_band.detach().clone()
     else:
         command = command.clone()
         phase_changed = maze_phase != state["maze_phase"]
@@ -1362,12 +1728,101 @@ def _apply_rl_phase_command(
     if update_env_command:
         _set_env_base_velocity_command(env, command, logger)
 
-    return obs, critic_obs, {
+    non_maze = ~maze_phase
+    non_maze_count = non_maze.float().sum().clamp_min(1.0)
+    phase_stats = {
         "rl_phase_command_vx": command[:, 0].detach(),
         "rl_phase_maze_ratio": maze_phase.float().detach(),
+        "gate_source_raw_ratio": (
+            terrain_gate.get("source_id", torch.zeros(obs.shape[0], device=obs.device, dtype=obs.dtype))
+            if terrain_gate is not None
+            else torch.zeros(obs.shape[0], device=obs.device, dtype=obs.dtype)
+        ).detach(),
+        "gate_current_flat_ratio": (terrain_id == 0).float().detach(),
         "rl_phase_slope_ratio": (terrain_id == 1).float().detach(),
         "rl_phase_stairs_ratio": (terrain_id == 2).float().detach(),
+        "gate_fused_wall_ratio": (terrain_id == 3).float().detach(),
+        "gate_difficulty_low_ratio": (difficulty_band == 0).float().detach(),
+        "gate_difficulty_mid_ratio": (difficulty_band == 1).float().detach(),
+        "gate_difficulty_high_ratio": (difficulty_band >= 2).float().detach(),
+        "gate_difficulty_mean": difficulty_band.float().detach(),
+        "gate_pre_maze_current_flat_ratio": (
+            ((terrain_id == 0) & non_maze).float().sum() / non_maze_count
+        ).detach(),
+        "gate_pre_maze_current_slope_ratio": (
+            ((terrain_id == 1) & non_maze).float().sum() / non_maze_count
+        ).detach(),
+        "gate_pre_maze_current_stairs_ratio": (
+            ((terrain_id == 2) & non_maze).float().sum() / non_maze_count
+        ).detach(),
+        "gate_pre_maze_wall_ratio": (
+            ((terrain_id == 3) & non_maze).float().sum() / non_maze_count
+        ).detach(),
+        "gate_pre_maze_difficulty_low_ratio": (
+            ((difficulty_band == 0) & non_maze).float().sum() / non_maze_count
+        ).detach(),
+        "gate_pre_maze_difficulty_mid_ratio": (
+            ((difficulty_band == 1) & non_maze).float().sum() / non_maze_count
+        ).detach(),
+        "gate_pre_maze_difficulty_high_ratio": (
+            ((difficulty_band >= 2) & non_maze).float().sum() / non_maze_count
+        ).detach(),
     }
+    if terrain_gate is not None:
+        for src_key, metric_key in (
+            ("available", "gate_fused_available_ratio"),
+            ("up", "gate_fused_up_ratio"),
+            ("down", "gate_fused_down_ratio"),
+            ("edge_sharpness", "gate_fused_edge_sharpness"),
+            ("edge_mean", "gate_fused_edge_mean"),
+            ("edge_locality", "gate_fused_edge_locality"),
+            ("slope_smoothness", "gate_fused_slope_smoothness"),
+            ("step_delta", "gate_fused_step_delta"),
+            ("difficulty_signal", "gate_fused_difficulty_signal"),
+            ("nav_available", "gate_nav_available_ratio"),
+        ):
+            if src_key in terrain_gate:
+                value = terrain_gate[src_key]
+                phase_stats[metric_key] = value.float().detach()
+    nan_gate = _nan_stair_gate_from_obs(obs, usr_conf)
+    if nan_gate is not None:
+        current_stair = terrain_id == 2
+        phase_stats.update({
+            "gate_nan_available_ratio": nan_gate["available"].detach(),
+            "gate_nan_stair_ratio": nan_gate["stair_like"].float().detach(),
+            "gate_nan_slope_ratio": nan_gate["slope_like"].float().detach(),
+            "gate_nan_wall_ratio": nan_gate["wall_like"].float().detach(),
+            "gate_nan_up_ratio": nan_gate["up_step"].float().detach(),
+            "gate_nan_down_ratio": nan_gate["down_step"].float().detach(),
+            "gate_nan_edge_sharpness": nan_gate["edge_sharpness"].detach(),
+            "gate_nan_edge_locality": nan_gate["edge_locality"].detach(),
+            "gate_nan_slope_smoothness": nan_gate["slope_smoothness"].detach(),
+            "gate_nan_step_delta": nan_gate["step_delta"].detach(),
+            "gate_current_nan_stair_disagree_ratio": (
+                current_stair != nan_gate["stair_like"]
+            ).float().detach(),
+            "gate_pre_maze_nan_stair_ratio": (
+                (nan_gate["stair_like"] & non_maze).float().sum() / non_maze_count
+            ).detach(),
+            "gate_pre_maze_nan_slope_ratio": (
+                (nan_gate["slope_like"] & non_maze).float().sum() / non_maze_count
+            ).detach(),
+            "gate_pre_maze_nan_wall_ratio": (
+                (nan_gate["wall_like"] & non_maze).float().sum() / non_maze_count
+            ).detach(),
+            "gate_pre_maze_nan_up_ratio": (
+                (nan_gate["up_step"] & non_maze).float().sum() / non_maze_count
+            ).detach(),
+            "gate_pre_maze_nan_down_ratio": (
+                (nan_gate["down_step"] & non_maze).float().sum() / non_maze_count
+            ).detach(),
+            "gate_pre_maze_current_nan_stair_disagree_ratio": (
+                ((current_stair != nan_gate["stair_like"]) & non_maze).float().sum()
+                / non_maze_count
+            ).detach(),
+        })
+
+    return obs, critic_obs, phase_stats
 
 
 def _apply_navigation_command(
@@ -1532,7 +1987,12 @@ def run_episodes_(
             # 瑁佸壀鍏宠妭鍔ㄤ綔
             command_actions = torch.clip(joint_actions, -6.0, 6.0).to(agent.device)
             if i == 0:
-                logger.info(f"clipped_action:{command_actions}")
+                logger.info(
+                    "clipped_action summary: "
+                    f"min={float(command_actions.min().item()):.4f} "
+                    f"max={float(command_actions.max().item()):.4f} "
+                    f"mean={float(command_actions.mean().item()):.4f}"
+                )
 
             # Environment interaction
             # 鐜浜や簰

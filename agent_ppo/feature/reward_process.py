@@ -12,6 +12,7 @@ goal-directed exploration signal without using a hand-written planner.
 
 import torch
 
+from agent_ppo.feature.terrain_gate import actual_minus_command, command_sync_error, gate_metric
 from tools.base_env.base_reward import RewardProcessBase
 
 
@@ -19,6 +20,486 @@ class RewardProcess(RewardProcessBase):
 
     def _tracking_command(self, command_name: str = "base_velocity"):
         return self.env.command_manager.get_command(command_name)
+
+    def _gate_metric(self, name: str):
+        return gate_metric(self.env, name)
+
+    def _reward_gate_current_available(self):
+        return self._gate_metric("current_available")
+
+    def _reward_gate_current_flat(self):
+        return self._gate_metric("current_flat")
+
+    def _reward_gate_current_slope(self):
+        return self._gate_metric("current_slope")
+
+    def _reward_gate_current_stairs(self):
+        return self._gate_metric("current_stairs")
+
+    def _reward_gate_current_wall(self):
+        return self._gate_metric("current_wall")
+
+    def _reward_gate_current_active(self):
+        return self._gate_metric("current_active")
+
+    def _reward_gate_current_terrain_sum(self):
+        return self._gate_metric("current_terrain_sum")
+
+    def _reward_gate_current_difficulty(self):
+        return self._gate_metric("current_difficulty")
+
+    def _reward_gate_current_difficulty_low(self):
+        return self._gate_metric("current_difficulty_low")
+
+    def _reward_gate_current_difficulty_mid(self):
+        return self._gate_metric("current_difficulty_mid")
+
+    def _reward_gate_current_difficulty_high(self):
+        return self._gate_metric("current_difficulty_high")
+
+    def _reward_gate_current_difficulty_sum(self):
+        return self._gate_metric("current_difficulty_sum")
+
+    def _reward_gate_current_active_difficulty_low(self):
+        return self._gate_metric("current_active_difficulty_low")
+
+    def _reward_gate_current_active_difficulty_mid(self):
+        return self._gate_metric("current_active_difficulty_mid")
+
+    def _reward_gate_current_active_difficulty_high(self):
+        return self._gate_metric("current_active_difficulty_high")
+
+    def _reward_gate_current_active_difficulty_sum(self):
+        return self._gate_metric("current_active_difficulty_sum")
+
+    def _reward_gate_nan_available(self):
+        return self._gate_metric("nan_available")
+
+    def _reward_gate_nan_flat(self):
+        return self._gate_metric("nan_flat")
+
+    def _reward_gate_nan_slope(self):
+        return self._gate_metric("nan_slope")
+
+    def _reward_gate_nan_stairs(self):
+        return self._gate_metric("nan_stairs")
+
+    def _reward_gate_nan_wall(self):
+        return self._gate_metric("nan_wall")
+
+    def _reward_gate_nan_active(self):
+        return self._gate_metric("nan_active")
+
+    def _reward_gate_nan_terrain_sum(self):
+        return self._gate_metric("nan_terrain_sum")
+
+    def _reward_gate_nan_difficulty(self):
+        return self._gate_metric("nan_difficulty")
+
+    def _reward_gate_nan_difficulty_low(self):
+        return self._gate_metric("nan_difficulty_low")
+
+    def _reward_gate_nan_difficulty_mid(self):
+        return self._gate_metric("nan_difficulty_mid")
+
+    def _reward_gate_nan_difficulty_high(self):
+        return self._gate_metric("nan_difficulty_high")
+
+    def _reward_gate_nan_difficulty_sum(self):
+        return self._gate_metric("nan_difficulty_sum")
+
+    def _reward_gate_nan_active_difficulty_low(self):
+        return self._gate_metric("nan_active_difficulty_low")
+
+    def _reward_gate_nan_active_difficulty_mid(self):
+        return self._gate_metric("nan_active_difficulty_mid")
+
+    def _reward_gate_nan_active_difficulty_high(self):
+        return self._gate_metric("nan_active_difficulty_high")
+
+    def _reward_gate_nan_active_difficulty_sum(self):
+        return self._gate_metric("nan_active_difficulty_sum")
+
+    def _reward_gate_raw_available(self):
+        return self._gate_metric("raw_fused_available")
+
+    def _reward_gate_raw_nav_available(self):
+        return self._gate_metric("raw_nav_available")
+
+    def _reward_gate_raw_flat(self):
+        return self._gate_metric("raw_fused_flat")
+
+    def _reward_gate_raw_slope(self):
+        return self._gate_metric("raw_fused_slope")
+
+    def _reward_gate_raw_stairs(self):
+        return self._gate_metric("raw_fused_stairs")
+
+    def _reward_gate_raw_wall(self):
+        return self._gate_metric("raw_fused_wall")
+
+    def _reward_gate_raw_active(self):
+        return self._gate_metric("raw_fused_active")
+
+    def _reward_gate_raw_terrain_sum(self):
+        return self._gate_metric("raw_fused_terrain_sum")
+
+    def _reward_gate_raw_difficulty(self):
+        return self._gate_metric("raw_fused_difficulty")
+
+    def _reward_gate_raw_difficulty_low(self):
+        return self._gate_metric("raw_fused_difficulty_low")
+
+    def _reward_gate_raw_difficulty_mid(self):
+        return self._gate_metric("raw_fused_difficulty_mid")
+
+    def _reward_gate_raw_difficulty_high(self):
+        return self._gate_metric("raw_fused_difficulty_high")
+
+    def _reward_gate_raw_difficulty_sum(self):
+        return self._gate_metric("raw_fused_difficulty_sum")
+
+    def _reward_gate_raw_active_difficulty_low(self):
+        return self._gate_metric("raw_fused_active_difficulty_low")
+
+    def _reward_gate_raw_active_difficulty_mid(self):
+        return self._gate_metric("raw_fused_active_difficulty_mid")
+
+    def _reward_gate_raw_active_difficulty_high(self):
+        return self._gate_metric("raw_fused_active_difficulty_high")
+
+    def _reward_gate_raw_active_difficulty_sum(self):
+        return self._gate_metric("raw_fused_active_difficulty_sum")
+
+    def _reward_gate_raw_edge_sharpness(self):
+        return self._gate_metric("raw_fused_edge_sharpness")
+
+    def _reward_gate_raw_edge_locality(self):
+        return self._gate_metric("raw_fused_edge_locality")
+
+    def _reward_gate_raw_slope_smoothness(self):
+        return self._gate_metric("raw_fused_slope_smoothness")
+
+    def _reward_gate_raw_step_delta(self):
+        return self._gate_metric("raw_fused_step_delta")
+
+    def _reward_gate_raw_difficulty_signal(self):
+        return self._gate_metric("raw_fused_difficulty_signal")
+
+    def _reward_gate_raw_nav_front_wall_score(self):
+        return self._gate_metric("raw_nav_front_wall_score")
+
+    def _reward_gate_raw_nav_left_wall_score(self):
+        return self._gate_metric("raw_nav_left_wall_score")
+
+    def _reward_gate_raw_nav_right_wall_score(self):
+        return self._gate_metric("raw_nav_right_wall_score")
+
+    def _reward_gate_raw_nav_front_blocked(self):
+        return self._gate_metric("raw_nav_front_blocked")
+
+    def _reward_gate_raw_nav_open_side(self):
+        return self._gate_metric("raw_nav_open_side")
+
+    def _reward_gate_selected_source(self):
+        return self._gate_metric("selected_source")
+
+    def _reward_gate_selected_available(self):
+        return self._gate_metric("selected_available")
+
+    def _reward_gate_selected_flat(self):
+        return self._gate_metric("selected_flat")
+
+    def _reward_gate_selected_slope(self):
+        return self._gate_metric("selected_slope")
+
+    def _reward_gate_selected_stairs(self):
+        return self._gate_metric("selected_stairs")
+
+    def _reward_gate_selected_wall(self):
+        return self._gate_metric("selected_wall")
+
+    def _reward_gate_selected_maze(self):
+        return self._gate_metric("selected_maze")
+
+    def _reward_gate_selected_terrain_sum(self):
+        return self._gate_metric("selected_terrain_sum")
+
+    def _reward_gate_selected_up(self):
+        return self._gate_metric("selected_up")
+
+    def _reward_gate_selected_down(self):
+        return self._gate_metric("selected_down")
+
+    def _reward_gate_mode_shadow(self):
+        return self._gate_metric("mode_shadow")
+
+    def _reward_gate_mode_control(self):
+        return self._gate_metric("mode_control")
+
+    def _reward_gate_maze_instant(self):
+        return self._gate_metric("maze_instant")
+
+    def _reward_gate_maze_phase(self):
+        return self._gate_metric("maze_phase")
+
+    def _reward_gate_maze_confirm_count(self):
+        return self._gate_metric("maze_confirm_count")
+
+    def _reward_gate_selected_difficulty(self):
+        return self._gate_metric("selected_difficulty")
+
+    def _reward_gate_selected_difficulty_low(self):
+        return self._gate_metric("selected_difficulty_low")
+
+    def _reward_gate_selected_difficulty_mid(self):
+        return self._gate_metric("selected_difficulty_mid")
+
+    def _reward_gate_selected_difficulty_high(self):
+        return self._gate_metric("selected_difficulty_high")
+
+    def _reward_gate_selected_difficulty_sum(self):
+        return self._gate_metric("selected_difficulty_sum")
+
+    def _reward_gate_final_flat(self):
+        return self._gate_metric("final_flat")
+
+    def _reward_gate_final_slope(self):
+        return self._gate_metric("final_slope")
+
+    def _reward_gate_final_stairs(self):
+        return self._gate_metric("final_stairs")
+
+    def _reward_gate_final_maze(self):
+        return self._gate_metric("final_maze")
+
+    def _reward_gate_final_invalid(self):
+        return self._gate_metric("final_invalid")
+
+    def _reward_gate_final_terrain_sum(self):
+        return self._gate_metric("final_terrain_sum")
+
+    def _reward_gate_final_non_maze_sum(self):
+        return self._gate_metric("final_non_maze_sum")
+
+    def _reward_gate_final_active(self):
+        return self._gate_metric("final_active")
+
+    def _reward_gate_final_difficulty(self):
+        return self._gate_metric("final_difficulty")
+
+    def _reward_gate_final_difficulty_low(self):
+        return self._gate_metric("final_difficulty_low")
+
+    def _reward_gate_final_difficulty_mid(self):
+        return self._gate_metric("final_difficulty_mid")
+
+    def _reward_gate_final_difficulty_high(self):
+        return self._gate_metric("final_difficulty_high")
+
+    def _reward_gate_final_difficulty_unknown(self):
+        return self._gate_metric("final_difficulty_unknown")
+
+    def _reward_gate_final_difficulty_sum(self):
+        return self._gate_metric("final_difficulty_sum")
+
+    def _reward_gate_final_source_current(self):
+        return self._gate_metric("final_source_current")
+
+    def _reward_gate_final_source_nan(self):
+        return self._gate_metric("final_source_nan")
+
+    def _reward_gate_final_source_raw(self):
+        return self._gate_metric("final_source_raw")
+
+    def _reward_gate_final_source_sticky(self):
+        return self._gate_metric("final_source_sticky")
+
+    def _reward_gate_final_gate_valid(self):
+        return self._gate_metric("final_gate_valid")
+
+    def _reward_gate_terrain_switch(self):
+        return self._gate_metric("terrain_switch")
+
+    def _reward_gate_difficulty_switch(self):
+        return self._gate_metric("difficulty_switch")
+
+    def _reward_gate_sticky_hold_steps(self):
+        return self._gate_metric("sticky_hold_steps")
+
+    def _reward_gate_sticky_pending_count(self):
+        return self._gate_metric("sticky_pending_count")
+
+    def _reward_gate_sticky_flat_release_count(self):
+        return self._gate_metric("sticky_flat_release_count")
+
+    def _reward_gate_sticky_flat_confident(self):
+        return self._gate_metric("sticky_flat_confident")
+
+    def _reward_gate_sticky_early_flat_release(self):
+        return self._gate_metric("sticky_early_flat_release")
+
+    def _reward_gate_sticky_active_preempt_switch(self):
+        return self._gate_metric("sticky_active_preempt_switch")
+
+    def _reward_gate_stair_up(self):
+        return self._gate_metric("stair_up")
+
+    def _reward_gate_stair_down(self):
+        return self._gate_metric("stair_down")
+
+    def _reward_gate_stair_unknown_dir(self):
+        return self._gate_metric("stair_unknown_dir")
+
+    def _reward_gate_pitch_abs(self):
+        return self._gate_metric("pitch_abs")
+
+    def _reward_gate_updown_confidence(self):
+        return self._gate_metric("updown_confidence")
+
+    def _reward_gate_high_stair_active(self):
+        return self._high_stair_gate()
+
+    def _reward_gate_command_written(self):
+        return self._gate_metric("command_written")
+
+    def _reward_gate_worker_cmd_vx(self):
+        return self._gate_metric("worker_cmd_vx")
+
+    def _reward_gate_target_cmd_vx(self):
+        return self._gate_metric("target_cmd_vx")
+
+    def _reward_gate_policy_cmd_error(self):
+        return command_sync_error(self.env, "policy_cmd_vx")
+
+    def _reward_gate_critic_cmd_error(self):
+        return command_sync_error(self.env, "critic_cmd_vx")
+
+    def _reward_gate_actual_minus_cmd_vx(self):
+        return actual_minus_command(self.env)
+
+    def _reward_gate_track_cache_valid(self):
+        return self._gate_metric("track_cache_valid")
+
+    def _reward_gate_track_cache_unknown(self):
+        return self._gate_metric("track_cache_unknown")
+
+    def _reward_gate_track_cache_low(self):
+        return self._gate_metric("track_cache_low")
+
+    def _reward_gate_track_cache_mid(self):
+        return self._gate_metric("track_cache_mid")
+
+    def _reward_gate_track_cache_high(self):
+        return self._gate_metric("track_cache_high")
+
+    def _reward_gate_track_cache_difficulty(self):
+        return self._gate_metric("track_cache_difficulty")
+
+    def _reward_gate_track_cache_factor(self):
+        return self._gate_metric("track_cache_factor")
+
+    def _reward_gate_track_cache_source_slope(self):
+        return self._gate_metric("track_cache_source_slope")
+
+    def _reward_gate_track_cache_source_stairs(self):
+        return self._gate_metric("track_cache_source_stairs")
+
+    def _reward_gate_maze_using_cached_difficulty(self):
+        return self._gate_metric("maze_using_cached_difficulty")
+
+    def _reward_gate_current_nan_stair_disagree(self):
+        return self._gate_metric("current_nan_stair_disagree")
+
+    def _reward_gate_current_raw_stair_disagree(self):
+        return self._gate_metric("current_raw_stair_disagree")
+
+    def _reward_gate_nan_raw_stair_disagree(self):
+        return self._gate_metric("nan_raw_stair_disagree")
+
+    def _reward_gate_current_nan_slope_disagree(self):
+        return self._gate_metric("current_nan_slope_disagree")
+
+    def _reward_gate_current_raw_slope_disagree(self):
+        return self._gate_metric("current_raw_slope_disagree")
+
+    def _reward_gate_nan_raw_slope_disagree(self):
+        return self._gate_metric("nan_raw_slope_disagree")
+
+    def _reward_gate_current_nan_wall_disagree(self):
+        return self._gate_metric("current_nan_wall_disagree")
+
+    def _reward_gate_current_raw_wall_disagree(self):
+        return self._gate_metric("current_raw_wall_disagree")
+
+    def _reward_gate_nan_raw_wall_disagree(self):
+        return self._gate_metric("nan_raw_wall_disagree")
+
+    def _reward_gate_raw_wall_non_maze(self):
+        return self._gate_metric("raw_wall_non_maze")
+
+    def _high_stair_gate(self):
+        stairs = self._gate_metric("selected_stairs")
+        difficulty = self._gate_metric("selected_difficulty")
+        if stairs.sum() <= 0 and difficulty.sum() <= 0:
+            stairs = self._gate_metric("current_stairs")
+            difficulty = self._gate_metric("current_difficulty")
+        return stairs * (difficulty >= 1.5).float()
+
+    def _high_difficulty_gate(self):
+        slope = self._gate_metric("final_slope")
+        stairs = self._gate_metric("final_stairs")
+        high = self._gate_metric("final_difficulty_high")
+        return torch.clamp(slope + stairs, 0.0, 1.0) * high
+
+    def _reward_slope_time_pressure(self):
+        return self._gate_metric("final_slope")
+
+    def _reward_low_mid_stair_time_pressure(self):
+        stairs = self._gate_metric("final_stairs")
+        low_mid = self._gate_metric("final_difficulty_low") + self._gate_metric("final_difficulty_mid")
+        return stairs * torch.clamp(low_mid, 0.0, 1.0)
+
+    def _reward_gate_slope_time_pressure_active(self):
+        return self._gate_metric("final_slope")
+
+    def _reward_gate_low_mid_stair_time_pressure_active(self):
+        return self._reward_low_mid_stair_time_pressure()
+
+    def _reward_gate_high_difficulty_pressure_active(self):
+        return self._high_difficulty_gate()
+
+    def _reward_high_difficulty_pose_pressure(self):
+        asset = self._get_robot_asset()
+        roll, pitch = self._quat_to_roll_pitch(asset.data.root_quat_w)
+        pose_deviation = torch.abs(roll) + torch.abs(pitch)
+        pose_deviation = torch.nan_to_num(pose_deviation, nan=0.0, posinf=0.0, neginf=0.0)
+        return self._high_difficulty_gate() * pose_deviation
+
+    def _reward_high_difficulty_ang_vel_xy(self):
+        asset = self._get_robot_asset()
+        return self._high_difficulty_gate() * torch.linalg.norm(asset.data.root_ang_vel_b[:, :2], dim=1)
+
+    def _reward_high_difficulty_energy(self):
+        asset = self._get_robot_asset()
+        power = torch.sum(torch.abs(asset.data.applied_torque * asset.data.joint_vel), dim=1)
+        return self._high_difficulty_gate() * power
+
+    def _reward_high_stair_roll_pitch_abs(self):
+        asset = self._get_robot_asset()
+        roll, pitch = self._quat_to_roll_pitch(asset.data.root_quat_w)
+        pose_deviation = torch.abs(roll) + torch.abs(pitch)
+        pose_deviation = torch.nan_to_num(pose_deviation, nan=0.0, posinf=0.0, neginf=0.0)
+        return self._high_stair_gate() * pose_deviation
+
+    def _reward_high_stair_ang_vel_xy(self):
+        asset = self._get_robot_asset()
+        return self._high_stair_gate() * torch.linalg.norm(asset.data.root_ang_vel_b[:, :2], dim=1)
+
+    def _reward_high_stair_energy(self):
+        asset = self._get_robot_asset()
+        power = torch.sum(torch.abs(asset.data.applied_torque * asset.data.joint_vel), dim=1)
+        return self._high_stair_gate() * power
 
     @staticmethod
     def _quat_to_roll_pitch(quat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -589,6 +1070,54 @@ class RewardProcess(RewardProcessBase):
         scan = scanner.data.pos_w[:, 2:3] - scanner.data.ray_hits_w[..., 2]
         return scan.view(self.env.num_envs, 16, 16)
 
+    def _nav_grid(self):
+        scanner = self.env.scene.sensors.get("nav_scanner")
+        if scanner is None:
+            return None
+        try:
+            scan = scanner.data.pos_w[:, 2:3] - scanner.data.ray_hits_w[..., 2]
+            scan = torch.nan_to_num(scan, nan=0.0, posinf=0.0, neginf=0.0)
+            num_rays = scan.shape[-1]
+            if num_rays == 143:
+                return scan.view(self.env.num_envs, 13, 11)
+            side = int(num_rays ** 0.5)
+            if side * side == num_rays:
+                return scan.view(self.env.num_envs, side, side)
+        except Exception:
+            return None
+        return None
+
+    def _nav_or_height_wall_grid(self):
+        nav_grid = self._nav_grid()
+        if nav_grid is not None:
+            return nav_grid
+        return self._height_grid()
+
+    def _goal_distance_gate(self, goal_dist_gate: float = 14.0):
+        if not hasattr(self.env, "goal_positions") or self.env.goal_positions is None:
+            return torch.ones(self.env.num_envs, device=self.env.device)
+        _, goal_dist = self._goal_delta_body()
+        return (goal_dist < goal_dist_gate).float()
+
+    def _front_wall_score(
+        self,
+        grid,
+        obstacle_threshold: float = -0.24,
+        temperature: float = 0.08,
+        front_cols: int = 6,
+        body_y_start: int = 3,
+        body_y_end: int = 10,
+    ):
+        if grid is None:
+            return torch.zeros(self.env.num_envs, device=self.env.device)
+        cols = max(1, min(int(front_cols), grid.shape[2]))
+        y0 = max(0, int(body_y_start))
+        y1 = min(int(body_y_end), grid.shape[1])
+        if y1 <= y0:
+            return torch.zeros(self.env.num_envs, device=self.env.device)
+        sector = grid[:, y0:y1, :cols]
+        return self._wall_score_from_sector(sector, obstacle_threshold, temperature)
+
     def _rough_terrain_gate(
         self,
         body_y_start: int = 4,
@@ -956,6 +1485,27 @@ class RewardProcess(RewardProcessBase):
         projection = torch.sum(robot.data.root_lin_vel_b[:, :2] * goal_dir, dim=1)
         return torch.clamp(-(projection + deadband), min=0.0) * (dist > 0.8).float()
 
+    def _reward_goal_near_wrong_direction_penalty(
+        self,
+        near_dist: float = 2.2,
+        complete_threshold: float = 0.6,
+        speed_deadband: float = 0.25,
+        required_projection: float = 0.25,
+        max_penalty: float = 1.5,
+    ):
+        """Penalize moving fast near the goal without velocity projected toward it."""
+        robot = self._get_robot_asset()
+        _, dist, goal_dir = self._goal_vector_body()
+        body_xy = robot.data.root_lin_vel_b[:, :2]
+        speed = torch.linalg.norm(body_xy, dim=1)
+        projection = torch.sum(body_xy * goal_dir, dim=1)
+
+        near_gate = ((dist < near_dist) & (dist > complete_threshold)).float()
+        speed_gate = torch.clamp(speed - speed_deadband, min=0.0)
+        direction_shortfall = torch.clamp(required_projection - projection, min=0.0)
+        penalty = speed_gate * direction_shortfall
+        return near_gate * torch.clamp(penalty, 0.0, max_penalty)
+
     def _reward_goal_distance(self, scale: float = 8.0):
         """Dense bounded reward that increases as the robot gets closer."""
         _, dist = self._goal_delta_body()
@@ -971,6 +1521,48 @@ class RewardProcess(RewardProcessBase):
         goal_pos = self.env.goal_positions[:, :2]
         dist = torch.norm(goal_pos - robot_pos, dim=1)
         return (dist < threshold).float()
+
+    def _reward_goal_miss_penalty(
+        self,
+        near_dist: float = 1.8,
+        miss_margin: float = 0.18,
+        max_penalty_dist: float = 1.2,
+        complete_threshold: float = 0.6,
+    ):
+        """Penalize moving away after already entering the goal-capture neighborhood."""
+        if not hasattr(self.env, "goal_positions") or self.env.goal_positions is None:
+            return torch.zeros(self.env.num_envs, device=self.env.device)
+
+        _, dist = self._goal_delta_body()
+        best = getattr(self.env, "_goal_miss_best_dist", None)
+        valid = getattr(self.env, "_goal_miss_valid", None)
+        if best is None or best.shape != dist.shape:
+            self.env._goal_miss_best_dist = dist.detach().clone()
+            self.env._goal_miss_valid = torch.ones_like(dist, dtype=torch.bool)
+            return torch.zeros_like(dist)
+        if valid is None or valid.shape != dist.shape:
+            valid = torch.ones_like(dist, dtype=torch.bool)
+
+        reset_mask = torch.zeros_like(valid)
+        try:
+            term_mgr = self.env.termination_manager
+            reset_mask = (term_mgr.terminated | term_mgr.time_outs).bool()
+        except Exception:
+            pass
+
+        prev_best = torch.where(reset_mask | (~valid), dist, best.to(device=dist.device, dtype=dist.dtype))
+        entered_goal_area = prev_best < near_dist
+        complete = dist < complete_threshold
+        miss = torch.clamp(dist - prev_best - miss_margin, min=0.0, max=max_penalty_dist)
+        penalty = miss * entered_goal_area.float() * (~complete).float() * (~reset_mask).float()
+
+        self.env._goal_miss_best_dist = torch.where(
+            reset_mask | complete,
+            dist,
+            torch.minimum(prev_best, dist),
+        ).detach().clone()
+        self.env._goal_miss_valid = (~reset_mask).detach().clone()
+        return penalty
 
     def _reward_wall_proximity(
         self,
@@ -1038,6 +1630,91 @@ class RewardProcess(RewardProcessBase):
             temperature=temperature,
         )
         return wall_intensity * penalty * gate
+
+    def _reward_nav_wall_impact_penalty(
+        self,
+        obstacle_threshold: float = -0.24,
+        front_cols: int = 6,
+        body_y_start: int = 3,
+        body_y_end: int = 10,
+        wall_score_threshold: float = 0.35,
+        temperature: float = 0.08,
+        decel_deadband: float = 0.18,
+        speed_start: float = 0.25,
+        speed_full: float = 1.10,
+        maze_goal_dist_gate: float = 14.0,
+    ):
+        """Penalize wall impact inferred from a sudden forward-speed drop near a wall."""
+        robot = self._get_robot_asset()
+        vx = robot.data.root_lin_vel_b[:, 0]
+        grid = self._nav_or_height_wall_grid()
+        wall_score = self._front_wall_score(
+            grid,
+            obstacle_threshold=obstacle_threshold,
+            temperature=temperature,
+            front_cols=front_cols,
+            body_y_start=body_y_start,
+            body_y_end=body_y_end,
+        )
+
+        prev_vx = getattr(self.env, "_nav_wall_impact_prev_vx", None)
+        if prev_vx is None or prev_vx.shape != vx.shape:
+            self.env._nav_wall_impact_prev_vx = vx.detach().clone()
+            return torch.zeros_like(vx)
+
+        decel = torch.clamp(prev_vx.to(device=vx.device, dtype=vx.dtype) - vx - decel_deadband, min=0.0)
+        speed_scale = torch.clamp(
+            (prev_vx.to(device=vx.device, dtype=vx.dtype) - speed_start)
+            / max(speed_full - speed_start, 1.0e-6),
+            0.0,
+            1.0,
+        )
+        wall_gate = torch.clamp(
+            (wall_score - wall_score_threshold) / max(1.0 - wall_score_threshold, 1.0e-6),
+            0.0,
+            1.0,
+        )
+        maze_gate = self._goal_distance_gate(maze_goal_dist_gate)
+        self.env._nav_wall_impact_prev_vx = vx.detach().clone()
+        return wall_gate * decel * speed_scale * maze_gate
+
+    def _reward_nav_wall_stuck_push_penalty(
+        self,
+        obstacle_threshold: float = -0.24,
+        front_cols: int = 6,
+        body_y_start: int = 3,
+        body_y_end: int = 10,
+        wall_score_threshold: float = 0.42,
+        temperature: float = 0.08,
+        still_speed: float = 0.12,
+        goal_dist_threshold: float = 0.8,
+        min_command: float = 0.05,
+        maze_goal_dist_gate: float = 14.0,
+    ):
+        """Penalize staying nearly still while still commanded to push into a front wall."""
+        robot = self._get_robot_asset()
+        grid = self._nav_or_height_wall_grid()
+        wall_score = self._front_wall_score(
+            grid,
+            obstacle_threshold=obstacle_threshold,
+            temperature=temperature,
+            front_cols=front_cols,
+            body_y_start=body_y_start,
+            body_y_end=body_y_end,
+        )
+        wall_gate = torch.clamp(
+            (wall_score - wall_score_threshold) / max(1.0 - wall_score_threshold, 1.0e-6),
+            0.0,
+            1.0,
+        )
+        body_speed = torch.linalg.norm(robot.data.root_lin_vel_b[:, :2], dim=1)
+        cmd_vx = self._tracking_command("base_velocity")[:, 0]
+        _, goal_dist = self._goal_delta_body()
+        stuck_gate = (body_speed < still_speed).float()
+        push_gate = (cmd_vx > min_command).float()
+        not_done_gate = (goal_dist > goal_dist_threshold).float()
+        maze_gate = self._goal_distance_gate(maze_goal_dist_gate)
+        return wall_gate * stuck_gate * push_gate * not_done_gate * maze_gate
 
     def _reward_wall_stall_penalty(
         self,

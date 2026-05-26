@@ -27,3 +27,8 @@ uploads/
 backups/
 __pycache__/
 .cache/
+
+# 本地系统文件/归档
+.DS_Store
+代码归档/
+docs/秘密武器.md
