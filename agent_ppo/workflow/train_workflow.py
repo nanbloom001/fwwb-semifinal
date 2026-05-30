@@ -10,311 +10,21 @@ Author: Tencent AI Arena Authors
 
 import os
 import time
-from typing import Optional, Tuple
 from agent_ppo.conf.conf import Config
 from agent_ppo.feature.definition import RolloutStorage
-from agent_ppo.feature.terrain_gate import worker_gate_monitor_stats
+from agent_ppo.feature.isaac_env_bridge import (
+    sample_physics_stats,
+    set_env_base_velocity_command,
+)
+from agent_ppo.feature.phase_command_adapter import (
+    apply_track_phase_command,
+    reset_track_phase_command_state,
+)
+from agent_ppo.feature.velocity_curriculum import VelocityCurriculum
 from tools.train_env_conf_validate import check_usr_conf
 from tools.utils import load_reward_keys_from_monitor_config
 import torch
 from collections import deque, defaultdict
-
-
-class VelocityCurriculum:
-    """Performance-based velocity curriculum, mirroring terrain curriculum logic.
-
-    Promotes to next velocity stage when mean reward_track_lin_vel_xy >
-    promote_threshold for promote_count consecutive episode-batch checks.
-    Demotes to previous stage when it falls below demote_threshold for
-    demote_count consecutive checks. Neither counter changes when the metric
-    stays in the neutral zone [demote_threshold, promote_threshold).
-
-    Completely independent of terrain.curriculum 鈥?terrain difficulty is managed
-    separately (num_rows=10, difficulty_range=[0,1.0]). Stage changes call
-    env.reset(usr_conf) to apply new velocity ranges.
-    Policy weights are NOT affected 鈥?only env command-sampling changes.
-
-    Configuration is loaded from usr_conf["velocity_curriculum"] (TOML section
-    [velocity_curriculum]), so all thresholds and stage definitions live in the
-    TOML file rather than being hard-coded here.
-
-    鎬ц兘椹卞姩鐨勯€熷害璇剧▼锛屽鐢ㄥ湴褰㈣绋嬮€昏緫锛堣〃鐜板ソ鍒欏崌绾э紝宸垯闄嶇骇锛夈€?    涓?terrain.curriculum 瀹屽叏鐙珛鈥斺€斿湴褰㈤毦搴︾敱 TOML [terrain] 鑺傜嫭绔嬬鐞?    锛?0 妗ｏ紝瑕嗙洊瀹屾暣 [0,1] 闅惧害甯︼級銆?    鎵€鏈夐槇鍊煎拰闃舵瀹氫箟鍧囦粠 TOML [velocity_curriculum] 鑺傝鍙栥€?    """
-
-    # Default stages used only when usr_conf has no [velocity_curriculum] section.
-    _DEFAULT_STAGES = [
-        {"lin_vel_x": [0.0,  0.5], "lin_vel_y": [-0.3,  0.3], "ang_vel_yaw": [-1.0,  1.0]},
-        {"lin_vel_x": [0.0,  1.0], "lin_vel_y": [-0.5,  0.5], "ang_vel_yaw": [-1.5,  1.5]},
-        {"lin_vel_x": [0.0,  1.5], "lin_vel_y": [-0.8,  0.8], "ang_vel_yaw": [-1.5,  1.5]},
-        {"lin_vel_x": [-0.5, 2.0], "lin_vel_y": [-1.0,  1.0], "ang_vel_yaw": [-1.5,  1.5]},
-    ]
-
-    # ep_info key used as performance signal.  Different framework versions may
-    # expose reward terms with slightly different names, so lookup is tolerant.
-    _TRACKING_KEY = "reward_track_lin_vel_xy"
-    _TRACKING_KEY_CANDIDATES = (
-        "reward_track_lin_vel_xy",
-        "track_lin_vel_xy",
-        "Episode_Reward/reward_track_lin_vel_xy",
-        "Episode_Reward/track_lin_vel_xy",
-    )
-
-    def __init__(self, logger, usr_conf: dict):
-        """Build curriculum from usr_conf["velocity_curriculum"] (TOML section).
-
-        Falls back to _DEFAULT_STAGES / hard-coded thresholds if the section is absent.
-        浠?TOML 鐨?[velocity_curriculum] 鑺傚姞杞介厤缃紱鑺傜己澶辨椂鍥為€€鍒伴粯璁ゅ€笺€?        """
-        self.logger = logger
-        vc_conf = usr_conf.get("velocity_curriculum", {})
-        tracking_reward_conf = usr_conf.get("rewards", {}).get("track_lin_vel_xy", {})
-
-        self._tracking_reward_weight = abs(float(tracking_reward_conf.get("weight", 1.0)))
-        if self._tracking_reward_weight <= 1e-6:
-            logger.warning(
-                "[VelocityCurriculum] track_lin_vel_xy weight is non-positive; "
-                "falling back to 1.0 for curriculum normalization. "
-                "Please check [rewards.track_lin_vel_xy].weight in TOML."
-            )
-            self._tracking_reward_weight = 1.0
-
-        self.promote_threshold: float = self._normalize_threshold(
-            float(vc_conf.get("promote_threshold", 0.64)), "promote_threshold"
-        )
-        self.demote_threshold:  float = self._normalize_threshold(
-            float(vc_conf.get("demote_threshold", 0.32)), "demote_threshold"
-        )
-        self.promote_count:     int   = int(vc_conf.get("promote_count", 5))
-        self.demote_count:      int   = int(vc_conf.get("demote_count",  3))
-
-        raw_stages = vc_conf.get("stages", None)
-        if raw_stages:
-            self.STAGES = [
-                {
-                    "lin_vel_x":   list(s["lin_vel_x"]),
-                    "lin_vel_y":   list(s["lin_vel_y"]),
-                    "ang_vel_yaw": list(s["ang_vel_yaw"]),
-                }
-                for s in raw_stages
-            ]
-        else:
-            self.STAGES = self._DEFAULT_STAGES
-            logger.warning(
-                "[VelocityCurriculum] No [velocity_curriculum.stages] found in usr_conf; "
-                "falling back to hard-coded default stages."
-            )
-
-        command_ranges = usr_conf.get("commands", {}).get("ranges", {})
-        stage0 = self.STAGES[0]
-        if (
-            list(command_ranges.get("lin_vel_x", [])) != stage0["lin_vel_x"]
-            or list(command_ranges.get("lin_vel_y", [])) != stage0["lin_vel_y"]
-            or list(command_ranges.get("ang_vel_yaw", [])) != stage0["ang_vel_yaw"]
-        ):
-            raise ValueError(
-                "Velocity curriculum Stage 0 must exactly match [commands.ranges] in TOML. "
-                f"Got commands.ranges={command_ranges}, stage0={stage0}."
-            )
-
-        self._stage_idx = 0
-        self._promote_streak = 0  # consecutive checks above promote_threshold
-        self._demote_streak = 0   # consecutive checks below demote_threshold
-        self._last_mean_tracking_reward = 0.0
-        self._last_mean_tracking_ratio = 0.0
-        self._tracking_key_resolved = None
-        self._tracking_key_warning_logged = False
-        self._debug_check_count = 0
-        logger.info(
-            f"[VelocityCurriculum] Initialized: {len(self.STAGES)} stages, "
-            f"tracking_weight={self._tracking_reward_weight}, "
-            f"promote_threshold={self.promote_threshold}, demote_threshold={self.demote_threshold}, "
-            f"promote_count={self.promote_count}, demote_count={self.demote_count}"
-        )
-
-    def _normalize_threshold(self, threshold_value: float, field_name: str) -> float:
-        """Normalize legacy absolute thresholds into reward-ratio thresholds.
-
-        Historical configs stored absolute weighted reward thresholds (e.g. 1.6).
-        That makes curriculum behavior drift every time reward weight changes.
-        New configs should store ratios in [0, 1], e.g. 0.55 means 55% of the
-        current track_lin_vel_xy maximum reward.
-        鍘嗗彶閰嶇疆浣跨敤鍔犳潈 reward 鐨勭粷瀵归槇鍊硷紙濡?1.6锛夛紝reward weight 涓€鏀瑰氨浼氭紓銆?        鐜板湪缁熶竴杞负姣斾緥闃堝€硷細[0,1] 鍖洪棿锛?.55 琛ㄧず杈惧埌褰撳墠鏈€澶?tracking reward 鐨?55%銆?        """
-        if threshold_value <= 1.0:
-            return threshold_value
-
-        normalized = threshold_value / self._tracking_reward_weight
-        self.logger.warning(
-            f"[VelocityCurriculum] {field_name}={threshold_value} detected as legacy absolute reward; "
-            f"normalized to ratio {normalized:.3f} using tracking weight {self._tracking_reward_weight:.3f}."
-        )
-        return normalized
-
-    @property
-    def stage(self) -> int:
-        return self._stage_idx
-
-    @property
-    def last_tracking_reward(self) -> float:
-        return self._last_mean_tracking_reward
-
-    @property
-    def last_tracking_ratio(self) -> float:
-        return self._last_mean_tracking_ratio
-
-    def _resolve_tracking_metric(self, ep_info):
-        """Return the tracking metric value and the key used to find it.
-
-        杩斿洖 episode info 涓殑閫熷害杩借釜鎸囨爣鍊硷紝浠ュ強鍛戒腑鐨?key銆?        """
-        if self._tracking_key_resolved and self._tracking_key_resolved in ep_info:
-            return ep_info[self._tracking_key_resolved], self._tracking_key_resolved
-
-        for key in self._TRACKING_KEY_CANDIDATES:
-            if key in ep_info:
-                self._tracking_key_resolved = key
-                return ep_info[key], key
-
-        for key, value in ep_info.items():
-            normalized = str(key).replace("/", "_")
-            if normalized.endswith("track_lin_vel_xy"):
-                self._tracking_key_resolved = key
-                return value, key
-
-        return None, None
-
-    def _mean_tracking_reward(self, ep_infos) -> Tuple[Optional[float], Optional[float]]:
-        """Average reward_track_lin_vel_xy across completed episodes.
-
-        Returns both the raw weighted reward and the normalized ratio.
-        杩斿洖鍔犳潈鍚庣殑鍘熷 tracking reward锛屼互鍙婄浉瀵瑰綋鍓?reward weight 鐨勫綊涓€鍖栨瘮渚嬨€?        """
-        values = []
-        for ep_info in ep_infos:
-            v, key = self._resolve_tracking_metric(ep_info)
-            if key is None:
-                continue
-            values.append(v.float().mean().item() if isinstance(v, torch.Tensor) else float(v))
-        if not values:
-            if ep_infos and not self._tracking_key_warning_logged:
-                sample_keys = list(ep_infos[0].keys())
-                self.logger.warning(
-                    "[VelocityCurriculum] Cannot find tracking metric for velocity curriculum. "
-                    f"Tried keys={self._TRACKING_KEY_CANDIDATES}; "
-                    f"sample episode keys={sample_keys[:40]}"
-                )
-                self._tracking_key_warning_logged = True
-            return None, None
-
-        mean_reward = sum(values) / len(values)
-        mean_ratio = mean_reward / self._tracking_reward_weight
-        return mean_reward, mean_ratio
-
-    def _apply_stage(self, usr_conf, env, obs, critic_obs):
-        """Write current stage ranges into usr_conf and call env.reset.
-        Returns (obs, critic_obs, reset_happened: bool).
-        reset_happened=False on env.reset failure so caller skips stat-tensor zeroing.
-        """
-        cfg = self.STAGES[self._stage_idx]
-        usr_conf["commands"]["ranges"]["lin_vel_x"]   = cfg["lin_vel_x"]
-        usr_conf["commands"]["ranges"]["lin_vel_y"]   = cfg["lin_vel_y"]
-        usr_conf["commands"]["ranges"]["ang_vel_yaw"] = cfg["ang_vel_yaw"]
-        self.logger.info(
-            f"[VelocityCurriculum] 鈫?Stage {self._stage_idx}: "
-            f"lin_vel_x={cfg['lin_vel_x']}, lin_vel_y={cfg['lin_vel_y']}, "
-            f"ang_vel_yaw={cfg['ang_vel_yaw']} 鈥?calling env.reset"
-        )
-        data = env.reset(usr_conf)
-        if data is None:
-            self.logger.error("[VelocityCurriculum] env.reset failed after stage change!")
-            raise RuntimeError("VelocityCurriculum env.reset failed after stage change")
-        new_obs, new_critic_obs = data
-        if new_critic_obs is None:
-            new_critic_obs = new_obs
-        return torch.clone(new_obs), torch.clone(new_critic_obs), True
-
-    def check_and_update(self, ep_infos, usr_conf, env, obs, critic_obs, rollout_stats=None):
-        """Check episode-batch performance and promote / demote stage if warranted.
-
-        Call this BEFORE ep_infos.clear() so the current batch's data is available.
-        Returns (obs, critic_obs, reset_happened: bool).
-        reset_happened=True means env.reset was called; caller should zero
-        cur_reward_sum / cur_episode_length to avoid stale statistics.
-
-        鍦?ep_infos.clear() 鍓嶈皟鐢紝纭繚鑳借鍒板綋鍓嶆壒娆＄殑鏁版嵁銆?        reset_happened=True 鏃惰皟鐢ㄦ柟闇€娓呴浂 cur_reward_sum / cur_episode_length锛?        閬垮厤 env.reset 鍚庢棫绱鍊兼薄鏌?rewbuffer 缁熻銆?        """
-        self._debug_check_count += 1
-        rollout_stats = rollout_stats or {}
-        mean_reward, mean_ratio = self._mean_tracking_reward(ep_infos)
-        metric_source = "episode"
-        if mean_reward is None or mean_ratio is None:
-            rollout_reward = rollout_stats.get("rollout_track_lin_vel_xy_reward")
-            rollout_ratio = rollout_stats.get("rollout_track_lin_vel_xy_ratio")
-            if rollout_reward is not None and rollout_ratio is not None:
-                mean_reward = float(rollout_reward)
-                mean_ratio = float(rollout_ratio)
-                metric_source = "rollout_critic_obs"
-
-        if mean_reward is None or mean_ratio is None:
-            if self._debug_check_count <= 10 or self._debug_check_count % 20 == 0:
-                sample_keys = list(ep_infos[0].keys())[:40] if ep_infos else []
-                self.logger.warning(
-                    "[VelocityCurriculumDebug] no tracking metric available; "
-                    f"check={self._debug_check_count}, ep_infos={len(ep_infos)}, "
-                    f"resolved_key={self._tracking_key_resolved}, sample_keys={sample_keys}, "
-                    f"rollout_stats_keys={list(rollout_stats.keys())}"
-                )
-            return obs, critic_obs, False
-
-        self._last_mean_tracking_reward = mean_reward
-        self._last_mean_tracking_ratio = mean_ratio
-
-        stage_changed = False
-        old_stage = self._stage_idx
-
-        if mean_ratio >= self.promote_threshold:
-            self._promote_streak += 1
-            self._demote_streak = 0
-            if self._promote_streak >= self.promote_count and self._stage_idx < len(self.STAGES) - 1:
-                self._stage_idx += 1
-                self._promote_streak = 0
-                self.logger.warning(
-                    f"[VelocityCurriculum] PROMOTE 鈫?stage {self._stage_idx} "
-                    f"(tracking_ratio={mean_ratio:.3f} >= {self.promote_threshold:.3f}, "
-                    f"tracking_reward={mean_reward:.3f}, "
-                    f"for {self.promote_count} consecutive checks)"
-                )
-                stage_changed = True
-        elif mean_ratio < self.demote_threshold:
-            self._demote_streak += 1
-            self._promote_streak = 0
-            if self._demote_streak >= self.demote_count and self._stage_idx > 0:
-                self._stage_idx -= 1
-                self._demote_streak = 0
-                self.logger.warning(
-                    f"[VelocityCurriculum] DEMOTE 鈫?stage {self._stage_idx} "
-                    f"(tracking_ratio={mean_ratio:.3f} < {self.demote_threshold:.3f}, "
-                    f"tracking_reward={mean_reward:.3f}, "
-                    f"for {self.demote_count} consecutive checks)"
-                )
-                stage_changed = True
-        else:
-            # Neutral zone: slowly decay both streaks to avoid oscillation
-            self._promote_streak = max(0, self._promote_streak - 1)
-            self._demote_streak = max(0, self._demote_streak - 1)
-
-        if self._debug_check_count <= 10 or self._debug_check_count % 20 == 0 or stage_changed:
-            current_cfg = self.STAGES[self._stage_idx]
-            self.logger.warning(
-                "[VelocityCurriculumDebug] "
-                f"check={self._debug_check_count}, ep_infos={len(ep_infos)}, "
-                f"source={metric_source}, key={self._tracking_key_resolved}, "
-                f"reward={mean_reward:.4f}, "
-                f"ratio={mean_ratio:.4f}, stage={old_stage}->{self._stage_idx}, "
-                f"promote={self._promote_streak}/{self.promote_count} "
-                f"@{self.promote_threshold:.3f}, "
-                f"demote={self._demote_streak}/{self.demote_count} "
-                f"@{self.demote_threshold:.3f}, "
-                f"ranges={current_cfg}"
-            )
-
-        if stage_changed:
-            return self._apply_stage(usr_conf, env, obs, critic_obs)
-        return obs, critic_obs, False
 
 
 def _initialize_training_state(env, agent, logger):
@@ -386,11 +96,6 @@ def _initialize_training_state(env, agent, logger):
     # Load reward keys from monitor config
     # 浠?monitor 閰嶇疆鍔犺浇 reward_keys
     reward_keys = load_reward_keys_from_monitor_config()
-    for term_name in usr_conf.get("rewards", {}):
-        if str(term_name).startswith("gate_"):
-            metric_key = f"reward_{term_name}"
-            if metric_key not in reward_keys:
-                reward_keys.append(metric_key)
     logger.info(f"reward_keys list is {reward_keys}")
 
     return (
@@ -442,7 +147,6 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     if "velocity_curriculum" in usr_conf:
         vel_curriculum = VelocityCurriculum(logger, usr_conf)
 
-    nav_controller = None
     nav_conf = usr_conf.get("navigation", {})
     if bool(nav_conf.get("enabled", False)):
         logger.warning(
@@ -470,7 +174,6 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             rewbuffer,
             lenbuffer,
             usr_conf,
-            nav_controller=nav_controller,
         )
 
         episode += 1
@@ -487,8 +190,6 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         if vel_reset:
             cur_reward_sum.zero_()
             cur_episode_length.zero_()
-            if nav_controller is not None:
-                nav_controller.reset(agent.num_envs, agent.device)
 
         # Phase 2: Policy Update
         # 闃舵2锛氱瓥鐣ユ洿鏂?        # framework=True lets the framework directly call back to the business layer,
@@ -591,17 +292,6 @@ def report_monitor_data(ep_infos, reward_keys, agent, monitor, episode, storage_
             if key not in monitor_data:
                 monitor_data[key] = value
         monitor_data["episode_reward"] = sum(monitor_data.get(key, 0) for key in reward_keys)
-
-    logger = getattr(agent, "logger", None)
-    if logger is not None:
-        logger.warning(
-            "[MonitorDebug] reporting curriculum metrics: "
-            f"episode={episode}, stage={monitor_data.get('vel_curriculum_stage')}, "
-            f"tracking_ratio={monitor_data.get('vel_curriculum_tracking_ratio')}, "
-            f"tracking_reward={monitor_data.get('vel_curriculum_tracking_reward')}, "
-            f"has_obs_lin_vel_x_error={'obs_lin_vel_x_error' in monitor_data}, "
-            f"has_obs_base_height={'obs_base_height' in monitor_data}"
-        )
 
     monitor.put_data({os.getpid(): monitor_data})
 
@@ -751,7 +441,6 @@ def _compute_advantages_and_returns(
     critic_obs,
     logger,
     env=None,
-    nav_controller=None,
     usr_conf=None,
 ):
     """
@@ -759,25 +448,16 @@ def _compute_advantages_and_returns(
     璁＄畻浼樺娍鍑芥暟鍜屽洖鎶ャ€?    """
     last_obs = obs
     last_critic_obs = critic_obs
-    if nav_controller is not None and last_obs is not None:
-        last_obs, last_critic_obs, _ = _apply_navigation_command(
-            last_obs,
-            last_critic_obs,
-            env,
-            nav_controller,
-            logger,
-            update_nav_state=False,
-            update_env_command=False,
-        )
     if usr_conf is not None and last_obs is not None:
-        last_obs, last_critic_obs, _ = _apply_rl_phase_command(
+        last_obs, last_critic_obs, _ = apply_track_phase_command(
             last_obs,
             last_critic_obs,
             env,
-            usr_conf,
+            usr_conf.get("rl_navigation", {}),
             logger,
             update_state=False,
             update_env_command=False,
+            set_env_command_fn=set_env_base_velocity_command,
         )
 
     value_obs = last_critic_obs if last_critic_obs is not None else last_obs
@@ -833,1029 +513,7 @@ def _sample_rollout_tracking_stats(storage, usr_conf, logger=None):
         "rollout_track_lin_vel_xy_reward": tracking_reward,
     }
 
-
-def _get_isaac_env(env):
-    """Try to unwrap the KaiwuDRL env wrapper to the underlying Isaac Lab env.
-
-    灏濊瘯瑙ｅ寘 KaiwuDRL 鍖呰灞傦紝鑾峰彇搴曞眰鐨?Isaac Lab 鐜瀵硅薄銆?    Returns the first object that exposes a `command_manager` attribute,
-    or None if none is found.
-    杩斿洖绗竴涓甫鏈?command_manager 灞炴€х殑瀵硅薄锛屾壘涓嶅埌鍒欒繑鍥?None銆?    """
-    # Walk common wrapper chains recursively instead of assuming one fixed depth.
-    seen_ids = set()
-    pending = [env]
-    while pending:
-        candidate = pending.pop(0)
-        if candidate is None or id(candidate) in seen_ids:
-            continue
-        seen_ids.add(id(candidate))
-        if hasattr(candidate, "command_manager") and hasattr(candidate, "scene"):
-            return candidate
-        for attr_name in (
-            "env",
-            "_env",
-            "unwrapped",
-            "wrapped_env",
-            "_wrapped_env",
-            "venv",
-            "isaac_env",
-            "_isaac_env",
-            "sim_env",
-            "_sim_env",
-            "task",
-            "_task",
-        ):
-            pending.append(getattr(candidate, attr_name, None))
-    return None
-
-
-def _has_robot_state(asset) -> bool:
-    data = getattr(asset, "data", None)
-    return (
-        data is not None
-        and hasattr(data, "root_lin_vel_b")
-        and hasattr(data, "root_pos_w")
-        and hasattr(data, "root_ang_vel_b")
-    )
-
-
-def _get_robot_asset_from_env(isaac_env):
-    """Best-effort robot asset lookup across common Isaac Lab scene layouts.
-
-    濂栧姳妯″潡閫氳繃骞冲彴鍩虹被闂存帴鍙?robot asset锛岃繖閲屾棤娉曞鐢ㄩ棴婧?helper锛?    鍥犳鏀逛负閬嶅巻甯歌 scene 瀹瑰櫒甯冨眬鍋氱ǔ鍋ユ煡鎵俱€?    """
-    if isaac_env is None:
-        return None
-
-    scene = getattr(isaac_env, "scene", None)
-    if scene is None:
-        return None
-
-    if hasattr(scene, "__getitem__"):
-        scene_keys = []
-        keys_fn = getattr(scene, "keys", None)
-        if callable(keys_fn):
-            try:
-                scene_keys = list(keys_fn())
-            except Exception:
-                scene_keys = []
-        for key in ("robot", "Robot", "go2", "Go2", "unitree_go2", "UnitreeGo2", *scene_keys):
-            try:
-                asset = scene[key]
-            except Exception:
-                asset = None
-            if _has_robot_state(asset):
-                return asset
-
-    for container_name in (
-        "articulations",
-        "_articulations",
-        "rigid_objects",
-        "_rigid_objects",
-        "entities",
-        "_entities",
-    ):
-        container = getattr(scene, container_name, None)
-        if container is None:
-            continue
-
-        if hasattr(container, "get"):
-            for key in ("robot", "Robot", "go2", "Go2", "unitree_go2", "UnitreeGo2"):
-                asset = container.get(key)
-                if _has_robot_state(asset):
-                    return asset
-
-        values = getattr(container, "values", None)
-        if callable(values):
-            for asset in values():
-                if _has_robot_state(asset):
-                    return asset
-
-    for attr_name in ("robot", "_robot"):
-        asset = getattr(isaac_env, attr_name, None)
-        if _has_robot_state(asset):
-            return asset
-
-    return None
-
-
-def _sample_physics_stats_from_critic_obs(critic_obs):
-    """Fallback physics metrics from critic observation layout.
-
-    critic_obs layout is:
-      [0:3] base_lin_vel, [3:6] base_ang_vel, [9:12] velocity command.
-
-    This path does not provide base height because height is not part of the
-    documented critic observation.  It still keeps velocity and attitude panels
-    alive when the wrapped Isaac env cannot be reached from the workflow.
-    """
-    if critic_obs is None or not hasattr(critic_obs, "shape") or critic_obs.shape[-1] < 12:
-        return {}
-
-    actual_vx = critic_obs[:, 0]
-    actual_vy = critic_obs[:, 1]
-    actual_yaw = critic_obs[:, 5]
-    cmd_vx = critic_obs[:, 9]
-    cmd_vy = critic_obs[:, 10]
-    cmd_yaw = critic_obs[:, 11]
-
-    return {
-        "obs_cmd_vel_x": cmd_vx.mean().item(),
-        "obs_cmd_vel_y": cmd_vy.mean().item(),
-        "obs_cmd_yaw": cmd_yaw.mean().item(),
-        "obs_lin_vel_x_error": torch.abs(actual_vx - cmd_vx).mean().item(),
-        "obs_lin_vel_y_error": torch.abs(actual_vy - cmd_vy).mean().item(),
-        "obs_yaw_error": torch.abs(actual_yaw - cmd_yaw).mean().item(),
-        "obs_actual_vel_x": actual_vx.mean().item(),
-        "obs_actual_vel_y": actual_vy.mean().item(),
-        "obs_actual_yaw": actual_yaw.mean().item(),
-        "obs_ang_vel_xy": torch.norm(critic_obs[:, 3:5], dim=1).mean().item(),
-    }
-
-
-def _sample_physics_stats(env, logger=None, critic_obs=None):
-    """Take a point-in-time snapshot of key physical quantities across all envs.
-
-    鍦ㄦ墍鏈夊苟琛岀幆澧冧笂瀵瑰叧閿墿鐞嗛噺鍋氫竴娆″揩鐓э紙鍧囧€硷級銆?    杩欎簺鎸囨爣涓?reward 鏉冮噸鏃犲叧锛屾槸鍒ゆ柇绛栫暐鐪熷疄鏀舵暃鎯呭喌鐨勭涓€鎵嬩緷鎹細
-      obs_lin_vel_x_error 鈥?鍓嶅悜閫熷害杩借釜璇樊 |cmd_vx - actual_vx| (m/s)
-      obs_lin_vel_y_error 鈥?渚у悜閫熷害杩借釜璇樊 |cmd_vy - actual_vy| (m/s)
-      obs_actual_vel_x    鈥?鏈轰綋鍓嶅悜瀹為檯閫熷害鍧囧€?(m/s)
-      obs_base_height     鈥?鏈鸿韩楂樺害鍧囧€?(m)锛岀洰鏍?0.38 m
-      obs_ang_vel_xy      鈥?pitch/roll 瑙掗€熷害骞呭€煎潎鍊?(rad/s)
-
-    Falls back to critic_obs for metrics that are available there if the
-    underlying Isaac Lab env is not accessible.
-    濡傛灉璁块棶涓嶅埌搴曞眰 Isaac Lab 鐜锛屽垯浠?critic_obs 涓厹搴曡绠楀彲鐢ㄦ寚鏍囥€?    """
-    try:
-        isaac_env = _get_isaac_env(env)
-        if isaac_env is None:
-            if logger is not None and not getattr(env, "_physics_stats_error_logged", False):
-                env._physics_stats_error_logged = True
-                logger.warning(
-                    "[PhysicsStats] Failed to unwrap Isaac Lab env; "
-                    "falling back to critic_obs for partial physics metrics."
-                )
-            return _sample_physics_stats_from_critic_obs(critic_obs)
-
-        cmd = isaac_env.command_manager.get_command("base_velocity")  # (N, 3)
-        asset = _get_robot_asset_from_env(isaac_env)
-        if asset is None:
-            if logger is not None and not getattr(env, "_physics_stats_error_logged", False):
-                env._physics_stats_error_logged = True
-                logger.warning(
-                    "[PhysicsStats] Failed to locate robot asset in scene; "
-                    "falling back to critic_obs for partial physics metrics."
-                )
-            return _sample_physics_stats_from_critic_obs(critic_obs)
-
-        actual_vx = asset.data.root_lin_vel_b[:, 0]
-        actual_vy = asset.data.root_lin_vel_b[:, 1]
-        actual_yaw = asset.data.root_ang_vel_b[:, 2]
-        cmd_vx    = cmd[:, 0]
-        cmd_vy    = cmd[:, 1]
-        cmd_yaw   = cmd[:, 2]
-
-        stats = {
-            "obs_cmd_vel_x":       cmd_vx.mean().item(),
-            "obs_cmd_vel_y":       cmd_vy.mean().item(),
-            "obs_cmd_yaw":         cmd_yaw.mean().item(),
-            "obs_lin_vel_x_error": torch.abs(actual_vx - cmd_vx).mean().item(),
-            "obs_lin_vel_y_error": torch.abs(actual_vy - cmd_vy).mean().item(),
-            "obs_yaw_error":       torch.abs(actual_yaw - cmd_yaw).mean().item(),
-            "obs_actual_vel_x":    actual_vx.mean().item(),
-            "obs_actual_vel_y":    actual_vy.mean().item(),
-            "obs_actual_yaw":      actual_yaw.mean().item(),
-            "obs_base_height":     asset.data.root_pos_w[:, 2].mean().item(),
-            "obs_ang_vel_xy":      torch.norm(
-                asset.data.root_ang_vel_b[:, :2], dim=1).mean().item(),
-        }
-        return stats
-    except Exception as exc:
-        if logger is not None and not getattr(env, "_physics_stats_error_logged", False):
-            env._physics_stats_error_logged = True
-            logger.warning(
-                f"[PhysicsStats] Failed to sample physics metrics from Isaac env: {exc}; "
-                "falling back to critic_obs for partial physics metrics."
-            )
-        return _sample_physics_stats_from_critic_obs(critic_obs)
-
-
-def _set_env_base_velocity_command(env, command, logger=None):
-    """Best-effort override of Isaac Lab's sampled base_velocity command."""
-    isaac_env = _get_isaac_env(env)
-    if isaac_env is None or not hasattr(isaac_env, "command_manager"):
-        if logger is not None and not getattr(env, "_nav_command_error_logged", False):
-            env._nav_command_error_logged = True
-            logger.warning("[Navigation] Cannot unwrap Isaac env; only observation command will be overridden.")
-        return False
-
-    try:
-        current_command = isaac_env.command_manager.get_command("base_velocity")
-        if current_command.shape != command.shape:
-            if logger is not None and not getattr(env, "_nav_command_error_logged", False):
-                env._nav_command_error_logged = True
-                logger.warning(
-                    "[Navigation] base_velocity command shape mismatch: "
-                    f"env={tuple(current_command.shape)}, nav={tuple(command.shape)}."
-                )
-            return False
-        current_command.copy_(command.to(device=current_command.device, dtype=current_command.dtype))
-        return True
-    except Exception as exc:
-        if logger is not None and not getattr(env, "_nav_command_error_logged", False):
-            env._nav_command_error_logged = True
-            logger.warning(f"[Navigation] Failed to override base_velocity command: {exc}")
-        return False
-
-
-def _range_midpoint(range_values, default_value: float) -> float:
-    if not isinstance(range_values, (list, tuple)) or len(range_values) != 2:
-        return default_value
-    return 0.5 * (float(range_values[0]) + float(range_values[1]))
-
-
-def _sample_uniform_range(range_values, shape, device, dtype):
-    low = float(range_values[0])
-    high = float(range_values[1])
-    if high < low:
-        low, high = high, low
-    if abs(high - low) <= 1e-8:
-        return torch.full(shape, low, device=device, dtype=dtype)
-    return low + (high - low) * torch.rand(shape, device=device, dtype=dtype)
-
-
-def _estimate_maze_phase_from_obs(obs, usr_conf):
-    """Best-effort track phase estimate from goal distance in policy obs.
-
-    Track navigation appends goal features at obs[301:304]:
-      local goal x/y normalized by 10m, and goal distance normalized by 20m.
-    The existing reward gate treats the final maze phase as goal_dist < 14m;
-    using the same threshold keeps command scheduling aligned with rewards.
-    """
-    if obs is None or not hasattr(obs, "shape") or obs.shape[-1] < 304:
-        return None
-
-    rl_nav_conf = usr_conf.get("rl_navigation", {})
-    goal_start = int(rl_nav_conf.get("goal_start", 301))
-    if obs.shape[-1] < goal_start + 3:
-        return None
-
-    goal_dist_gate = float(rl_nav_conf.get("phase_maze_goal_dist_gate", 14.0))
-    goal_dist = torch.clamp(obs[:, goal_start + 2], 0.0, 1.0) * 20.0
-    return goal_dist < goal_dist_gate
-
-
-def _height_grid_from_obs(obs, usr_conf):
-    if obs is None or not hasattr(obs, "shape"):
-        return None
-    rl_nav_conf = usr_conf.get("rl_navigation", {})
-    scan_start = int(rl_nav_conf.get("scan_start", 45))
-    scan_size = int(rl_nav_conf.get("scan_size", 256))
-    if obs.shape[-1] < scan_start + scan_size:
-        return None
-    side = int(scan_size ** 0.5)
-    if side * side != scan_size:
-        return None
-    return obs[:, scan_start:scan_start + scan_size].view(obs.shape[0], side, side)
-
-
-def _infer_ray_grid_shape(num_rays: int):
-    if num_rays == 256:
-        return 16, 16
-    if num_rays == 143:
-        return 13, 11
-    side = int(num_rays ** 0.5)
-    if side * side == num_rays:
-        return side, side
-    for rows in range(side + 1, 1, -1):
-        if num_rays % rows == 0:
-            return rows, num_rays // rows
-    return None
-
-
-def _raw_ground_grid_from_sensor(isaac_env, sensor_name: str):
-    scene = getattr(isaac_env, "scene", None)
-    sensors = getattr(scene, "sensors", None)
-    if sensors is None or sensor_name not in sensors:
-        return None
-    sensor = sensors.get(sensor_name)
-    data = getattr(sensor, "data", None)
-    if data is None or not hasattr(data, "pos_w") or not hasattr(data, "ray_hits_w"):
-        return None
-    try:
-        scan = data.pos_w[:, 2:3] - data.ray_hits_w[..., 2]
-        scan = torch.nan_to_num(scan, nan=0.0, posinf=0.0, neginf=0.0)
-        shape = _infer_ray_grid_shape(scan.shape[-1])
-        if shape is None:
-            return None
-        return (-scan).view(scan.shape[0], shape[0], shape[1])
-    except Exception:
-        return None
-
-
-def _terrain_structure_from_ground_grid(grid, usr_conf, prefix: str = "fused_gate"):
-    if grid is None:
-        return None
-    num_envs = grid.shape[0]
-    zeros = torch.zeros(num_envs, device=grid.device, dtype=grid.dtype)
-    false = torch.zeros(num_envs, device=grid.device, dtype=torch.bool)
-    if grid.shape[1] < 2 or grid.shape[2] < 2:
-        return None
-
-    rl_nav_conf = usr_conf.get("rl_navigation", {})
-    body_y_start = max(0, int(rl_nav_conf.get(f"{prefix}_body_y_start", max(0, grid.shape[1] // 2 - 3))))
-    body_y_end = min(int(rl_nav_conf.get(f"{prefix}_body_y_end", min(grid.shape[1], grid.shape[1] // 2 + 3))), grid.shape[1])
-    x_start = max(0, int(rl_nav_conf.get(f"{prefix}_x_start", 0)))
-    x_end = min(int(rl_nav_conf.get(f"{prefix}_x_end", min(grid.shape[2], 10))), grid.shape[2])
-    if body_y_end <= body_y_start or x_end - x_start < 2:
-        return None
-
-    window = grid[:, body_y_start:body_y_end, x_start:x_end]
-    dx = window[:, :, 1:] - window[:, :, :-1]
-    dy = window[:, 1:, :] - window[:, :-1, :]
-    abs_edges = torch.cat(
-        [torch.abs(dx).reshape(num_envs, -1), torch.abs(dy).reshape(num_envs, -1)],
-        dim=1,
-    )
-    if abs_edges.numel() == 0:
-        return None
-
-    edge_sharpness = abs_edges.amax(dim=1)
-    edge_mean = abs_edges.mean(dim=1)
-    slope_smoothness = torch.clamp(edge_mean / (edge_sharpness + 1.0e-6), min=0.0, max=1.0)
-    edge_locality = torch.clamp(1.0 - slope_smoothness, min=0.0, max=1.0)
-
-    near_x_end = min(int(rl_nav_conf.get(f"{prefix}_near_x_end", 4)), grid.shape[2])
-    front_x_start = min(int(rl_nav_conf.get(f"{prefix}_front_x_start", 4)), grid.shape[2] - 1)
-    front_x_end = min(int(rl_nav_conf.get(f"{prefix}_front_x_end", min(grid.shape[2], 10))), grid.shape[2])
-    if near_x_end <= 0 or front_x_end <= front_x_start:
-        step_delta = zeros
-    else:
-        near_z = grid[:, body_y_start:body_y_end, :near_x_end].mean(dim=(1, 2))
-        front_z = grid[:, body_y_start:body_y_end, front_x_start:front_x_end].mean(dim=(1, 2))
-        step_delta = front_z - near_z
-
-    wall_like = edge_sharpness > float(rl_nav_conf.get(f"{prefix}_wall_edge_threshold", 0.30))
-    stair_like = (
-        (edge_sharpness >= float(rl_nav_conf.get(f"{prefix}_stair_edge_threshold", 0.040)))
-        & (edge_locality >= float(rl_nav_conf.get(f"{prefix}_stair_locality_threshold", 0.30)))
-        & (slope_smoothness <= float(rl_nav_conf.get(f"{prefix}_stair_smoothness_max", 0.45)))
-        & (~wall_like)
-    )
-    slope_like = (
-        (edge_mean >= float(rl_nav_conf.get(f"{prefix}_slope_edge_mean_min", 0.006)))
-        & (slope_smoothness >= float(rl_nav_conf.get(f"{prefix}_slope_smoothness_min", 0.60)))
-        & (edge_sharpness <= float(rl_nav_conf.get(f"{prefix}_slope_edge_max", 0.080)))
-        & (~wall_like)
-        & (~stair_like)
-    )
-    direction_margin = float(rl_nav_conf.get(f"{prefix}_direction_margin", 0.02))
-    up_step = stair_like & (step_delta > direction_margin)
-    down_step = stair_like & (step_delta < -direction_margin)
-    difficulty_signal = torch.where(stair_like, edge_sharpness, torch.abs(step_delta))
-    low_thr = float(rl_nav_conf.get(f"{prefix}_difficulty_low_threshold", 0.09))
-    high_thr = float(rl_nav_conf.get(f"{prefix}_difficulty_high_threshold", 0.16))
-    difficulty_band = torch.zeros(num_envs, dtype=torch.long, device=grid.device)
-    terrain_active = stair_like | slope_like
-    difficulty_band = torch.where(
-        terrain_active & (difficulty_signal >= low_thr),
-        torch.ones_like(difficulty_band),
-        difficulty_band,
-    )
-    difficulty_band = torch.where(
-        terrain_active & (difficulty_signal >= high_thr),
-        torch.full_like(difficulty_band, 2),
-        difficulty_band,
-    )
-
-    return {
-        "available": torch.ones_like(edge_sharpness),
-        "wall_like": wall_like,
-        "stair_like": stair_like,
-        "slope_like": slope_like,
-        "up_step": up_step,
-        "down_step": down_step,
-        "edge_sharpness": edge_sharpness,
-        "edge_mean": edge_mean,
-        "edge_locality": edge_locality,
-        "slope_smoothness": slope_smoothness,
-        "step_delta": step_delta,
-        "difficulty_signal": difficulty_signal,
-        "difficulty_band": difficulty_band,
-    }
-
-
-def _raw_fused_terrain_gate(env, obs, usr_conf, logger=None):
-    rl_nav_conf = usr_conf.get("rl_navigation", {})
-    if not bool(rl_nav_conf.get("raw_terrain_gate_enabled", True)):
-        return None
-
-    isaac_env = _get_isaac_env(env)
-    if isaac_env is None:
-        if logger is not None and not getattr(env, "_raw_terrain_gate_unwrap_logged", False):
-            env._raw_terrain_gate_unwrap_logged = True
-            logger.warning("[TerrainGate] raw scanner unavailable: cannot unwrap Isaac env; using obs gate fallback.")
-        return None
-
-    height_grid = _raw_ground_grid_from_sensor(isaac_env, "height_scanner")
-    if height_grid is None:
-        if logger is not None and not getattr(env, "_raw_terrain_gate_sensor_logged", False):
-            env._raw_terrain_gate_sensor_logged = True
-            logger.warning("[TerrainGate] height_scanner unavailable; using obs gate fallback.")
-        return None
-
-    height = _terrain_structure_from_ground_grid(height_grid, usr_conf, "fused_gate")
-    if height is None:
-        return None
-    nav_grid = _raw_ground_grid_from_sensor(isaac_env, "nav_scanner")
-    nav = _terrain_structure_from_ground_grid(nav_grid, usr_conf, "nav_gate") if nav_grid is not None else None
-
-    wall_like = height["wall_like"]
-    if nav is not None:
-        wall_like = wall_like | nav["wall_like"]
-
-    stair_like = height["stair_like"] & (~wall_like)
-    slope_like = height["slope_like"] & (~wall_like) & (~stair_like)
-    up_step = height["up_step"] & stair_like
-    down_step = height["down_step"] & stair_like
-
-    terrain_id = torch.zeros(obs.shape[0], dtype=torch.long, device=obs.device)
-    terrain_id = torch.where(slope_like.to(obs.device), torch.ones_like(terrain_id), terrain_id)
-    terrain_id = torch.where(stair_like.to(obs.device), torch.full_like(terrain_id, 2), terrain_id)
-    terrain_id = torch.where(wall_like.to(obs.device), torch.full_like(terrain_id, 3), terrain_id)
-    difficulty_band = height["difficulty_band"].to(obs.device)
-
-    gate = {
-        "terrain_id": terrain_id,
-        "difficulty_band": difficulty_band,
-        "available": height["available"].to(obs.device),
-        "flat": (terrain_id == 0),
-        "slope": slope_like.to(obs.device),
-        "stairs": stair_like.to(obs.device),
-        "wall": wall_like.to(obs.device),
-        "up": up_step.to(obs.device),
-        "down": down_step.to(obs.device),
-        "edge_sharpness": height["edge_sharpness"].to(obs.device),
-        "edge_mean": height["edge_mean"].to(obs.device),
-        "edge_locality": height["edge_locality"].to(obs.device),
-        "slope_smoothness": height["slope_smoothness"].to(obs.device),
-        "step_delta": height["step_delta"].to(obs.device),
-        "difficulty_signal": height["difficulty_signal"].to(obs.device),
-        "nav_available": torch.full_like(height["available"].to(obs.device), 1.0 if nav is not None else 0.0),
-    }
-
-    try:
-        isaac_env._terrain_gate_state = {
-            "terrain_id": terrain_id.detach(),
-            "difficulty_band": difficulty_band.detach(),
-            "source": "raw_fused",
-        }
-    except Exception:
-        pass
-    return gate
-
-
-def _obs_terrain_gate(obs, usr_conf):
-    terrain_id = _estimate_pre_maze_terrain_from_obs(obs, usr_conf)
-    if terrain_id is None:
-        return None
-    difficulty_band = torch.zeros_like(terrain_id)
-    nan_gate = _nan_stair_gate_from_obs(obs, usr_conf)
-    if nan_gate is not None:
-        stair_signal = nan_gate["edge_sharpness"]
-        slope_signal = torch.abs(nan_gate["step_delta"])
-        difficulty_signal = torch.where(nan_gate["stair_like"], stair_signal, slope_signal)
-        low_thr = float(usr_conf.get("rl_navigation", {}).get("fused_gate_difficulty_low_threshold", 0.09))
-        high_thr = float(usr_conf.get("rl_navigation", {}).get("fused_gate_difficulty_high_threshold", 0.16))
-        active = terrain_id > 0
-        difficulty_band = torch.where(active & (difficulty_signal >= low_thr), torch.ones_like(difficulty_band), difficulty_band)
-        difficulty_band = torch.where(active & (difficulty_signal >= high_thr), torch.full_like(difficulty_band, 2), difficulty_band)
-    return {
-        "terrain_id": terrain_id,
-        "difficulty_band": difficulty_band,
-        "available": torch.ones(terrain_id.shape[0], device=terrain_id.device, dtype=torch.float32),
-        "flat": terrain_id == 0,
-        "slope": terrain_id == 1,
-        "stairs": terrain_id == 2,
-        "wall": torch.zeros_like(terrain_id, dtype=torch.bool),
-        "up": torch.zeros_like(terrain_id, dtype=torch.bool),
-        "down": torch.zeros_like(terrain_id, dtype=torch.bool),
-    }
-
-
-def _select_terrain_gate(obs, env, usr_conf, logger=None):
-    raw_gate = _raw_fused_terrain_gate(env, obs, usr_conf, logger)
-    if raw_gate is not None:
-        raw_gate["source_id"] = torch.ones(obs.shape[0], device=obs.device, dtype=obs.dtype)
-        try:
-            env._terrain_gate_state = {
-                "terrain_id": raw_gate["terrain_id"].detach(),
-                "difficulty_band": raw_gate["difficulty_band"].detach(),
-                "source": "raw_fused",
-            }
-        except Exception:
-            pass
-        return raw_gate
-    obs_gate = _obs_terrain_gate(obs, usr_conf)
-    if obs_gate is not None:
-        obs_gate["source_id"] = torch.zeros(obs.shape[0], device=obs.device, dtype=obs.dtype)
-        try:
-            env._terrain_gate_state = {
-                "terrain_id": obs_gate["terrain_id"].detach(),
-                "difficulty_band": obs_gate["difficulty_band"].detach(),
-                "source": "obs_fallback",
-            }
-        except Exception:
-            pass
-    return obs_gate
-
-
-def _estimate_pre_maze_terrain_from_obs(obs, usr_conf):
-    """Classify non-maze front terrain into flat / slope / stairs from height scan."""
-    grid = _height_grid_from_obs(obs, usr_conf)
-    if grid is None:
-        return None
-
-    rl_nav_conf = usr_conf.get("rl_navigation", {})
-    row_start = max(int(rl_nav_conf.get("terrain_row_start", 3)), 0)
-    row_end = min(int(rl_nav_conf.get("terrain_row_end", 13)), grid.shape[1])
-    front_cols = min(int(rl_nav_conf.get("terrain_front_cols", 8)), grid.shape[2])
-    if row_end <= row_start or front_cols <= 1:
-        return None
-
-    sector = grid[:, row_start:row_end, :front_cols]
-    if sector.shape[1] == 0 or sector.shape[2] <= 1:
-        return None
-
-    lateral_std = sector.std(dim=1, unbiased=False).mean(dim=1)
-    dx = sector[:, :, 1:] - sector[:, :, :-1]
-    abs_dx = dx.abs()
-    if abs_dx.numel() == 0:
-        return None
-
-    q = float(rl_nav_conf.get("terrain_step_quantile", 0.85))
-    q = min(max(q, 0.0), 1.0)
-    step_strength = torch.quantile(abs_dx.flatten(1), q, dim=1)
-    sign_consistency = dx.mean(dim=(1, 2)).abs() / (abs_dx.mean(dim=(1, 2)) + 1e-6)
-    if dx.shape[2] > 1:
-        second_diff = (dx[:, :, 1:] - dx[:, :, :-1]).abs().mean(dim=(1, 2))
-    else:
-        second_diff = torch.zeros(obs.shape[0], device=obs.device, dtype=obs.dtype)
-
-    is_uniform = lateral_std < float(rl_nav_conf.get("terrain_lateral_std_threshold", 0.18))
-    not_wall = sector.amin(dim=(1, 2)) > float(rl_nav_conf.get("terrain_wall_height_threshold", -1.05))
-    terrain_like = is_uniform & not_wall & (
-        step_strength > float(rl_nav_conf.get("terrain_slope_delta_threshold", 0.035))
-    )
-    stair_like = terrain_like & (
-        (step_strength > float(rl_nav_conf.get("terrain_stair_delta_threshold", 0.10)))
-        | (second_diff > float(rl_nav_conf.get("terrain_stair_second_diff_threshold", 0.055)))
-    )
-    slope_like = terrain_like & ~stair_like & (
-        sign_consistency > float(rl_nav_conf.get("terrain_slope_sign_consistency_threshold", 0.55))
-    )
-
-    terrain_id = torch.zeros(obs.shape[0], dtype=torch.long, device=obs.device)
-    terrain_id = torch.where(slope_like, torch.ones_like(terrain_id), terrain_id)
-    terrain_id = torch.where(stair_like, torch.full_like(terrain_id, 2), terrain_id)
-    return terrain_id
-
-
-def _nan_stair_gate_from_obs(obs, usr_conf):
-    """Observation-side copy of nan's stair/slope structure gate for monitoring."""
-    grid = _height_grid_from_obs(obs, usr_conf)
-    if grid is None:
-        return None
-
-    grid = torch.nan_to_num(-grid, nan=0.0, posinf=0.0, neginf=0.0)
-    num_envs = grid.shape[0]
-    zeros = torch.zeros(num_envs, device=grid.device, dtype=grid.dtype)
-    false = torch.zeros(num_envs, device=grid.device, dtype=torch.bool)
-
-    rl_nav_conf = usr_conf.get("rl_navigation", {})
-    body_y_start = max(0, int(rl_nav_conf.get("nan_gate_body_y_start", 5)))
-    body_y_end = min(int(rl_nav_conf.get("nan_gate_body_y_end", 11)), grid.shape[1])
-    x_end = min(int(rl_nav_conf.get("nan_gate_x_end", 10)), grid.shape[2])
-    if body_y_end <= body_y_start or x_end < 2:
-        return {
-            "available": zeros,
-            "stair_like": false,
-            "slope_like": false,
-            "wall_like": false,
-            "up_step": false,
-            "down_step": false,
-            "edge_sharpness": zeros,
-            "edge_locality": zeros,
-            "slope_smoothness": zeros,
-            "step_delta": zeros,
-        }
-
-    window = grid[:, body_y_start:body_y_end, :x_end]
-    if window.shape[1] < 2 or window.shape[2] < 2:
-        return {
-            "available": zeros,
-            "stair_like": false,
-            "slope_like": false,
-            "wall_like": false,
-            "up_step": false,
-            "down_step": false,
-            "edge_sharpness": zeros,
-            "edge_locality": zeros,
-            "slope_smoothness": zeros,
-            "step_delta": zeros,
-        }
-
-    dx = window[:, :, 1:] - window[:, :, :-1]
-    dy = window[:, 1:, :] - window[:, :-1, :]
-    abs_edges = torch.cat(
-        [torch.abs(dx).reshape(num_envs, -1), torch.abs(dy).reshape(num_envs, -1)],
-        dim=1,
-    )
-    edge_sharpness = abs_edges.amax(dim=1)
-    edge_mean = abs_edges.mean(dim=1)
-    slope_smoothness = torch.clamp(edge_mean / (edge_sharpness + 1.0e-6), min=0.0, max=1.0)
-    edge_locality = torch.clamp(1.0 - slope_smoothness, min=0.0, max=1.0)
-
-    wall_like = edge_sharpness > float(rl_nav_conf.get("nan_gate_wall_edge_threshold", 0.30))
-    stair_like = (
-        (edge_sharpness >= float(rl_nav_conf.get("nan_gate_stair_edge_threshold", 0.040)))
-        & (edge_locality >= float(rl_nav_conf.get("nan_gate_stair_locality_threshold", 0.30)))
-        & (slope_smoothness <= float(rl_nav_conf.get("nan_gate_stair_smoothness_max", 0.45)))
-        & (~wall_like)
-    )
-    slope_like = (
-        (edge_mean >= float(rl_nav_conf.get("nan_gate_slope_edge_mean_min", 0.006)))
-        & (slope_smoothness >= float(rl_nav_conf.get("nan_gate_slope_smoothness_min", 0.60)))
-        & (edge_sharpness <= float(rl_nav_conf.get("nan_gate_slope_edge_max", 0.070)))
-        & (~wall_like)
-    )
-
-    near_x_end = min(int(rl_nav_conf.get("nan_gate_near_x_end", 4)), grid.shape[2])
-    front_x_start = min(int(rl_nav_conf.get("nan_gate_front_x_start", 4)), grid.shape[2] - 1)
-    front_x_end = min(int(rl_nav_conf.get("nan_gate_front_x_end", 10)), grid.shape[2])
-    if near_x_end <= 0 or front_x_end <= front_x_start:
-        step_delta = zeros
-    else:
-        near_z = grid[:, body_y_start:body_y_end, :near_x_end].mean(dim=(1, 2))
-        front_z = grid[:, body_y_start:body_y_end, front_x_start:front_x_end].mean(dim=(1, 2))
-        step_delta = front_z - near_z
-    direction_margin = float(rl_nav_conf.get("nan_gate_direction_margin", 0.02))
-    up_step = stair_like & (step_delta > direction_margin)
-    down_step = stair_like & (step_delta < -direction_margin)
-
-    return {
-        "available": torch.ones_like(edge_sharpness),
-        "stair_like": stair_like,
-        "slope_like": slope_like,
-        "wall_like": wall_like,
-        "up_step": up_step,
-        "down_step": down_step,
-        "edge_sharpness": edge_sharpness,
-        "edge_locality": edge_locality,
-        "slope_smoothness": slope_smoothness,
-        "step_delta": step_delta,
-    }
-
-
-def _maze_wall_anticipation_from_obs(obs, usr_conf):
-    grid = _height_grid_from_obs(obs, usr_conf)
-    if grid is None:
-        return None, None
-
-    rl_nav_conf = usr_conf.get("rl_navigation", {})
-    obstacle_threshold = float(rl_nav_conf.get("maze_anticipate_obstacle_threshold", -0.72))
-    temperature = max(float(rl_nav_conf.get("maze_anticipate_temperature", 0.18)), 1e-6)
-    front_cols = max(1, min(int(rl_nav_conf.get("maze_anticipate_front_cols", 8)), grid.shape[2]))
-    body_y_start = max(0, int(rl_nav_conf.get("maze_anticipate_body_y_start", 3)))
-    body_y_end = min(int(rl_nav_conf.get("maze_anticipate_body_y_end", 13)), grid.shape[1])
-    side_width = max(1, min(int(rl_nav_conf.get("maze_anticipate_side_width", 4)), grid.shape[1] // 2))
-    if body_y_end <= body_y_start:
-        return None, None
-
-    wall_prob = torch.sigmoid((obstacle_threshold - grid[:, :, :front_cols]) / temperature)
-    center_wall = wall_prob[:, body_y_start:body_y_end, :].mean(dim=(1, 2))
-    left_open = 1.0 - wall_prob[:, :side_width, :].mean(dim=(1, 2))
-    right_open = 1.0 - wall_prob[:, -side_width:, :].mean(dim=(1, 2))
-    open_delta = right_open - left_open
-    turn_sign = torch.sign(open_delta)
-    goal_start = int(rl_nav_conf.get("goal_start", 301))
-    if obs.shape[-1] > goal_start + 1:
-        goal_turn = torch.sign(obs[:, goal_start + 1])
-        turn_sign = torch.where(torch.abs(open_delta) > 0.06, turn_sign, goal_turn)
-
-    wall_start = float(rl_nav_conf.get("maze_anticipate_wall_start", 0.20))
-    wall_full = float(rl_nav_conf.get("maze_anticipate_wall_full", 0.72))
-    wall_gate = torch.clamp((center_wall - wall_start) / max(wall_full - wall_start, 1e-6), 0.0, 1.0)
-    return wall_gate, turn_sign
-
-
-def _phase_command_midpoint(obs, maze_phase, usr_conf, dtype):
-    rl_nav_conf = usr_conf.get("rl_navigation", {})
-    fallback_vx = float(rl_nav_conf.get("fallback_lin_vel_x", 0.90))
-    slope_range = rl_nav_conf.get("slope_lin_vel_x", [fallback_vx, fallback_vx])
-    stairs_range = rl_nav_conf.get("stairs_lin_vel_x", [fallback_vx, fallback_vx])
-    maze_range = rl_nav_conf.get("maze_lin_vel_x", [0.45, 0.65])
-    terrain_phase_speed_enabled = bool(rl_nav_conf.get("terrain_phase_speed_enabled", False))
-    slope_vx = _range_midpoint(slope_range, fallback_vx)
-    stairs_vx = _range_midpoint(stairs_range, fallback_vx)
-    maze_vx = _range_midpoint(maze_range, 0.55)
-    command = torch.zeros(maze_phase.shape[0], 3, device=maze_phase.device, dtype=dtype)
-    pre_command = torch.full_like(command[:, 0], fallback_vx)
-    if terrain_phase_speed_enabled and obs is not None:
-        terrain_id = _estimate_pre_maze_terrain_from_obs(obs, usr_conf)
-        if terrain_id is not None:
-            pre_command = torch.where(
-                terrain_id == 1,
-                torch.full_like(pre_command, slope_vx),
-                pre_command,
-            )
-            pre_command = torch.where(
-                terrain_id == 2,
-                torch.full_like(pre_command, stairs_vx),
-                pre_command,
-            )
-    maze_command = torch.full_like(command[:, 0], maze_vx)
-    wall_gate, _ = _maze_wall_anticipation_from_obs(obs, usr_conf)
-    if wall_gate is not None:
-        min_scale = float(rl_nav_conf.get("maze_anticipate_min_speed_scale", 1.0))
-        speed_scale = 1.0 - torch.clamp(wall_gate, 0.0, 1.0) * (1.0 - min_scale)
-        maze_command = maze_command * speed_scale
-    command[:, 0] = torch.where(maze_phase, maze_command, pre_command)
-    return command
-
-
-def _get_phase_command_state(env, num_envs, device, dtype):
-    state = getattr(env, "_rl_phase_command_state", None)
-    if (
-        state is None
-        or state["command"].shape[0] != num_envs
-        or state["command"].device != device
-        or state["command"].dtype != dtype
-    ):
-        state = {
-            "command": torch.zeros(num_envs, 3, device=device, dtype=dtype),
-            "timer": torch.zeros(num_envs, dtype=torch.long, device=device),
-            "maze_phase": torch.zeros(num_envs, dtype=torch.bool, device=device),
-            "terrain_id": torch.zeros(num_envs, dtype=torch.long, device=device),
-            "difficulty_band": torch.zeros(num_envs, dtype=torch.long, device=device),
-        }
-        setattr(env, "_rl_phase_command_state", state)
-    return state
-
-
-def _reset_phase_command_state(env, dones):
-    state = getattr(env, "_rl_phase_command_state", None)
-    if state is None or dones is None:
-        return
-    done_mask = dones.bool().view(-1)
-    if done_mask.any() and state["timer"].shape[0] == done_mask.shape[0]:
-        state["timer"][done_mask] = 0
-        state["command"][done_mask] = 0.0
-        state["maze_phase"][done_mask] = False
-        if "terrain_id" in state:
-            state["terrain_id"][done_mask] = 0
-        if "difficulty_band" in state:
-            state["difficulty_band"][done_mask] = 0
-
-
-def _apply_rl_phase_command(
-    obs,
-    critic_obs,
-    env,
-    usr_conf,
-    logger=None,
-    update_state=True,
-    update_env_command=True,
-):
-    """Override the locomotion anchor speed before/after the maze phase.
-
-    This is intentionally separate from the rule-based navigation controller:
-    it changes only the velocity command observation/reward anchor while the
-    PPO policy still controls all joints directly.
-    """
-    rl_nav_conf = usr_conf.get("rl_navigation", {})
-    if not bool(rl_nav_conf.get("phase_command_enabled", False)):
-        return obs, critic_obs, {}
-    if bool(rl_nav_conf.get("worker_phase_command_enabled", False)):
-        return obs, critic_obs, worker_gate_monitor_stats(env)
-
-    maze_phase = _estimate_maze_phase_from_obs(obs, usr_conf)
-    if maze_phase is None:
-        return obs, critic_obs, {}
-
-    state = _get_phase_command_state(env, obs.shape[0], obs.device, obs.dtype)
-    resample_steps = max(int(rl_nav_conf.get("phase_command_resample_steps", 96)), 1)
-    fallback_vx = float(rl_nav_conf.get("fallback_lin_vel_x", 0.90))
-    slope_range = rl_nav_conf.get("slope_lin_vel_x", [fallback_vx, fallback_vx])
-    stairs_range = rl_nav_conf.get("stairs_lin_vel_x", [fallback_vx, fallback_vx])
-    maze_range = rl_nav_conf.get("maze_lin_vel_x", [0.45, 0.65])
-    terrain_phase_speed_enabled = bool(rl_nav_conf.get("terrain_phase_speed_enabled", False))
-    terrain_gate = _select_terrain_gate(obs, env, usr_conf, logger)
-    if terrain_gate is None:
-        terrain_id = torch.zeros(obs.shape[0], dtype=torch.long, device=obs.device)
-        difficulty_band = torch.zeros_like(terrain_id)
-    else:
-        terrain_id = terrain_gate["terrain_id"]
-        difficulty_band = terrain_gate["difficulty_band"]
-
-    command = state["command"]
-    if update_state:
-        timer = torch.clamp(state["timer"] - 1, min=0)
-        wall_gate, turn_sign = _maze_wall_anticipation_from_obs(obs, usr_conf)
-        wall_active = torch.zeros(obs.shape[0], dtype=torch.bool, device=obs.device)
-        if wall_gate is not None:
-            wall_active = maze_phase & (wall_gate > 0.05)
-        phase_changed = maze_phase != state["maze_phase"]
-        difficulty_changed = difficulty_band != state.get("difficulty_band", torch.zeros_like(difficulty_band))
-        terrain_changed = terrain_phase_speed_enabled & (~maze_phase) & (
-            (terrain_id != state["terrain_id"]) | difficulty_changed
-        )
-        yaw_cleanup = (~wall_active) & (torch.abs(command[:, 2]) > 1e-4)
-        needs_sample = (timer <= 0) | phase_changed | terrain_changed | (command[:, 0] <= 0.0)
-
-        if needs_sample.any():
-            sampled_pre = torch.full((obs.shape[0],), fallback_vx, device=obs.device, dtype=obs.dtype)
-            sampled_slope = _sample_uniform_range(slope_range, (obs.shape[0],), obs.device, obs.dtype)
-            sampled_stairs = _sample_uniform_range(stairs_range, (obs.shape[0],), obs.device, obs.dtype)
-            sampled_maze = _sample_uniform_range(maze_range, (obs.shape[0],), obs.device, obs.dtype)
-            sampled_non_maze = sampled_pre
-            if terrain_phase_speed_enabled:
-                sampled_non_maze = torch.where(terrain_id == 1, sampled_slope, sampled_non_maze)
-                sampled_non_maze = torch.where(terrain_id == 2, sampled_stairs, sampled_non_maze)
-                sampled_non_maze = torch.where(terrain_id == 3, sampled_stairs, sampled_non_maze)
-            if wall_gate is not None:
-                min_scale = float(rl_nav_conf.get("maze_anticipate_min_speed_scale", 1.0))
-                speed_scale = 1.0 - torch.clamp(wall_gate, 0.0, 1.0) * (1.0 - min_scale)
-                sampled_maze = sampled_maze * speed_scale
-            sampled_vx = torch.where(maze_phase, sampled_maze, sampled_non_maze)
-            command = command.clone()
-            command[needs_sample, 0] = sampled_vx[needs_sample]
-            command[needs_sample, 1] = 0.0
-            command[needs_sample, 2] = 0.0
-            state["command"] = command
-
-        if wall_active.any() or yaw_cleanup.any():
-            command = command.clone()
-            if wall_gate is not None and turn_sign is not None and wall_active.any():
-                max_yaw = float(rl_nav_conf.get("maze_anticipate_yaw_cmd", 0.85))
-                yaw_cmd = torch.clamp(wall_gate * turn_sign * max_yaw, -max_yaw, max_yaw)
-                command[wall_active, 2] = yaw_cmd[wall_active]
-            command[yaw_cleanup, 2] = 0.0
-            state["command"] = command
-
-        state["timer"] = torch.where(
-            needs_sample,
-            torch.full_like(timer, resample_steps),
-            timer,
-        )
-        state["maze_phase"] = maze_phase.detach().clone()
-        state["terrain_id"] = terrain_id.detach().clone()
-        state["difficulty_band"] = difficulty_band.detach().clone()
-    else:
-        command = command.clone()
-        phase_changed = maze_phase != state["maze_phase"]
-        invalid = command[:, 0] <= 0.0
-        fallback = _phase_command_midpoint(obs, maze_phase, usr_conf, obs.dtype)
-        command[phase_changed | invalid] = fallback[phase_changed | invalid]
-
-    obs = obs.clone()
-    if obs.shape[-1] >= 9:
-        obs[:, 6:9] = command
-
-    if critic_obs is not None:
-        critic_obs = critic_obs.clone()
-        if critic_obs.shape[-1] >= 12:
-            critic_obs[:, 9:12] = command.to(device=critic_obs.device, dtype=critic_obs.dtype)
-
-    if update_env_command:
-        _set_env_base_velocity_command(env, command, logger)
-
-    non_maze = ~maze_phase
-    non_maze_count = non_maze.float().sum().clamp_min(1.0)
-    phase_stats = {
-        "rl_phase_command_vx": command[:, 0].detach(),
-        "rl_phase_maze_ratio": maze_phase.float().detach(),
-        "gate_source_raw_ratio": (
-            terrain_gate.get("source_id", torch.zeros(obs.shape[0], device=obs.device, dtype=obs.dtype))
-            if terrain_gate is not None
-            else torch.zeros(obs.shape[0], device=obs.device, dtype=obs.dtype)
-        ).detach(),
-        "gate_current_flat_ratio": (terrain_id == 0).float().detach(),
-        "rl_phase_slope_ratio": (terrain_id == 1).float().detach(),
-        "rl_phase_stairs_ratio": (terrain_id == 2).float().detach(),
-        "gate_fused_wall_ratio": (terrain_id == 3).float().detach(),
-        "gate_difficulty_low_ratio": (difficulty_band == 0).float().detach(),
-        "gate_difficulty_mid_ratio": (difficulty_band == 1).float().detach(),
-        "gate_difficulty_high_ratio": (difficulty_band >= 2).float().detach(),
-        "gate_difficulty_mean": difficulty_band.float().detach(),
-        "gate_pre_maze_current_flat_ratio": (
-            ((terrain_id == 0) & non_maze).float().sum() / non_maze_count
-        ).detach(),
-        "gate_pre_maze_current_slope_ratio": (
-            ((terrain_id == 1) & non_maze).float().sum() / non_maze_count
-        ).detach(),
-        "gate_pre_maze_current_stairs_ratio": (
-            ((terrain_id == 2) & non_maze).float().sum() / non_maze_count
-        ).detach(),
-        "gate_pre_maze_wall_ratio": (
-            ((terrain_id == 3) & non_maze).float().sum() / non_maze_count
-        ).detach(),
-        "gate_pre_maze_difficulty_low_ratio": (
-            ((difficulty_band == 0) & non_maze).float().sum() / non_maze_count
-        ).detach(),
-        "gate_pre_maze_difficulty_mid_ratio": (
-            ((difficulty_band == 1) & non_maze).float().sum() / non_maze_count
-        ).detach(),
-        "gate_pre_maze_difficulty_high_ratio": (
-            ((difficulty_band >= 2) & non_maze).float().sum() / non_maze_count
-        ).detach(),
-    }
-    if terrain_gate is not None:
-        for src_key, metric_key in (
-            ("available", "gate_fused_available_ratio"),
-            ("up", "gate_fused_up_ratio"),
-            ("down", "gate_fused_down_ratio"),
-            ("edge_sharpness", "gate_fused_edge_sharpness"),
-            ("edge_mean", "gate_fused_edge_mean"),
-            ("edge_locality", "gate_fused_edge_locality"),
-            ("slope_smoothness", "gate_fused_slope_smoothness"),
-            ("step_delta", "gate_fused_step_delta"),
-            ("difficulty_signal", "gate_fused_difficulty_signal"),
-            ("nav_available", "gate_nav_available_ratio"),
-        ):
-            if src_key in terrain_gate:
-                value = terrain_gate[src_key]
-                phase_stats[metric_key] = value.float().detach()
-    nan_gate = _nan_stair_gate_from_obs(obs, usr_conf)
-    if nan_gate is not None:
-        current_stair = terrain_id == 2
-        phase_stats.update({
-            "gate_nan_available_ratio": nan_gate["available"].detach(),
-            "gate_nan_stair_ratio": nan_gate["stair_like"].float().detach(),
-            "gate_nan_slope_ratio": nan_gate["slope_like"].float().detach(),
-            "gate_nan_wall_ratio": nan_gate["wall_like"].float().detach(),
-            "gate_nan_up_ratio": nan_gate["up_step"].float().detach(),
-            "gate_nan_down_ratio": nan_gate["down_step"].float().detach(),
-            "gate_nan_edge_sharpness": nan_gate["edge_sharpness"].detach(),
-            "gate_nan_edge_locality": nan_gate["edge_locality"].detach(),
-            "gate_nan_slope_smoothness": nan_gate["slope_smoothness"].detach(),
-            "gate_nan_step_delta": nan_gate["step_delta"].detach(),
-            "gate_current_nan_stair_disagree_ratio": (
-                current_stair != nan_gate["stair_like"]
-            ).float().detach(),
-            "gate_pre_maze_nan_stair_ratio": (
-                (nan_gate["stair_like"] & non_maze).float().sum() / non_maze_count
-            ).detach(),
-            "gate_pre_maze_nan_slope_ratio": (
-                (nan_gate["slope_like"] & non_maze).float().sum() / non_maze_count
-            ).detach(),
-            "gate_pre_maze_nan_wall_ratio": (
-                (nan_gate["wall_like"] & non_maze).float().sum() / non_maze_count
-            ).detach(),
-            "gate_pre_maze_nan_up_ratio": (
-                (nan_gate["up_step"] & non_maze).float().sum() / non_maze_count
-            ).detach(),
-            "gate_pre_maze_nan_down_ratio": (
-                (nan_gate["down_step"] & non_maze).float().sum() / non_maze_count
-            ).detach(),
-            "gate_pre_maze_current_nan_stair_disagree_ratio": (
-                ((current_stair != nan_gate["stair_like"]) & non_maze).float().sum()
-                / non_maze_count
-            ).detach(),
-        })
-
-    return obs, critic_obs, phase_stats
-
-
-def _apply_navigation_command(
-    obs,
-    critic_obs,
-    env,
-    nav_controller,
-    logger=None,
-    update_nav_state=True,
-    update_env_command=True,
-):
-    """Patch policy/critic observations and env command with navigation output."""
-    if nav_controller is None:
-        return obs, critic_obs, {}
-
-    command, nav_stats = nav_controller.compute(obs, update_state=update_nav_state)
-    command = command.to(device=obs.device, dtype=obs.dtype)
-
-    obs = obs.clone()
-    if obs.shape[-1] >= 9:
-        obs[:, 6:9] = command
-
-    if critic_obs is not None:
-        critic_obs = critic_obs.clone()
-        if critic_obs.shape[-1] >= 12:
-            critic_obs[:, 9:12] = command.to(device=critic_obs.device, dtype=critic_obs.dtype)
-
-    if update_env_command:
-        _set_env_base_velocity_command(env, command, logger)
-    return obs, critic_obs, nav_stats
-
-
-def _compute_timeout_bootstrap_values(obs, critic_obs, env, nav_controller, agent, infos, logger=None, usr_conf=None):
+def _compute_timeout_bootstrap_values(obs, critic_obs, env, agent, infos, logger=None, usr_conf=None):
     """Evaluate V(s_{t+1}) for timeout bootstrapping using rollout-consistent obs."""
     if "time_outs" not in infos:
         return None
@@ -1870,25 +528,16 @@ def _compute_timeout_bootstrap_values(obs, critic_obs, env, nav_controller, agen
 
     value_obs = obs
     value_critic_obs = critic_obs
-    if nav_controller is not None:
-        value_obs, value_critic_obs, _ = _apply_navigation_command(
-            obs,
-            critic_obs,
-            env,
-            nav_controller,
-            logger,
-            update_nav_state=False,
-            update_env_command=False,
-        )
     if usr_conf is not None:
-        value_obs, value_critic_obs, _ = _apply_rl_phase_command(
+        value_obs, value_critic_obs, _ = apply_track_phase_command(
             value_obs,
             value_critic_obs,
             env,
-            usr_conf,
+            usr_conf.get("rl_navigation", {}),
             logger,
             update_state=False,
             update_env_command=False,
+            set_env_command_fn=set_env_base_velocity_command,
         )
 
     value_input = value_critic_obs if value_critic_obs is not None else value_obs
@@ -1917,7 +566,6 @@ def run_episodes_(
     rewbuffer,
     lenbuffer,
     usr_conf,
-    nav_controller=None,
 ):
     """
     Run episodes to collect trajectory data.
@@ -1937,18 +585,14 @@ def run_episodes_(
     # 绛栫暐鎵ц寰幆
     with torch.inference_mode():
         for i in range(agent.num_steps_per_env):
-            policy_obs, policy_critic_obs, nav_stats = _apply_navigation_command(
-                obs, critic_obs, env, nav_controller, logger
-            )
-            policy_obs, policy_critic_obs, phase_stats = _apply_rl_phase_command(
-                policy_obs,
-                policy_critic_obs,
+            policy_obs, policy_critic_obs, phase_stats = apply_track_phase_command(
+                obs,
+                critic_obs,
                 env,
-                usr_conf,
+                usr_conf.get("rl_navigation", {}),
                 logger,
+                set_env_command_fn=set_env_base_velocity_command,
             )
-            for key, value in nav_stats.items():
-                nav_metric_values[key].append(value.float().mean())
             for key, value in phase_stats.items():
                 nav_metric_values[key].append(value.float().mean())
 
@@ -2006,15 +650,12 @@ def run_episodes_(
                 obs,
                 critic_obs,
                 env,
-                nav_controller,
                 agent,
                 infos,
                 logger,
                 usr_conf=usr_conf,
             )
-            if nav_controller is not None:
-                nav_controller.reset(dones=dones)
-            _reset_phase_command_state(env, dones)
+            reset_track_phase_command_state(env, dones)
 
             # Update episode statistics (always, regardless of decimation)
             _update_episode_statistics(
@@ -2058,7 +699,6 @@ def run_episodes_(
             critic_obs,
             logger,
             env=env,
-            nav_controller=nav_controller,
             usr_conf=usr_conf,
         )
         storage_stats.update(_sample_rollout_tracking_stats(storage, usr_conf, logger))
@@ -2069,7 +709,7 @@ def run_episodes_(
     # Storage will be cleared after learning
     # 娉細batch 鐢熸垚宸茬敱 AlgorithmPPO.learn() 澶勭悊锛?    # storage 灏嗗湪璁粌瀹屾垚鍚庤娓呯┖銆?
     # Append a physics snapshot (averaged across all envs).
-    # Wrapped in try/except inside _sample_physics_stats, so always safe.
-    storage_stats.update(_sample_physics_stats(env, logger, critic_obs=critic_obs))
+    # Wrapped in try/except inside sample_physics_stats, so always safe.
+    storage_stats.update(sample_physics_stats(env, logger, critic_obs=critic_obs))
 
     return last_obs, critic_obs, storage_stats

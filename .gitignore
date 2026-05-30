@@ -7,9 +7,12 @@
 
 # 压缩包
 *.zip
+*.zip*
 *.tar
 *.tar.gz
+*.tar.gz*
 *.tgz
+*.tgz*
 *.rar
 *.7z
 
@@ -21,12 +24,14 @@
 *.pth
 *.h5
 *.hdf5
+*.jsonl
 
 # 上传/备份/缓存
 uploads/
 backups/
 __pycache__/
 .cache/
+ckpt/
 
 # 本地系统文件/归档
 .DS_Store

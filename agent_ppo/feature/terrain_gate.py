@@ -41,6 +41,10 @@ def _rl_conf():
     return (_CONF_CACHE or {}).get("rl_navigation", {})
 
 
+def _diagnostics_enabled(conf):
+    return bool(conf.get("gate_diagnostics_enabled", False))
+
+
 def _zeros(env, dtype=torch.float32):
     return torch.zeros(env.num_envs, device=env.device, dtype=dtype)
 
@@ -64,62 +68,6 @@ def _sample_range(values, shape, device, dtype):
     if abs(high - low) < 1.0e-8:
         return torch.full(shape, low, device=device, dtype=dtype)
     return low + (high - low) * torch.rand(shape, device=device, dtype=dtype)
-
-
-def _range_bounds(values, default):
-    if not isinstance(values, (list, tuple)) or len(values) != 2:
-        values = default
-    low, high = float(values[0]), float(values[1])
-    if high < low:
-        low, high = high, low
-    return low, high
-
-
-def _linear_speed_from_factor(values, default, factor, jitter, device, dtype):
-    low, high = _range_bounds(values, default)
-    factor = torch.clamp(factor.to(device=device, dtype=dtype), 0.0, 1.0)
-    speed = high - factor * (high - low)
-    if jitter > 0.0 and high > low:
-        noise = (torch.rand_like(speed) * 2.0 - 1.0) * float(jitter)
-        speed = torch.clamp(speed + noise, low, high)
-    return speed
-
-
-def _difficulty_factor_from_gate(conf, gate, terrain_id, default=0.5):
-    signal = gate.get("difficulty_signal")
-    if signal is None:
-        return torch.full_like(gate["difficulty_band"].float(), float(default))
-    signal = signal.float()
-    stair_low = float(conf.get("stairs_difficulty_low_threshold", conf.get("nan_gate_difficulty_low_threshold", 0.09)))
-    stair_high = float(conf.get("stairs_difficulty_high_threshold", conf.get("nan_gate_difficulty_high_threshold", 0.16)))
-    slope_low = float(conf.get("slope_difficulty_low_threshold", conf.get("nan_gate_difficulty_low_threshold", 0.09)))
-    slope_high = float(conf.get("slope_difficulty_high_threshold", conf.get("nan_gate_difficulty_high_threshold", 0.16)))
-    low = torch.where(
-        terrain_id == 2,
-        torch.full_like(signal, stair_low),
-        torch.full_like(signal, slope_low),
-    )
-    high = torch.where(
-        terrain_id == 2,
-        torch.full_like(signal, stair_high),
-        torch.full_like(signal, slope_high),
-    )
-    factor = (signal - low) / torch.clamp(high - low, min=1.0e-6)
-    band_fallback = torch.clamp(gate["difficulty_band"].float() / 2.0, 0.0, 1.0)
-    return torch.where(torch.isfinite(factor), torch.clamp(factor, 0.0, 1.0), band_fallback)
-
-
-def _runtime_is_eval():
-    try:
-        from common_python.config.config_control import CONFIG
-        from kaiwudrl.common.utils.kaiwudrl_define import KaiwuDRLDefine
-
-        return getattr(CONFIG, "run_mode", None) in (
-            KaiwuDRLDefine.RUN_MODE_EVAL,
-            KaiwuDRLDefine.RUN_MODE_EXAM,
-        )
-    except Exception:
-        return False
 
 
 def _step_key(env):
@@ -182,13 +130,25 @@ def _sensor_grid(env, sensor_name):
         return None
 
 
-def _obs_grid(obs):
+def _obs_grid(obs, group="policy"):
     if obs is None or obs.shape[-1] < 301:
         return None
+    scan_start = 60 if group == "critic" else 45
+    if obs.shape[-1] < scan_start + 256:
+        return None
     try:
-        return obs[:, 45:301].view(obs.shape[0], 16, 16)
+        return obs[:, scan_start:scan_start + 256].view(obs.shape[0], 16, 16)
     except Exception:
         return None
+
+
+def _relative_height_grid(grid, floor_quantile=0.20):
+    """Convert an elevation grid into height above the local floor estimate."""
+    if grid is None:
+        return None
+    q = min(max(float(floor_quantile), 0.0), 1.0)
+    floor = torch.quantile(grid.flatten(1), q, dim=1).view(-1, 1, 1)
+    return torch.clamp(grid - floor, min=0.0)
 
 
 def _empty_gate(env, source_id=0):
@@ -441,13 +401,26 @@ def _nav_wall_features(env, grid, conf):
     threshold = float(conf.get("nav_wall_height_threshold", 0.24))
     temperature = max(float(conf.get("nav_wall_temperature", 0.08)), 1.0e-6)
     block_threshold = float(conf.get("nav_wall_score_threshold", 0.35))
+    rel_grid = _relative_height_grid(
+        grid,
+        floor_quantile=float(conf.get("nav_wall_floor_quantile", 0.20)),
+    )
+    if rel_grid is None:
+        return {
+            "available": zeros,
+            "front_wall_score": zeros,
+            "left_wall_score": zeros,
+            "right_wall_score": zeros,
+            "front_blocked": zeros,
+            "open_side": zeros,
+        }
 
     def wall_score(sector):
         return torch.sigmoid((sector - threshold) / temperature).mean(dim=(1, 2))
 
-    front_sector = grid[:, body_y_start:body_y_end, :front_cols]
-    left_sector = grid[:, :side_width, :front_cols]
-    right_sector = grid[:, -side_width:, :front_cols]
+    front_sector = rel_grid[:, body_y_start:body_y_end, :front_cols]
+    left_sector = rel_grid[:, :side_width, :front_cols]
+    right_sector = rel_grid[:, -side_width:, :front_cols]
     front_score = wall_score(front_sector)
     left_score = wall_score(left_sector)
     right_score = wall_score(right_sector)
@@ -462,9 +435,9 @@ def _nav_wall_features(env, grid, conf):
     }
 
 
-def _current_gate(env, obs, conf):
+def _current_gate(env, obs, conf, group="policy"):
     gate = _empty_gate(env, 0)
-    grid = _obs_grid(obs)
+    grid = _obs_grid(obs, group)
     if grid is None:
         return gate
     row_start = max(0, int(conf.get("terrain_row_start", 3)))
@@ -517,7 +490,7 @@ def _current_gate(env, obs, conf):
     return gate
 
 
-def _maze_remaining(env, obs, conf):
+def _maze_remaining(env, obs, conf, group="policy"):
     gate = float(conf.get("phase_maze_goal_dist_gate", 14.0))
     mode = str(conf.get("phase_maze_distance_mode", "euclidean")).lower()
     try:
@@ -537,14 +510,15 @@ def _maze_remaining(env, obs, conf):
         return torch.linalg.norm(delta_xy, dim=1), gate
     except Exception:
         pass
-    goal_start = int(conf.get("goal_start", 301))
+    default_goal_start = 316 if group == "critic" else 301
+    goal_start = int(conf.get("goal_start", default_goal_start))
     if obs is not None and obs.shape[-1] >= goal_start + 3:
         return torch.clamp(obs[:, goal_start + 2], 0.0, 1.0) * 20.0, gate
     return None, gate
 
 
-def _maze_phase(env, obs, conf):
-    remaining, gate = _maze_remaining(env, obs, conf)
+def _maze_phase(env, obs, conf, group="policy"):
+    remaining, gate = _maze_remaining(env, obs, conf, group)
     if remaining is None:
         return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     min_remaining = float(conf.get("phase_maze_goal_longitudinal_min", -1.0))
@@ -570,9 +544,14 @@ def _long_state(shape, device):
     return torch.zeros(shape, dtype=torch.long, device=device)
 
 
-def _update_sticky_gate(env, obs, conf, instant_gate, maze_instant, state):
+def _float_state(shape, device):
+    return torch.zeros(shape, dtype=torch.float, device=device)
+
+
+def _update_sticky_gate(env, obs, conf, instant_gate, maze_instant, state, group="policy"):
     terrain_id = instant_gate["terrain_id"].to(device=env.device).long()
     difficulty = instant_gate["difficulty_band"].to(device=env.device).long()
+    difficulty_signal = instant_gate["difficulty_signal"].to(device=env.device).float()
     up = instant_gate["up"].to(device=env.device).bool()
     down = instant_gate["down"].to(device=env.device).bool()
     num_envs = terrain_id.shape[0]
@@ -580,6 +559,7 @@ def _update_sticky_gate(env, obs, conf, instant_gate, maze_instant, state):
     if "sticky_terrain_id" not in state or state["sticky_terrain_id"].shape[0] != num_envs:
         state["sticky_terrain_id"] = _long_state(num_envs, env.device)
         state["sticky_difficulty_band"] = _long_state(num_envs, env.device)
+        state["sticky_difficulty_signal"] = _float_state(num_envs, env.device)
         state["sticky_up"] = _bool_state(num_envs, env.device)
         state["sticky_down"] = _bool_state(num_envs, env.device)
         state["sticky_hold"] = _long_state(num_envs, env.device)
@@ -634,6 +614,11 @@ def _update_sticky_gate(env, obs, conf, instant_gate, maze_instant, state):
     )
     state["sticky_terrain_id"] = torch.where(apply_active, terrain_id, state["sticky_terrain_id"])
     state["sticky_difficulty_band"] = torch.where(apply_active, difficulty, state["sticky_difficulty_band"])
+    state["sticky_difficulty_signal"] = torch.where(
+        apply_active,
+        difficulty_signal,
+        state["sticky_difficulty_signal"],
+    )
     state["sticky_up"] = torch.where(apply_active, up, state["sticky_up"])
     state["sticky_down"] = torch.where(apply_active, down, state["sticky_down"])
     state["sticky_hold"] = torch.where(
@@ -663,6 +648,7 @@ def _update_sticky_gate(env, obs, conf, instant_gate, maze_instant, state):
     )
     state["sticky_terrain_id"] = torch.where(release, torch.zeros_like(state["sticky_terrain_id"]), state["sticky_terrain_id"])
     state["sticky_difficulty_band"] = torch.where(release, torch.zeros_like(state["sticky_difficulty_band"]), state["sticky_difficulty_band"])
+    state["sticky_difficulty_signal"] = torch.where(release, torch.zeros_like(state["sticky_difficulty_signal"]), state["sticky_difficulty_signal"])
     state["sticky_up"] = torch.where(release, torch.zeros_like(state["sticky_up"]), state["sticky_up"])
     state["sticky_down"] = torch.where(release, torch.zeros_like(state["sticky_down"]), state["sticky_down"])
     state["flat_confident"] = flat_confident.detach().clone()
@@ -676,7 +662,7 @@ def _update_sticky_gate(env, obs, conf, instant_gate, maze_instant, state):
         torch.zeros_like(state["maze_confirm_count"]),
     )
     maze_sticky = state["maze_sticky"] | (state["maze_confirm_count"] >= maze_confirm_steps)
-    remaining, gate = _maze_remaining(env, obs, conf)
+    remaining, gate = _maze_remaining(env, obs, conf, group)
     if remaining is not None:
         release_margin = float(conf.get("phase_maze_release_margin", 2.0))
         maze_sticky = maze_sticky & ~(remaining > (float(gate) + release_margin))
@@ -690,6 +676,7 @@ def _sticky_gate_from_state(env, instant_gate, state, conf):
     sticky_terrain = state["sticky_terrain_id"]
     sticky["terrain_id"] = sticky_terrain.detach().clone()
     sticky["difficulty_band"] = state["sticky_difficulty_band"].detach().clone()
+    sticky["difficulty_signal"] = state["sticky_difficulty_signal"].detach().clone()
     sticky["flat"] = sticky_terrain == 0
     sticky["slope"] = sticky_terrain == 1
     sticky["stairs"] = sticky_terrain == 2
@@ -722,11 +709,11 @@ def _sticky_gate_from_state(env, instant_gate, state, conf):
     return sticky
 
 
-def _compute_gates(env, obs, conf, maze_phase=None):
+def _compute_gates(env, obs, conf, maze_phase=None, group="policy"):
     raw_height_grid = _sensor_grid(env, "height_scanner")
     raw_nav_grid = _sensor_grid(env, "nav_scanner")
-    current = _current_gate(env, obs, conf)
-    nan = _nan_structure_gate(env, raw_height_grid if raw_height_grid is not None else _obs_grid(obs), conf)
+    current = _current_gate(env, obs, conf, group)
+    nan = _nan_structure_gate(env, raw_height_grid if raw_height_grid is not None else _obs_grid(obs, group), conf)
     raw = _structure_gate(env, raw_height_grid, conf, "fused_gate", 2)
     nav = _structure_gate(env, raw_nav_grid, conf, "nav_gate", 2)
     nav_features = _nav_wall_features(env, raw_nav_grid, conf)
@@ -788,114 +775,30 @@ def _get_state(env):
             "maze_phase": torch.zeros(cmd.shape[0], dtype=torch.bool, device=cmd.device),
             "terrain_id": torch.zeros(cmd.shape[0], dtype=torch.long, device=cmd.device),
             "difficulty_band": torch.zeros(cmd.shape[0], dtype=torch.long, device=cmd.device),
-            "track_difficulty_cache": torch.ones(cmd.shape[0], dtype=torch.long, device=cmd.device),
-            "track_difficulty_factor": torch.full((cmd.shape[0],), 0.5, device=cmd.device),
-            "track_difficulty_source": torch.zeros(cmd.shape[0], dtype=torch.long, device=cmd.device),
-            "track_difficulty_valid": torch.zeros(cmd.shape[0], dtype=torch.bool, device=cmd.device),
         }
         setattr(env, "_worker_terrain_gate_state", state)
     return state
-
-
-def _update_track_difficulty_cache(conf, maze_phase, gate, state):
-    if not bool(conf.get("track_difficulty_cache_enabled", True)):
-        return
-    terrain_id = gate["terrain_id"]
-    difficulty = gate["difficulty_band"]
-    factor = _difficulty_factor_from_gate(conf, gate, terrain_id, default=0.5)
-    previous_maze = state.get("maze_phase", torch.zeros_like(maze_phase))
-    leaving_maze = previous_maze & (~maze_phase)
-    if leaving_maze.any():
-        state["track_difficulty_cache"] = torch.where(
-            leaving_maze,
-            torch.ones_like(state["track_difficulty_cache"]),
-            state["track_difficulty_cache"],
-        )
-        state["track_difficulty_factor"] = torch.where(
-            leaving_maze,
-            torch.full_like(state["track_difficulty_factor"], 0.5),
-            state["track_difficulty_factor"],
-        )
-        state["track_difficulty_source"] = torch.where(
-            leaving_maze,
-            torch.zeros_like(state["track_difficulty_source"]),
-            state["track_difficulty_source"],
-        )
-        state["track_difficulty_valid"] = torch.where(
-            leaving_maze,
-            torch.zeros_like(state["track_difficulty_valid"]),
-            state["track_difficulty_valid"],
-        )
-
-    non_maze = ~maze_phase
-    stair_update = non_maze & (terrain_id == 2)
-    slope_update = non_maze & (terrain_id == 1) & (state["track_difficulty_source"] < 2)
-    update = stair_update | slope_update
-    source = torch.where(stair_update, torch.full_like(state["track_difficulty_source"], 2), state["track_difficulty_source"])
-    source = torch.where(slope_update, torch.ones_like(source), source)
-    state["track_difficulty_cache"] = torch.where(update, difficulty, state["track_difficulty_cache"])
-    state["track_difficulty_factor"] = torch.where(update, factor, state["track_difficulty_factor"])
-    state["track_difficulty_source"] = torch.where(update, source, state["track_difficulty_source"])
-    state["track_difficulty_valid"] = state["track_difficulty_valid"] | update
 
 
 def _sample_command(env, conf, maze_phase, gate, state, dtype):
     command = state["command"].clone()
     timer = torch.clamp(state["timer"] - 1, min=0)
     terrain_id = gate["terrain_id"]
-    difficulty = gate["difficulty_band"]
-    _update_track_difficulty_cache(conf, maze_phase, gate, state)
-    terrain_changed = (terrain_id != state["terrain_id"]) | (difficulty != state["difficulty_band"])
+    terrain_changed = terrain_id != state["terrain_id"]
     phase_changed = maze_phase != state["maze_phase"]
     needs_sample = (timer <= 0) | phase_changed | terrain_changed | (command[:, 0] <= 0.0)
     if needs_sample.any():
-        jitter = float(conf.get("phase_command_jitter", 0.0))
-        linear_speed = bool(conf.get("phase_command_linear_speed_enabled", True))
-        difficulty_factor = _difficulty_factor_from_gate(conf, gate, terrain_id, default=0.5)
-        maze_factor = torch.where(
-            state["track_difficulty_valid"],
-            state["track_difficulty_factor"],
-            torch.full_like(state["track_difficulty_factor"], 0.5),
-        )
-        if linear_speed:
-            fallback_vx = float(conf.get("fallback_lin_vel_x", 0.90))
-            fallback = torch.full((env.num_envs,), fallback_vx, device=env.device, dtype=dtype)
-            slope = _linear_speed_from_factor(
-                conf.get("slope_lin_vel_x", [0.72, 1.20]),
-                [0.72, 1.20],
-                difficulty_factor,
-                jitter,
-                env.device,
-                dtype,
-            )
-            stairs = _linear_speed_from_factor(
-                conf.get("stairs_lin_vel_x", [0.65, 1.00]),
-                [0.65, 1.00],
-                difficulty_factor,
-                jitter,
-                env.device,
-                dtype,
-            )
-            maze = _linear_speed_from_factor(
-                conf.get("maze_lin_vel_x", [0.72, 0.92]),
-                [0.72, 0.92],
-                maze_factor,
-                jitter,
-                env.device,
-                dtype,
-            )
-            stairs_by_difficulty = stairs
-        else:
-            fallback_vx = float(conf.get("fallback_lin_vel_x", 0.90))
-            fallback = torch.full((env.num_envs,), fallback_vx, device=env.device, dtype=dtype)
-            slope = _sample_range(conf.get("slope_lin_vel_x", [0.72, 1.20]), (env.num_envs,), env.device, dtype)
-            stairs = _sample_range(conf.get("stairs_lin_vel_x", [0.65, 1.00]), (env.num_envs,), env.device, dtype)
-            maze = _sample_range(conf.get("maze_lin_vel_x", [0.72, 0.92]), (env.num_envs,), env.device, dtype)
-            stairs_by_difficulty = stairs
-        non_maze = fallback
+        fallback_vx = float(conf.get("suggested_speed_fallback", conf.get("phase_command_fallback_vx", 0.62)))
+        fallback = torch.full((env.num_envs,), fallback_vx, device=env.device, dtype=dtype)
+        pre = _sample_range(conf.get("pre_maze_lin_vel_x", [fallback_vx, fallback_vx]), (env.num_envs,), env.device, dtype)
+        slope = _sample_range(conf.get("slope_lin_vel_x", [fallback_vx, fallback_vx]), (env.num_envs,), env.device, dtype)
+        stairs = _sample_range(conf.get("stairs_lin_vel_x", [fallback_vx, fallback_vx]), (env.num_envs,), env.device, dtype)
+        maze = _sample_range(conf.get("maze_lin_vel_x", [fallback_vx, fallback_vx]), (env.num_envs,), env.device, dtype)
+        non_maze = pre
         if bool(conf.get("terrain_phase_speed_enabled", True)):
             non_maze = torch.where(terrain_id == 1, slope, non_maze)
-            non_maze = torch.where(terrain_id == 2, stairs_by_difficulty, non_maze)
+            non_maze = torch.where(terrain_id == 2, stairs, non_maze)
+            non_maze = torch.where(terrain_id == 3, fallback, non_maze)
         command[:, 0] = torch.where(maze_phase, maze, non_maze)
         command[:, 1] = 0.0
         command[:, 2] = 0.0
@@ -907,74 +810,56 @@ def _sample_command(env, conf, maze_phase, gate, state, dtype):
     )
     state["maze_phase"] = maze_phase.detach().clone()
     state["terrain_id"] = terrain_id.detach().clone()
-    state["difficulty_band"] = difficulty.detach().clone()
     return command
-
-
-def _patch_obs_command(obs, group, command):
-    patched = obs.clone()
-    if group == "policy" and patched.shape[-1] >= 9:
-        patched[:, 6:9] = command.to(device=patched.device, dtype=patched.dtype)
-    elif group == "critic" and patched.shape[-1] >= 12:
-        patched[:, 9:12] = command.to(device=patched.device, dtype=patched.dtype)
-    return patched
-
-
-def _record_group_command(state, patched, group):
-    if group == "policy" and patched.shape[-1] >= 9:
-        state["policy_cmd_vx"] = patched[:, 6].detach().clone()
-    if group == "critic" and patched.shape[-1] >= 12:
-        state["critic_cmd_vx"] = patched[:, 9].detach().clone()
 
 
 def apply_worker_gate_command(env, obs, group):
     """Compute all gates, optionally publish terrain-conditioned command, patch obs."""
     conf = _rl_conf()
     mode = str(conf.get("gate_test_mode", "raw_fused"))
+    diagnostics_enabled = _diagnostics_enabled(conf)
+    reward_metrics_enabled = bool(conf.get("gate_reward_metrics_enabled", True))
     enabled = (
         bool(conf.get("worker_phase_command_enabled", True))
         and bool(conf.get("phase_command_enabled", False))
         and bool(conf.get("gate_speed_advice_enabled", True))
     )
-    diagnostics_enabled = bool(conf.get("worker_gate_diagnostics_enabled", True))
-    if (bool(getattr(env, "_is_eval", False)) or _runtime_is_eval()) and not bool(conf.get("eval_worker_gate_enabled", False)):
+    if bool(getattr(env, "_is_eval", False)) and not enabled and not diagnostics_enabled:
         return obs
-    if not enabled and not diagnostics_enabled:
+    if not enabled and not diagnostics_enabled and not reward_metrics_enabled:
         return obs
+
     state = _get_state(env)
     step = _step_key(env)
-
-    if step is not None and state.get("last_gate_compute_step") == step and state.get("diagnostics"):
-        command = state.get("command", _current_command(env))
-        if enabled and mode != "shadow":
-            _write_command(env, command)
-            patched = _patch_obs_command(obs, group, command)
-        else:
-            patched = obs
-        _record_group_command(state, patched, group)
-        return patched
-
-    maze_instant = _maze_phase(env, obs, conf)
-    gates = _compute_gates(env, obs, conf, maze_instant)
-    sticky_source_name = _sticky_source_name(conf, mode)
-    sticky_source = gates.get(sticky_source_name, gates["nan"])
-    if sticky_source_name == "raw_fused" and sticky_source["available"].mean() <= 0:
-        sticky_source_name = "nan"
-        sticky_source = gates["nan"]
-    if step is None or state.get("last_gate_step") != step or "sticky_terrain_id" not in state:
-        sticky = _update_sticky_gate(env, obs, conf, sticky_source, maze_instant, state)
-        state["last_gate_step"] = step
+    cache = state.get("gate_cache")
+    if step is not None and cache is not None and cache.get("step") == step:
+        maze_instant = cache["maze_instant"]
+        maze_phase = cache["maze_phase"]
+        gates = cache["gates"]
+        sticky = gates["sticky"]
     else:
-        sticky = _sticky_gate_from_state(env, sticky_source, state, conf)
-    maze_phase = sticky["maze"] if bool(conf.get("phase_maze_sticky_until_done", True)) else maze_instant
-    if bool(conf.get("nav_wall_gate_in_maze_only", True)):
-        gates = _compute_gates(env, obs, conf, maze_phase)
+        maze_instant = _maze_phase(env, obs, conf, group)
+        gates = _compute_gates(env, obs, conf, maze_instant, group)
+        sticky_source_name = _sticky_source_name(conf, mode)
         sticky_source = gates.get(sticky_source_name, gates["nan"])
-        if sticky_source_name == "raw_fused" and sticky_source["available"].mean() <= 0:
-            sticky_source_name = "nan"
-            sticky_source = gates["nan"]
-        sticky = _sticky_gate_from_state(env, sticky_source, state, conf)
-    gates["sticky"] = sticky
+        if step is None or state.get("last_gate_step") != step or "sticky_terrain_id" not in state:
+            sticky = _update_sticky_gate(env, obs, conf, sticky_source, maze_instant, state, group)
+            state["last_gate_step"] = step
+        else:
+            sticky = _sticky_gate_from_state(env, sticky_source, state, conf)
+        maze_phase = sticky["maze"] if bool(conf.get("phase_maze_sticky_until_done", True)) else maze_instant
+        if bool(conf.get("nav_wall_gate_in_maze_only", True)):
+            gates = _compute_gates(env, obs, conf, maze_phase, group)
+            sticky_source = gates.get(sticky_source_name, gates["nan"])
+            sticky = _sticky_gate_from_state(env, sticky_source, state, conf)
+        gates["sticky"] = sticky
+        if step is not None:
+            state["gate_cache"] = {
+                "step": step,
+                "maze_instant": maze_instant,
+                "maze_phase": maze_phase,
+                "gates": gates,
+            }
     selected, selected_name = _select_gate(gates, mode if mode != "shadow" else str(conf.get("shadow_selected_gate", "sticky")))
     current_cmd = _current_command(env)
     command = current_cmd.clone()
@@ -992,9 +877,16 @@ def apply_worker_gate_command(env, obs, group):
 
     patched = obs
     if enabled and mode != "shadow":
-        patched = _patch_obs_command(obs, group, command)
+        patched = obs.clone()
+        if group == "policy" and patched.shape[-1] >= 9:
+            patched[:, 6:9] = command.to(device=patched.device, dtype=patched.dtype)
+        elif group == "critic" and patched.shape[-1] >= 12:
+            patched[:, 9:12] = command.to(device=patched.device, dtype=patched.dtype)
 
-    _record_group_command(state, patched, group)
+    if group == "policy" and patched.shape[-1] >= 9:
+        state["policy_cmd_vx"] = patched[:, 6].detach().clone()
+    if group == "critic" and patched.shape[-1] >= 12:
+        state["critic_cmd_vx"] = patched[:, 9].detach().clone()
 
     source_value = {"current": 0.0, "nan": 1.0, "raw_fused": 2.0, "sticky": 4.0}.get(selected_name, -1.0)
     selected_maze = maze_phase.float()
@@ -1012,6 +904,7 @@ def apply_worker_gate_command(env, obs, group):
     final_non_maze_sum = final_flat + final_slope + final_stairs + final_invalid
     final_active = final_slope + final_stairs
     final_difficulty = selected["difficulty_band"].float() * final_active
+    final_difficulty_signal = selected["difficulty_signal"].float() * final_active
     final_difficulty_low = (selected["difficulty_band"] == 0).float() * final_active
     final_difficulty_mid = (selected["difficulty_band"] == 1).float() * final_active
     final_difficulty_high = (selected["difficulty_band"] >= 2).float() * final_active
@@ -1040,6 +933,66 @@ def apply_worker_gate_command(env, obs, group):
         difficulty_switch = (previous_final_difficulty != final_difficulty_id).float()
     state["final_terrain_id"] = final_terrain_id.detach().clone()
     state["final_difficulty_id"] = final_difficulty_id.detach().clone()
+    minimal_diagnostics = {
+        "selected_stairs": selected_stairs.detach(),
+        "selected_difficulty": selected["difficulty_band"].float().detach(),
+        "current_stairs": gates["current"]["stairs"].float().detach(),
+        "current_difficulty": gates["current"]["difficulty_band"].float().detach(),
+        "final_flat": final_flat.detach(),
+        "final_slope": final_slope.detach(),
+        "final_stairs": final_stairs.detach(),
+        "final_maze": final_maze.detach(),
+        "final_invalid": final_invalid.detach(),
+        "final_terrain_sum": final_terrain_sum.detach(),
+        "final_non_maze_sum": final_non_maze_sum.detach(),
+        "final_active": final_active.detach(),
+        "final_difficulty": final_difficulty.detach(),
+        "final_difficulty_signal": final_difficulty_signal.detach(),
+        "final_difficulty_low": final_difficulty_low.detach(),
+        "final_difficulty_mid": final_difficulty_mid.detach(),
+        "final_difficulty_high": final_difficulty_high.detach(),
+        "final_difficulty_unknown": final_difficulty_unknown.detach(),
+        "final_difficulty_sum": final_active.detach(),
+        "final_gate_valid": ((selected["available"].float() > 0.5) & (final_terrain_sum > 0.5)).float().detach(),
+        "nav_wall_front_score": gates["raw_fused"]["nav_front_wall_score"].float().detach(),
+        "nav_wall_left_score": gates["raw_fused"]["nav_left_wall_score"].float().detach(),
+        "nav_wall_right_score": gates["raw_fused"]["nav_right_wall_score"].float().detach(),
+        "nav_wall_front_blocked": gates["raw_fused"]["nav_front_blocked"].float().detach(),
+        "high_stair_active": (
+            selected["stairs"] & (selected["difficulty_band"] >= 2)
+        ).float().detach(),
+        "mode_shadow": torch.full((env.num_envs,), 1.0 if mode == "shadow" else 0.0, device=env.device),
+        "mode_control": torch.full((env.num_envs,), 0.0 if mode == "shadow" else 1.0, device=env.device),
+        "selected_source": torch.full((env.num_envs,), source_value, device=env.device),
+        "selected_available": selected["available"].float().detach(),
+        "selected_terrain_sum": final_terrain_sum.detach(),
+        "selected_maze": selected_maze.detach(),
+        "selected_slope": selected_slope.detach(),
+        "selected_stairs": selected_stairs.detach(),
+        "selected_wall": selected_wall.detach(),
+        "selected_difficulty_low": final_difficulty_low.detach(),
+        "selected_difficulty_mid": final_difficulty_mid.detach(),
+        "selected_difficulty_high": final_difficulty_high.detach(),
+        "selected_difficulty_sum": final_active.detach(),
+        "sticky_hold_steps": selected.get("sticky_hold", torch.zeros(env.num_envs, device=env.device)).float().detach(),
+        "sticky_pending_count": selected.get("pending_count", torch.zeros(env.num_envs, device=env.device)).float().detach(),
+        "maze_instant": maze_instant.float().detach(),
+        "maze_confirm_count": selected.get("maze_confirm_count", torch.zeros(env.num_envs, device=env.device)).float().detach(),
+        "maze_phase": maze_phase.float().detach(),
+        "command_written": torch.full((env.num_envs,), 1.0 if command_written else 0.0, device=env.device),
+        "worker_cmd_vx": _current_command(env)[:, 0].float().detach(),
+        "target_cmd_vx": command[:, 0].float().detach(),
+        "raw_nav_available": gates["raw_fused"]["nav_available"].float().detach(),
+        "raw_nav_front_wall_score": gates["raw_fused"]["nav_front_wall_score"].float().detach(),
+        "raw_nav_left_wall_score": gates["raw_fused"]["nav_left_wall_score"].float().detach(),
+        "raw_nav_right_wall_score": gates["raw_fused"]["nav_right_wall_score"].float().detach(),
+        "raw_nav_front_blocked": gates["raw_fused"]["nav_front_blocked"].float().detach(),
+        "raw_nav_open_side": gates["raw_fused"]["nav_open_side"].float().detach(),
+    }
+    if not diagnostics_enabled:
+        state["diagnostics"] = minimal_diagnostics
+        return patched
+
     state["diagnostics"] = {
         "mode_shadow": torch.full((env.num_envs,), 1.0 if mode == "shadow" else 0.0, device=env.device),
         "mode_control": torch.full((env.num_envs,), 0.0 if mode == "shadow" else 1.0, device=env.device),
@@ -1054,6 +1007,7 @@ def apply_worker_gate_command(env, obs, group):
         "selected_up": (selected["up"].float() * not_maze).detach(),
         "selected_down": (selected["down"].float() * not_maze).detach(),
         "selected_difficulty": selected["difficulty_band"].float().detach(),
+        "selected_difficulty_signal": final_difficulty_signal.detach(),
         "selected_difficulty_low": final_difficulty_low.detach(),
         "selected_difficulty_mid": final_difficulty_mid.detach(),
         "selected_difficulty_high": final_difficulty_high.detach(),
@@ -1067,6 +1021,7 @@ def apply_worker_gate_command(env, obs, group):
         "final_non_maze_sum": final_non_maze_sum.detach(),
         "final_active": final_active.detach(),
         "final_difficulty": final_difficulty.detach(),
+        "final_difficulty_signal": final_difficulty_signal.detach(),
         "final_difficulty_low": final_difficulty_low.detach(),
         "final_difficulty_mid": final_difficulty_mid.detach(),
         "final_difficulty_high": final_difficulty_high.detach(),
@@ -1098,17 +1053,8 @@ def apply_worker_gate_command(env, obs, group):
         "worker_cmd_vx": _current_command(env)[:, 0].detach().clone(),
         "target_cmd_vx": command[:, 0].detach().clone(),
         "maze_phase": maze_phase.float().detach().clone(),
-        "track_cache_valid": state["track_difficulty_valid"].float().detach(),
-        "track_cache_unknown": (~state["track_difficulty_valid"]).float().detach(),
-        "track_cache_low": (state["track_difficulty_valid"] & (state["track_difficulty_cache"] == 0)).float().detach(),
-        "track_cache_mid": (state["track_difficulty_valid"] & (state["track_difficulty_cache"] == 1)).float().detach(),
-        "track_cache_high": (state["track_difficulty_valid"] & (state["track_difficulty_cache"] >= 2)).float().detach(),
-        "track_cache_difficulty": state["track_difficulty_cache"].float().detach(),
-        "track_cache_factor": state["track_difficulty_factor"].float().detach(),
-        "track_cache_source_slope": (state["track_difficulty_source"] == 1).float().detach(),
-        "track_cache_source_stairs": (state["track_difficulty_source"] == 2).float().detach(),
-        "maze_using_cached_difficulty": (maze_phase & state["track_difficulty_valid"]).float().detach(),
     }
+    state["diagnostics"].update(minimal_diagnostics)
     for name, gate in gates.items():
         prefix = f"{name}_"
         flat = gate["flat"].float()
@@ -1186,7 +1132,6 @@ def apply_worker_gate_command(env, obs, group):
     state["diagnostics"]["high_stair_active"] = (
         selected["stairs"] & (selected["difficulty_band"] >= 2)
     ).float().detach()
-    state["last_gate_compute_step"] = step
     return patched
 
 
@@ -1248,22 +1193,36 @@ def worker_gate_monitor_stats(env):
         ("worker_cmd_vx", "worker_cmd_vx"),
         ("target_cmd_vx", "target_cmd_vx"),
         ("maze_phase_ratio", "maze_phase"),
-        ("track_cache_valid_ratio", "track_cache_valid"),
-        ("track_cache_unknown_ratio", "track_cache_unknown"),
-        ("track_cache_low_ratio", "track_cache_low"),
-        ("track_cache_mid_ratio", "track_cache_mid"),
-        ("track_cache_high_ratio", "track_cache_high"),
-        ("track_cache_difficulty_mean", "track_cache_difficulty"),
-        ("track_cache_factor", "track_cache_factor"),
-        ("track_cache_source_slope_ratio", "track_cache_source_slope"),
-        ("track_cache_source_stairs_ratio", "track_cache_source_stairs"),
-        ("maze_using_cached_difficulty_ratio", "maze_using_cached_difficulty"),
         ("raw_nav_available_ratio", "raw_nav_available"),
         ("raw_nav_front_wall_score", "raw_nav_front_wall_score"),
         ("raw_nav_left_wall_score", "raw_nav_left_wall_score"),
         ("raw_nav_right_wall_score", "raw_nav_right_wall_score"),
         ("raw_nav_front_blocked_ratio", "raw_nav_front_blocked"),
         ("raw_nav_open_side", "raw_nav_open_side"),
+    ):
+        add(metric_name, diagnostic_name)
+
+    for metric_name, diagnostic_name in (
+        ("final_flat_ratio", "final_flat"),
+        ("final_slope_ratio", "final_slope"),
+        ("final_stairs_ratio", "final_stairs"),
+        ("final_maze_ratio", "final_maze"),
+        ("final_invalid_ratio", "final_invalid"),
+        ("final_terrain_sum_ratio", "final_terrain_sum"),
+        ("final_non_maze_sum_ratio", "final_non_maze_sum"),
+        ("final_active_ratio", "final_active"),
+        ("final_difficulty_mean", "final_difficulty"),
+        ("final_difficulty_signal", "final_difficulty_signal"),
+        ("final_difficulty_low_ratio", "final_difficulty_low"),
+        ("final_difficulty_mid_ratio", "final_difficulty_mid"),
+        ("final_difficulty_high_ratio", "final_difficulty_high"),
+        ("final_difficulty_unknown_ratio", "final_difficulty_unknown"),
+        ("final_difficulty_sum_ratio", "final_difficulty_sum"),
+        ("final_gate_valid_ratio", "final_gate_valid"),
+        ("final_source_current_ratio", "final_source_current"),
+        ("final_source_nan_ratio", "final_source_nan"),
+        ("final_source_raw_ratio", "final_source_raw"),
+        ("final_source_sticky_ratio", "final_source_sticky"),
     ):
         add(metric_name, diagnostic_name)
 

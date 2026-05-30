@@ -12,494 +12,67 @@ goal-directed exploration signal without using a hand-written planner.
 
 import torch
 
-from agent_ppo.feature.terrain_gate import actual_minus_command, command_sync_error, gate_metric
+from agent_ppo.feature.terrain_gate import gate_metric
 from tools.base_env.base_reward import RewardProcessBase
 
 
 class RewardProcess(RewardProcessBase):
 
-    def _tracking_command(self, command_name: str = "base_velocity"):
-        return self.env.command_manager.get_command(command_name)
-
     def _gate_metric(self, name: str):
         return gate_metric(self.env, name)
 
-    def _reward_gate_current_available(self):
-        return self._gate_metric("current_available")
-
-    def _reward_gate_current_flat(self):
-        return self._gate_metric("current_flat")
-
-    def _reward_gate_current_slope(self):
-        return self._gate_metric("current_slope")
-
-    def _reward_gate_current_stairs(self):
-        return self._gate_metric("current_stairs")
-
-    def _reward_gate_current_wall(self):
-        return self._gate_metric("current_wall")
-
-    def _reward_gate_current_active(self):
-        return self._gate_metric("current_active")
-
-    def _reward_gate_current_terrain_sum(self):
-        return self._gate_metric("current_terrain_sum")
-
-    def _reward_gate_current_difficulty(self):
-        return self._gate_metric("current_difficulty")
-
-    def _reward_gate_current_difficulty_low(self):
-        return self._gate_metric("current_difficulty_low")
-
-    def _reward_gate_current_difficulty_mid(self):
-        return self._gate_metric("current_difficulty_mid")
-
-    def _reward_gate_current_difficulty_high(self):
-        return self._gate_metric("current_difficulty_high")
-
-    def _reward_gate_current_difficulty_sum(self):
-        return self._gate_metric("current_difficulty_sum")
-
-    def _reward_gate_current_active_difficulty_low(self):
-        return self._gate_metric("current_active_difficulty_low")
-
-    def _reward_gate_current_active_difficulty_mid(self):
-        return self._gate_metric("current_active_difficulty_mid")
-
-    def _reward_gate_current_active_difficulty_high(self):
-        return self._gate_metric("current_active_difficulty_high")
-
-    def _reward_gate_current_active_difficulty_sum(self):
-        return self._gate_metric("current_active_difficulty_sum")
-
-    def _reward_gate_nan_available(self):
-        return self._gate_metric("nan_available")
-
-    def _reward_gate_nan_flat(self):
-        return self._gate_metric("nan_flat")
-
-    def _reward_gate_nan_slope(self):
-        return self._gate_metric("nan_slope")
-
-    def _reward_gate_nan_stairs(self):
-        return self._gate_metric("nan_stairs")
-
-    def _reward_gate_nan_wall(self):
-        return self._gate_metric("nan_wall")
-
-    def _reward_gate_nan_active(self):
-        return self._gate_metric("nan_active")
-
-    def _reward_gate_nan_terrain_sum(self):
-        return self._gate_metric("nan_terrain_sum")
-
-    def _reward_gate_nan_difficulty(self):
-        return self._gate_metric("nan_difficulty")
-
-    def _reward_gate_nan_difficulty_low(self):
-        return self._gate_metric("nan_difficulty_low")
-
-    def _reward_gate_nan_difficulty_mid(self):
-        return self._gate_metric("nan_difficulty_mid")
-
-    def _reward_gate_nan_difficulty_high(self):
-        return self._gate_metric("nan_difficulty_high")
-
-    def _reward_gate_nan_difficulty_sum(self):
-        return self._gate_metric("nan_difficulty_sum")
-
-    def _reward_gate_nan_active_difficulty_low(self):
-        return self._gate_metric("nan_active_difficulty_low")
-
-    def _reward_gate_nan_active_difficulty_mid(self):
-        return self._gate_metric("nan_active_difficulty_mid")
-
-    def _reward_gate_nan_active_difficulty_high(self):
-        return self._gate_metric("nan_active_difficulty_high")
-
-    def _reward_gate_nan_active_difficulty_sum(self):
-        return self._gate_metric("nan_active_difficulty_sum")
-
-    def _reward_gate_raw_available(self):
-        return self._gate_metric("raw_fused_available")
-
-    def _reward_gate_raw_nav_available(self):
-        return self._gate_metric("raw_nav_available")
-
-    def _reward_gate_raw_flat(self):
-        return self._gate_metric("raw_fused_flat")
-
-    def _reward_gate_raw_slope(self):
-        return self._gate_metric("raw_fused_slope")
-
-    def _reward_gate_raw_stairs(self):
-        return self._gate_metric("raw_fused_stairs")
-
-    def _reward_gate_raw_wall(self):
-        return self._gate_metric("raw_fused_wall")
-
-    def _reward_gate_raw_active(self):
-        return self._gate_metric("raw_fused_active")
-
-    def _reward_gate_raw_terrain_sum(self):
-        return self._gate_metric("raw_fused_terrain_sum")
-
-    def _reward_gate_raw_difficulty(self):
-        return self._gate_metric("raw_fused_difficulty")
-
-    def _reward_gate_raw_difficulty_low(self):
-        return self._gate_metric("raw_fused_difficulty_low")
-
-    def _reward_gate_raw_difficulty_mid(self):
-        return self._gate_metric("raw_fused_difficulty_mid")
-
-    def _reward_gate_raw_difficulty_high(self):
-        return self._gate_metric("raw_fused_difficulty_high")
-
-    def _reward_gate_raw_difficulty_sum(self):
-        return self._gate_metric("raw_fused_difficulty_sum")
-
-    def _reward_gate_raw_active_difficulty_low(self):
-        return self._gate_metric("raw_fused_active_difficulty_low")
-
-    def _reward_gate_raw_active_difficulty_mid(self):
-        return self._gate_metric("raw_fused_active_difficulty_mid")
-
-    def _reward_gate_raw_active_difficulty_high(self):
-        return self._gate_metric("raw_fused_active_difficulty_high")
-
-    def _reward_gate_raw_active_difficulty_sum(self):
-        return self._gate_metric("raw_fused_active_difficulty_sum")
-
-    def _reward_gate_raw_edge_sharpness(self):
-        return self._gate_metric("raw_fused_edge_sharpness")
-
-    def _reward_gate_raw_edge_locality(self):
-        return self._gate_metric("raw_fused_edge_locality")
-
-    def _reward_gate_raw_slope_smoothness(self):
-        return self._gate_metric("raw_fused_slope_smoothness")
-
-    def _reward_gate_raw_step_delta(self):
-        return self._gate_metric("raw_fused_step_delta")
-
-    def _reward_gate_raw_difficulty_signal(self):
-        return self._gate_metric("raw_fused_difficulty_signal")
-
-    def _reward_gate_raw_nav_front_wall_score(self):
-        return self._gate_metric("raw_nav_front_wall_score")
-
-    def _reward_gate_raw_nav_left_wall_score(self):
-        return self._gate_metric("raw_nav_left_wall_score")
-
-    def _reward_gate_raw_nav_right_wall_score(self):
-        return self._gate_metric("raw_nav_right_wall_score")
-
-    def _reward_gate_raw_nav_front_blocked(self):
-        return self._gate_metric("raw_nav_front_blocked")
-
-    def _reward_gate_raw_nav_open_side(self):
-        return self._gate_metric("raw_nav_open_side")
-
-    def _reward_gate_selected_source(self):
-        return self._gate_metric("selected_source")
-
-    def _reward_gate_selected_available(self):
-        return self._gate_metric("selected_available")
-
-    def _reward_gate_selected_flat(self):
-        return self._gate_metric("selected_flat")
-
-    def _reward_gate_selected_slope(self):
-        return self._gate_metric("selected_slope")
-
-    def _reward_gate_selected_stairs(self):
-        return self._gate_metric("selected_stairs")
-
-    def _reward_gate_selected_wall(self):
-        return self._gate_metric("selected_wall")
-
-    def _reward_gate_selected_maze(self):
-        return self._gate_metric("selected_maze")
-
-    def _reward_gate_selected_terrain_sum(self):
-        return self._gate_metric("selected_terrain_sum")
-
-    def _reward_gate_selected_up(self):
-        return self._gate_metric("selected_up")
-
-    def _reward_gate_selected_down(self):
-        return self._gate_metric("selected_down")
-
-    def _reward_gate_mode_shadow(self):
-        return self._gate_metric("mode_shadow")
-
-    def _reward_gate_mode_control(self):
-        return self._gate_metric("mode_control")
-
-    def _reward_gate_maze_instant(self):
-        return self._gate_metric("maze_instant")
-
-    def _reward_gate_maze_phase(self):
-        return self._gate_metric("maze_phase")
-
-    def _reward_gate_maze_confirm_count(self):
-        return self._gate_metric("maze_confirm_count")
-
-    def _reward_gate_selected_difficulty(self):
-        return self._gate_metric("selected_difficulty")
-
-    def _reward_gate_selected_difficulty_low(self):
-        return self._gate_metric("selected_difficulty_low")
-
-    def _reward_gate_selected_difficulty_mid(self):
-        return self._gate_metric("selected_difficulty_mid")
-
-    def _reward_gate_selected_difficulty_high(self):
-        return self._gate_metric("selected_difficulty_high")
-
-    def _reward_gate_selected_difficulty_sum(self):
-        return self._gate_metric("selected_difficulty_sum")
-
-    def _reward_gate_final_flat(self):
+    # -----------------------------------------------------------------------
+    # Suggested-speed gate monitor probes
+    # 建议速度门控监控探针
+    # -----------------------------------------------------------------------
+
+    def _reward_speed_gate_flat(self):
         return self._gate_metric("final_flat")
 
-    def _reward_gate_final_slope(self):
+    def _reward_speed_gate_slope(self):
         return self._gate_metric("final_slope")
 
-    def _reward_gate_final_stairs(self):
+    def _reward_speed_gate_stairs(self):
         return self._gate_metric("final_stairs")
 
-    def _reward_gate_final_maze(self):
+    def _reward_speed_gate_maze(self):
         return self._gate_metric("final_maze")
 
-    def _reward_gate_final_invalid(self):
+    def _reward_speed_gate_invalid(self):
         return self._gate_metric("final_invalid")
 
-    def _reward_gate_final_terrain_sum(self):
+    def _reward_speed_gate_sum(self):
         return self._gate_metric("final_terrain_sum")
 
-    def _reward_gate_final_non_maze_sum(self):
-        return self._gate_metric("final_non_maze_sum")
-
-    def _reward_gate_final_active(self):
-        return self._gate_metric("final_active")
-
-    def _reward_gate_final_difficulty(self):
-        return self._gate_metric("final_difficulty")
-
-    def _reward_gate_final_difficulty_low(self):
-        return self._gate_metric("final_difficulty_low")
-
-    def _reward_gate_final_difficulty_mid(self):
-        return self._gate_metric("final_difficulty_mid")
-
-    def _reward_gate_final_difficulty_high(self):
-        return self._gate_metric("final_difficulty_high")
-
-    def _reward_gate_final_difficulty_unknown(self):
-        return self._gate_metric("final_difficulty_unknown")
-
-    def _reward_gate_final_difficulty_sum(self):
-        return self._gate_metric("final_difficulty_sum")
-
-    def _reward_gate_final_source_current(self):
-        return self._gate_metric("final_source_current")
-
-    def _reward_gate_final_source_nan(self):
-        return self._gate_metric("final_source_nan")
-
-    def _reward_gate_final_source_raw(self):
-        return self._gate_metric("final_source_raw")
-
-    def _reward_gate_final_source_sticky(self):
-        return self._gate_metric("final_source_sticky")
-
-    def _reward_gate_final_gate_valid(self):
+    def _reward_speed_gate_valid(self):
         return self._gate_metric("final_gate_valid")
 
-    def _reward_gate_terrain_switch(self):
-        return self._gate_metric("terrain_switch")
-
-    def _reward_gate_difficulty_switch(self):
-        return self._gate_metric("difficulty_switch")
-
-    def _reward_gate_sticky_hold_steps(self):
-        return self._gate_metric("sticky_hold_steps")
-
-    def _reward_gate_sticky_pending_count(self):
-        return self._gate_metric("sticky_pending_count")
-
-    def _reward_gate_sticky_flat_release_count(self):
-        return self._gate_metric("sticky_flat_release_count")
-
-    def _reward_gate_sticky_flat_confident(self):
-        return self._gate_metric("sticky_flat_confident")
-
-    def _reward_gate_sticky_early_flat_release(self):
-        return self._gate_metric("sticky_early_flat_release")
-
-    def _reward_gate_sticky_active_preempt_switch(self):
-        return self._gate_metric("sticky_active_preempt_switch")
-
-    def _reward_gate_stair_up(self):
-        return self._gate_metric("stair_up")
-
-    def _reward_gate_stair_down(self):
-        return self._gate_metric("stair_down")
-
-    def _reward_gate_stair_unknown_dir(self):
-        return self._gate_metric("stair_unknown_dir")
-
-    def _reward_gate_pitch_abs(self):
-        return self._gate_metric("pitch_abs")
-
-    def _reward_gate_updown_confidence(self):
-        return self._gate_metric("updown_confidence")
-
-    def _reward_gate_high_stair_active(self):
-        return self._high_stair_gate()
-
-    def _reward_gate_command_written(self):
-        return self._gate_metric("command_written")
-
-    def _reward_gate_worker_cmd_vx(self):
-        return self._gate_metric("worker_cmd_vx")
-
-    def _reward_gate_target_cmd_vx(self):
+    def _reward_speed_gate_target_vx(self):
         return self._gate_metric("target_cmd_vx")
 
-    def _reward_gate_policy_cmd_error(self):
-        return command_sync_error(self.env, "policy_cmd_vx")
+    def _reward_speed_gate_worker_vx(self):
+        return self._gate_metric("worker_cmd_vx")
 
-    def _reward_gate_critic_cmd_error(self):
-        return command_sync_error(self.env, "critic_cmd_vx")
+    def _reward_speed_gate_written(self):
+        return self._gate_metric("command_written")
 
-    def _reward_gate_actual_minus_cmd_vx(self):
-        return actual_minus_command(self.env)
+    def _reward_speed_gate_nav_front(self):
+        return self._gate_metric("nav_wall_front_score")
 
-    def _reward_gate_track_cache_valid(self):
-        return self._gate_metric("track_cache_valid")
+    def _reward_speed_gate_nav_block(self):
+        return self._gate_metric("nav_wall_front_blocked")
 
-    def _reward_gate_track_cache_unknown(self):
-        return self._gate_metric("track_cache_unknown")
+    def _reward_speed_gate_hold_steps(self):
+        return self._gate_metric("sticky_hold_steps")
 
-    def _reward_gate_track_cache_low(self):
-        return self._gate_metric("track_cache_low")
+    def _reward_speed_gate_pending(self):
+        return self._gate_metric("sticky_pending_count")
 
-    def _reward_gate_track_cache_mid(self):
-        return self._gate_metric("track_cache_mid")
+    def _reward_speed_gate_maze_confirm(self):
+        return self._gate_metric("maze_confirm_count")
 
-    def _reward_gate_track_cache_high(self):
-        return self._gate_metric("track_cache_high")
-
-    def _reward_gate_track_cache_difficulty(self):
-        return self._gate_metric("track_cache_difficulty")
-
-    def _reward_gate_track_cache_factor(self):
-        return self._gate_metric("track_cache_factor")
-
-    def _reward_gate_track_cache_source_slope(self):
-        return self._gate_metric("track_cache_source_slope")
-
-    def _reward_gate_track_cache_source_stairs(self):
-        return self._gate_metric("track_cache_source_stairs")
-
-    def _reward_gate_maze_using_cached_difficulty(self):
-        return self._gate_metric("maze_using_cached_difficulty")
-
-    def _reward_gate_current_nan_stair_disagree(self):
-        return self._gate_metric("current_nan_stair_disagree")
-
-    def _reward_gate_current_raw_stair_disagree(self):
-        return self._gate_metric("current_raw_stair_disagree")
-
-    def _reward_gate_nan_raw_stair_disagree(self):
-        return self._gate_metric("nan_raw_stair_disagree")
-
-    def _reward_gate_current_nan_slope_disagree(self):
-        return self._gate_metric("current_nan_slope_disagree")
-
-    def _reward_gate_current_raw_slope_disagree(self):
-        return self._gate_metric("current_raw_slope_disagree")
-
-    def _reward_gate_nan_raw_slope_disagree(self):
-        return self._gate_metric("nan_raw_slope_disagree")
-
-    def _reward_gate_current_nan_wall_disagree(self):
-        return self._gate_metric("current_nan_wall_disagree")
-
-    def _reward_gate_current_raw_wall_disagree(self):
-        return self._gate_metric("current_raw_wall_disagree")
-
-    def _reward_gate_nan_raw_wall_disagree(self):
-        return self._gate_metric("nan_raw_wall_disagree")
-
-    def _reward_gate_raw_wall_non_maze(self):
-        return self._gate_metric("raw_wall_non_maze")
-
-    def _high_stair_gate(self):
-        stairs = self._gate_metric("selected_stairs")
-        difficulty = self._gate_metric("selected_difficulty")
-        if stairs.sum() <= 0 and difficulty.sum() <= 0:
-            stairs = self._gate_metric("current_stairs")
-            difficulty = self._gate_metric("current_difficulty")
-        return stairs * (difficulty >= 1.5).float()
-
-    def _high_difficulty_gate(self):
-        slope = self._gate_metric("final_slope")
-        stairs = self._gate_metric("final_stairs")
-        high = self._gate_metric("final_difficulty_high")
-        return torch.clamp(slope + stairs, 0.0, 1.0) * high
-
-    def _reward_slope_time_pressure(self):
-        return self._gate_metric("final_slope")
-
-    def _reward_low_mid_stair_time_pressure(self):
-        stairs = self._gate_metric("final_stairs")
-        low_mid = self._gate_metric("final_difficulty_low") + self._gate_metric("final_difficulty_mid")
-        return stairs * torch.clamp(low_mid, 0.0, 1.0)
-
-    def _reward_gate_slope_time_pressure_active(self):
-        return self._gate_metric("final_slope")
-
-    def _reward_gate_low_mid_stair_time_pressure_active(self):
-        return self._reward_low_mid_stair_time_pressure()
-
-    def _reward_gate_high_difficulty_pressure_active(self):
-        return self._high_difficulty_gate()
-
-    def _reward_high_difficulty_pose_pressure(self):
-        asset = self._get_robot_asset()
-        roll, pitch = self._quat_to_roll_pitch(asset.data.root_quat_w)
-        pose_deviation = torch.abs(roll) + torch.abs(pitch)
-        pose_deviation = torch.nan_to_num(pose_deviation, nan=0.0, posinf=0.0, neginf=0.0)
-        return self._high_difficulty_gate() * pose_deviation
-
-    def _reward_high_difficulty_ang_vel_xy(self):
-        asset = self._get_robot_asset()
-        return self._high_difficulty_gate() * torch.linalg.norm(asset.data.root_ang_vel_b[:, :2], dim=1)
-
-    def _reward_high_difficulty_energy(self):
-        asset = self._get_robot_asset()
-        power = torch.sum(torch.abs(asset.data.applied_torque * asset.data.joint_vel), dim=1)
-        return self._high_difficulty_gate() * power
-
-    def _reward_high_stair_roll_pitch_abs(self):
-        asset = self._get_robot_asset()
-        roll, pitch = self._quat_to_roll_pitch(asset.data.root_quat_w)
-        pose_deviation = torch.abs(roll) + torch.abs(pitch)
-        pose_deviation = torch.nan_to_num(pose_deviation, nan=0.0, posinf=0.0, neginf=0.0)
-        return self._high_stair_gate() * pose_deviation
-
-    def _reward_high_stair_ang_vel_xy(self):
-        asset = self._get_robot_asset()
-        return self._high_stair_gate() * torch.linalg.norm(asset.data.root_ang_vel_b[:, :2], dim=1)
-
-    def _reward_high_stair_energy(self):
-        asset = self._get_robot_asset()
-        power = torch.sum(torch.abs(asset.data.applied_torque * asset.data.joint_vel), dim=1)
-        return self._high_stair_gate() * power
+    def _tracking_command(self, command_name: str = "base_velocity"):
+        return self.env.command_manager.get_command(command_name)
 
     @staticmethod
     def _quat_to_roll_pitch(quat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -886,6 +459,17 @@ class RewardProcess(RewardProcessBase):
         asset = self._get_robot_asset()
         return torch.sum(torch.abs(asset.data.applied_torque * asset.data.joint_vel), dim=1)
 
+    def _reward_energy_score_formula(self):
+        """Platform-aligned energy score: exp(-0.01 * sum(|torque × joint_vel|)).
+
+        与平台评分公式严格对齐：系数 0.01 与 base_scorer.py 中
+        energy_score = 100 * exp(-0.01 * mean_energy) 的指数核一致。
+        输出范围 (0, 1]，功率越低奖励越接近 1，直接引导策略降低能耗。
+        """
+        asset = self._get_robot_asset()
+        power = torch.sum(torch.abs(asset.data.applied_torque * asset.data.joint_vel), dim=1)
+        return torch.exp(-0.01 * power)
+
     def _reward_pose_score_formula(self):
         """Platform-aligned posture score: exp(-5 * (|roll| + |pitch|))."""
         asset = self._get_robot_asset()
@@ -893,6 +477,147 @@ class RewardProcess(RewardProcessBase):
         pose_deviation = torch.abs(roll) + torch.abs(pitch)
         pose_deviation = torch.nan_to_num(pose_deviation, nan=0.0, posinf=0.0, neginf=0.0)
         return torch.exp(-5.0 * pose_deviation)
+
+    def _reward_difficulty_pressure_complete(
+        self,
+        threshold: float = 0.6,
+        ema_decay: float = 0.995,
+        warmup_steps: int = 80,
+        min_std: float = 0.02,
+        std_scale: float = 2.0,
+        energy_weight: float = 0.6,
+        pressure_start: float = 0.55,
+        curve_power: float = 1.5,
+    ):
+        """Extra completion bonus for high-pressure episodes.
+
+        Pressure is inferred from the current episode mean energy/posture formula
+        scores relative to recent EMA statistics. It is never rewarded by itself;
+        only completed envs can receive the bonus.
+        """
+        if not hasattr(self.env, "goal_positions") or self.env.goal_positions is None:
+            return torch.zeros(self.env.num_envs, device=self.env.device)
+
+        num_envs = self.env.num_envs
+        device = self.env.device
+        asset = self._get_robot_asset()
+        power = torch.sum(torch.abs(asset.data.applied_torque * asset.data.joint_vel), dim=1)
+        energy_score = torch.exp(-0.01 * power)
+        roll, pitch = self._quat_to_roll_pitch(asset.data.root_quat_w)
+        pose_deviation = torch.nan_to_num(torch.abs(roll) + torch.abs(pitch), nan=0.0, posinf=0.0, neginf=0.0)
+        pose_score = torch.exp(-5.0 * pose_deviation)
+
+        if (
+            not hasattr(self.env, "_difficulty_pressure_energy_sum")
+            or self.env._difficulty_pressure_energy_sum.shape[0] != num_envs
+        ):
+            self.env._difficulty_pressure_energy_sum = torch.zeros(num_envs, device=device)
+            self.env._difficulty_pressure_pose_sum = torch.zeros(num_envs, device=device)
+            self.env._difficulty_pressure_step_count = torch.zeros(num_envs, device=device)
+
+        energy_sum = self.env._difficulty_pressure_energy_sum
+        pose_sum = self.env._difficulty_pressure_pose_sum
+        step_count = self.env._difficulty_pressure_step_count
+        energy_sum[:] = energy_sum + energy_score.detach()
+        pose_sum[:] = pose_sum + pose_score.detach()
+        step_count[:] = step_count + 1.0
+
+        safe_count = torch.clamp(step_count, min=1.0)
+        episode_energy_mean = energy_sum / safe_count
+        episode_pose_mean = pose_sum / safe_count
+        energy_mean_batch = episode_energy_mean.mean()
+        pose_mean_batch = episode_pose_mean.mean()
+        energy_var_batch = torch.mean(torch.square(episode_energy_mean - energy_mean_batch))
+        pose_var_batch = torch.mean(torch.square(episode_pose_mean - pose_mean_batch))
+
+        stats = getattr(self.env, "_difficulty_pressure_stats", None)
+        if stats is None:
+            stats = {
+                "energy_mean": energy_mean_batch.clone(),
+                "energy_var": torch.clamp(energy_var_batch, min=min_std * min_std).clone(),
+                "pose_mean": pose_mean_batch.clone(),
+                "pose_var": torch.clamp(pose_var_batch, min=min_std * min_std).clone(),
+                "steps": 0,
+            }
+            setattr(self.env, "_difficulty_pressure_stats", stats)
+
+        energy_std = torch.sqrt(torch.clamp(stats["energy_var"], min=min_std * min_std))
+        pose_std = torch.sqrt(torch.clamp(stats["pose_var"], min=min_std * min_std))
+        energy_pressure = torch.clamp((stats["energy_mean"] - episode_energy_mean) / max(std_scale, 1e-6) / energy_std, 0.0, 1.0)
+        pose_pressure = torch.clamp((stats["pose_mean"] - episode_pose_mean) / max(std_scale, 1e-6) / pose_std, 0.0, 1.0)
+        energy_weight = min(max(float(energy_weight), 0.0), 1.0)
+        pressure = energy_weight * energy_pressure + (1.0 - energy_weight) * pose_pressure
+        pressure_start = min(max(float(pressure_start), 0.0), 0.99)
+        bonus_pressure = torch.clamp((pressure - pressure_start) / max(1.0 - pressure_start, 1e-6), 0.0, 1.0)
+        if curve_power != 1.0:
+            bonus_pressure = torch.pow(bonus_pressure, max(float(curve_power), 1.0))
+
+        robot_pos = asset.data.root_pos_w[:, :2]
+        goal_pos = self.env.goal_positions[:, :2]
+        complete = (torch.norm(goal_pos - robot_pos, dim=1) < threshold).float()
+        reward = bonus_pressure.detach() * complete
+
+        decay = min(max(float(ema_decay), 0.0), 0.9999)
+        stats["energy_mean"] = (decay * stats["energy_mean"] + (1.0 - decay) * energy_mean_batch).detach()
+        stats["pose_mean"] = (decay * stats["pose_mean"] + (1.0 - decay) * pose_mean_batch).detach()
+        stats["energy_var"] = (
+            decay * stats["energy_var"] + (1.0 - decay) * torch.clamp(energy_var_batch, min=min_std * min_std)
+        ).detach()
+        stats["pose_var"] = (
+            decay * stats["pose_var"] + (1.0 - decay) * torch.clamp(pose_var_batch, min=min_std * min_std)
+        ).detach()
+        stats["steps"] = int(stats.get("steps", 0)) + 1
+        self.env._difficulty_pressure_metrics = {
+            "pressure": pressure.detach(),
+            "bonus_pressure": bonus_pressure.detach(),
+            "energy_pressure": energy_pressure.detach(),
+            "pose_pressure": pose_pressure.detach(),
+            "episode_energy_mean": episode_energy_mean.detach(),
+            "episode_pose_mean": episode_pose_mean.detach(),
+        }
+        try:
+            done = self.env.termination_manager.terminated | self.env.termination_manager.time_outs
+            if done.any():
+                energy_sum[done] = 0.0
+                pose_sum[done] = 0.0
+                step_count[done] = 0.0
+        except Exception:
+            pass
+        if stats["steps"] < int(warmup_steps):
+            return torch.zeros_like(reward)
+        return reward
+
+    def _reward_posture_stability(self):
+        """Penalize rapid changes in roll and pitch (1st-order finite difference).
+
+        姿态稳定性惩罚：惩罚 roll/pitch 的快速变化（一阶差分）。
+        直接指数奖励只惩罚当前偏角大小，无法抑制机身周期性震荡；
+        本项惩罚角度的变化速率，鼓励机身平稳过渡而非来回摇摆。
+        在楼梯、坡道过渡段尤其有效，可减少因步态节律不稳导致的
+        roll/pitch 振荡，直接提升姿态评分。
+        """
+        asset = self._get_robot_asset()
+        roll, pitch = self._quat_to_roll_pitch(asset.data.root_quat_w)
+
+        if not hasattr(self.env, "_posture_prev_roll") or self.env._posture_prev_roll.shape != roll.shape:
+            self.env._posture_prev_roll = roll.clone()
+            self.env._posture_prev_pitch = pitch.clone()
+
+        roll_rate = torch.abs(roll - self.env._posture_prev_roll)
+        pitch_rate = torch.abs(pitch - self.env._posture_prev_pitch)
+
+        try:
+            done = self.env.termination_manager.terminated | self.env.termination_manager.time_outs
+            if done.any():
+                roll_rate[done] = 0.0
+                pitch_rate[done] = 0.0
+        except Exception:
+            pass
+
+        self.env._posture_prev_roll = roll.clone()
+        self.env._posture_prev_pitch = pitch.clone()
+
+        return roll_rate + pitch_rate
 
     def _reward_correct_base_height(self, target_height: float = 0.38):
         """Penalize deviation of base height from target (squared).
@@ -1070,199 +795,6 @@ class RewardProcess(RewardProcessBase):
         scan = scanner.data.pos_w[:, 2:3] - scanner.data.ray_hits_w[..., 2]
         return scan.view(self.env.num_envs, 16, 16)
 
-    def _nav_grid(self):
-        scanner = self.env.scene.sensors.get("nav_scanner")
-        if scanner is None:
-            return None
-        try:
-            scan = scanner.data.pos_w[:, 2:3] - scanner.data.ray_hits_w[..., 2]
-            scan = torch.nan_to_num(scan, nan=0.0, posinf=0.0, neginf=0.0)
-            num_rays = scan.shape[-1]
-            if num_rays == 143:
-                return scan.view(self.env.num_envs, 13, 11)
-            side = int(num_rays ** 0.5)
-            if side * side == num_rays:
-                return scan.view(self.env.num_envs, side, side)
-        except Exception:
-            return None
-        return None
-
-    def _nav_or_height_wall_grid(self):
-        nav_grid = self._nav_grid()
-        if nav_grid is not None:
-            return nav_grid
-        return self._height_grid()
-
-    def _goal_distance_gate(self, goal_dist_gate: float = 14.0):
-        if not hasattr(self.env, "goal_positions") or self.env.goal_positions is None:
-            return torch.ones(self.env.num_envs, device=self.env.device)
-        _, goal_dist = self._goal_delta_body()
-        return (goal_dist < goal_dist_gate).float()
-
-    def _front_wall_score(
-        self,
-        grid,
-        obstacle_threshold: float = -0.24,
-        temperature: float = 0.08,
-        front_cols: int = 6,
-        body_y_start: int = 3,
-        body_y_end: int = 10,
-    ):
-        if grid is None:
-            return torch.zeros(self.env.num_envs, device=self.env.device)
-        cols = max(1, min(int(front_cols), grid.shape[2]))
-        y0 = max(0, int(body_y_start))
-        y1 = min(int(body_y_end), grid.shape[1])
-        if y1 <= y0:
-            return torch.zeros(self.env.num_envs, device=self.env.device)
-        sector = grid[:, y0:y1, :cols]
-        return self._wall_score_from_sector(sector, obstacle_threshold, temperature)
-
-    def _rough_terrain_gate(
-        self,
-        body_y_start: int = 4,
-        body_y_end: int = 12,
-        near_x_start: int = 1,
-        near_x_end: int = 10,
-        delta_quantile: float = 0.85,
-        min_delta: float = 0.025,
-        full_delta: float = 0.10,
-    ):
-        """Soft gate for slopes/stairs using forward height-scan roughness."""
-        grid = self._height_grid()
-        if grid is None:
-            return torch.zeros(self.env.num_envs, device=self.env.device)
-
-        window = grid[:, body_y_start:body_y_end, near_x_start:near_x_end]
-        if window.shape[1] == 0 or window.shape[2] <= 1:
-            return torch.zeros(self.env.num_envs, device=self.env.device)
-
-        deltas = torch.abs(window[:, :, 1:] - window[:, :, :-1])
-        if deltas.numel() == 0:
-            return torch.zeros(self.env.num_envs, device=self.env.device)
-
-        local_delta = torch.quantile(deltas.flatten(1), delta_quantile, dim=1)
-        denom = max(full_delta - min_delta, 1e-6)
-        return torch.clamp((local_delta - min_delta) / denom, 0.0, 1.0)
-
-    def _reward_rough_score_guidance(
-        self,
-        command_name: str = "base_velocity",
-        min_command: float = 0.15,
-        tracking_std: float = 0.38,
-        posture_weight: float = 0.75,
-        body_y_start: int = 4,
-        body_y_end: int = 12,
-        near_x_start: int = 1,
-        near_x_end: int = 10,
-        delta_quantile: float = 0.85,
-        min_delta: float = 0.025,
-        full_delta: float = 0.10,
-    ):
-        """Official-score-shaped posture/energy bonus on rough terrain."""
-        robot = self._get_robot_asset()
-        cmd = self._tracking_command(command_name)
-        cmd_xy = cmd[:, :2]
-        actual_xy = robot.data.root_lin_vel_b[:, :2]
-        cmd_speed = torch.linalg.norm(cmd_xy, dim=1)
-        moving_cmd = cmd_speed > min_command
-
-        vel_error = torch.sum(torch.square(cmd_xy - actual_xy), dim=1)
-        tracking_score = torch.exp(-vel_error / max(tracking_std * tracking_std, 1e-6))
-
-        roll, pitch = self._quat_to_roll_pitch(robot.data.root_quat_w)
-        pose_deviation = torch.abs(roll) + torch.abs(pitch)
-        pose_deviation = torch.nan_to_num(pose_deviation, nan=0.0, posinf=0.0, neginf=0.0)
-        pose_score = torch.exp(-5.0 * pose_deviation)
-        power = torch.sum(torch.abs(robot.data.applied_torque * robot.data.joint_vel), dim=1)
-        energy_score = torch.exp(-0.01 * power)
-
-        rough_gate = self._rough_terrain_gate(
-            body_y_start=body_y_start,
-            body_y_end=body_y_end,
-            near_x_start=near_x_start,
-            near_x_end=near_x_end,
-            delta_quantile=delta_quantile,
-            min_delta=min_delta,
-            full_delta=full_delta,
-        )
-        posture_weight = min(max(posture_weight, 0.0), 1.0)
-        score_hint = posture_weight * pose_score + (1.0 - posture_weight) * energy_score
-        return rough_gate * moving_cmd.float() * tracking_score * score_hint
-
-    def _reward_rough_ang_vel_xy(
-        self,
-        body_y_start: int = 4,
-        body_y_end: int = 12,
-        near_x_start: int = 1,
-        near_x_end: int = 10,
-        delta_quantile: float = 0.85,
-        min_delta: float = 0.025,
-        full_delta: float = 0.10,
-    ):
-        """Extra pitch/roll angular-velocity penalty only on rough terrain."""
-        robot = self._get_robot_asset()
-        rough_gate = self._rough_terrain_gate(
-            body_y_start=body_y_start,
-            body_y_end=body_y_end,
-            near_x_start=near_x_start,
-            near_x_end=near_x_end,
-            delta_quantile=delta_quantile,
-            min_delta=min_delta,
-            full_delta=full_delta,
-        )
-        return rough_gate * torch.linalg.norm(robot.data.root_ang_vel_b[:, :2], dim=1)
-
-    def _reward_rough_roll_pitch_abs(
-        self,
-        body_y_start: int = 4,
-        body_y_end: int = 12,
-        near_x_start: int = 1,
-        near_x_end: int = 10,
-        delta_quantile: float = 0.85,
-        min_delta: float = 0.015,
-        full_delta: float = 0.075,
-    ):
-        """Direct official posture penalty amplified on rough terrain."""
-        robot = self._get_robot_asset()
-        roll, pitch = self._quat_to_roll_pitch(robot.data.root_quat_w)
-        pose_deviation = torch.abs(roll) + torch.abs(pitch)
-        pose_deviation = torch.nan_to_num(pose_deviation, nan=0.0, posinf=0.0, neginf=0.0)
-        rough_gate = self._rough_terrain_gate(
-            body_y_start=body_y_start,
-            body_y_end=body_y_end,
-            near_x_start=near_x_start,
-            near_x_end=near_x_end,
-            delta_quantile=delta_quantile,
-            min_delta=min_delta,
-            full_delta=full_delta,
-        )
-        return rough_gate * pose_deviation
-
-    def _reward_rough_energy(
-        self,
-        body_y_start: int = 4,
-        body_y_end: int = 12,
-        near_x_start: int = 1,
-        near_x_end: int = 10,
-        delta_quantile: float = 0.85,
-        min_delta: float = 0.015,
-        full_delta: float = 0.075,
-    ):
-        """Extra official energy penalty where stairs/slopes usually hurt score."""
-        robot = self._get_robot_asset()
-        rough_gate = self._rough_terrain_gate(
-            body_y_start=body_y_start,
-            body_y_end=body_y_end,
-            near_x_start=near_x_start,
-            near_x_end=near_x_end,
-            delta_quantile=delta_quantile,
-            min_delta=min_delta,
-            full_delta=full_delta,
-        )
-        power = torch.sum(torch.abs(robot.data.applied_torque * robot.data.joint_vel), dim=1)
-        return rough_gate * power
-
     def _goal_vector_body(self):
         local_goal, dist = self._goal_delta_body()
         denom = torch.clamp(dist, min=1e-6).unsqueeze(1)
@@ -1278,6 +810,20 @@ class RewardProcess(RewardProcessBase):
         if sector.shape[1] == 0 or sector.shape[2] == 0:
             return torch.zeros(sector.shape[0], device=sector.device)
         return torch.sigmoid((obstacle_threshold - sector) / max(temperature, 1e-6)).mean(dim=(1, 2))
+
+    def _fractional_side_wall_mean(self, wall_prob: torch.Tensor, side_width: float, left: bool):
+        """Mean side wall probability with fractional row support, e.g. width=4.5."""
+        num_rows = wall_prob.shape[1]
+        width = max(1.0, min(float(side_width), float(num_rows) * 0.5))
+        row_idx = torch.arange(num_rows, device=wall_prob.device, dtype=wall_prob.dtype)
+        if left:
+            weights = torch.clamp(width - row_idx, min=0.0, max=1.0)
+        else:
+            weights = torch.clamp(width - (float(num_rows - 1) - row_idx), min=0.0, max=1.0)
+        weights = weights.view(1, num_rows, 1)
+        return (wall_prob * weights).sum(dim=(1, 2)) / torch.clamp(
+            weights.sum() * wall_prob.shape[2], min=1e-6
+        )
 
     def _maze_context_gate(
         self,
@@ -1367,11 +913,10 @@ class RewardProcess(RewardProcessBase):
         front_cols: int = 6,
         body_y_start: int = 3,
         body_y_end: int = 13,
-        side_width: int = 4,
+        side_width: float = 4.5,
         wall_start: float = 0.28,
         wall_full: float = 0.72,
         maze_goal_dist_gate: float = 14.0,
-        maze_gate_obstacle_threshold: float = -0.80,
     ):
         grid = self._height_grid()
         if grid is None:
@@ -1381,15 +926,14 @@ class RewardProcess(RewardProcessBase):
         front_cols = max(1, min(int(front_cols), grid.shape[2]))
         body_y_start = max(0, int(body_y_start))
         body_y_end = min(int(body_y_end), grid.shape[1])
-        side_width = max(1, min(int(side_width), grid.shape[1] // 2))
         if body_y_end <= body_y_start:
             zeros = torch.zeros(self.env.num_envs, device=self.env.device)
             return zeros, zeros
 
         wall_prob = torch.sigmoid((obstacle_threshold - grid[:, :, :front_cols]) / max(temperature, 1e-6))
         center_wall = wall_prob[:, body_y_start:body_y_end, :].mean(dim=(1, 2))
-        left_open = 1.0 - wall_prob[:, :side_width, :].mean(dim=(1, 2))
-        right_open = 1.0 - wall_prob[:, -side_width:, :].mean(dim=(1, 2))
+        left_open = 1.0 - self._fractional_side_wall_mean(wall_prob, side_width, left=True)
+        right_open = 1.0 - self._fractional_side_wall_mean(wall_prob, side_width, left=False)
         open_delta = right_open - left_open
 
         _, _, goal_dir = self._goal_vector_body()
@@ -1398,13 +942,12 @@ class RewardProcess(RewardProcessBase):
         turn_sign = torch.where(torch.abs(open_delta) > 0.08, visual_turn, goal_turn)
 
         wall_gate = torch.clamp((center_wall - wall_start) / max(wall_full - wall_start, 1e-6), 0.0, 1.0)
-        maze_gate = self._maze_context_gate(
-            grid,
-            goal_dist_gate=maze_goal_dist_gate,
-            obstacle_threshold=maze_gate_obstacle_threshold,
-            temperature=temperature,
-        )
-        return wall_gate * maze_gate, turn_sign
+        if hasattr(self.env, "goal_positions") and self.env.goal_positions is not None:
+            _, goal_dist = self._goal_delta_body()
+            phase_gate = (goal_dist < maze_goal_dist_gate).float()
+        else:
+            phase_gate = torch.ones(self.env.num_envs, device=self.env.device)
+        return wall_gate * phase_gate, turn_sign
 
     def _reward_maze_anticipatory_turn(
         self,
@@ -1413,15 +956,15 @@ class RewardProcess(RewardProcessBase):
         front_cols: int = 6,
         body_y_start: int = 3,
         body_y_end: int = 13,
-        side_width: int = 4,
+        side_width: float = 4.5,
         wall_start: float = 0.28,
         wall_full: float = 0.72,
         target_yaw_rate: float = 0.75,
-        target_forward_speed: float = 0.95,
+        target_forward_speed: float = 0.75,
         maze_goal_dist_gate: float = 14.0,
-        maze_gate_obstacle_threshold: float = -0.80,
+        near_goal_disable_dist: float = 0.0,
     ):
-        """Reward fast arcing turns toward a side opening before a maze wall."""
+        """Reward arcing turns toward the more open side before a maze wall."""
         robot = self._get_robot_asset()
         wall_gate, turn_sign = self._maze_front_wall_turn_features(
             obstacle_threshold=obstacle_threshold,
@@ -1433,8 +976,10 @@ class RewardProcess(RewardProcessBase):
             wall_start=wall_start,
             wall_full=wall_full,
             maze_goal_dist_gate=maze_goal_dist_gate,
-            maze_gate_obstacle_threshold=maze_gate_obstacle_threshold,
         )
+        if near_goal_disable_dist > 0.0 and hasattr(self.env, "goal_positions") and self.env.goal_positions is not None:
+            _, goal_dist = self._goal_delta_body()
+            wall_gate = wall_gate * (goal_dist > near_goal_disable_dist).float()
         yaw_toward_opening = torch.clamp(
             robot.data.root_ang_vel_b[:, 2] * turn_sign / max(target_yaw_rate, 1e-6),
             min=0.0,
@@ -1485,26 +1030,125 @@ class RewardProcess(RewardProcessBase):
         projection = torch.sum(robot.data.root_lin_vel_b[:, :2] * goal_dir, dim=1)
         return torch.clamp(-(projection + deadband), min=0.0) * (dist > 0.8).float()
 
-    def _reward_goal_near_wrong_direction_penalty(
+    def _reward_near_goal_circling_penalty(
         self,
-        near_dist: float = 2.2,
-        complete_threshold: float = 0.6,
-        speed_deadband: float = 0.25,
-        required_projection: float = 0.25,
-        max_penalty: float = 1.5,
+        near_dist: float = 3.5,
+        complete_dist: float = 0.6,
+        min_progress_speed: float = 0.10,
+        yaw_rate_threshold: float = 0.45,
+        lateral_speed_threshold: float = 0.18,
     ):
-        """Penalize moving fast near the goal without velocity projected toward it."""
+        """Penalize moving/turning near the finish without positive goal progress."""
+        if not hasattr(self.env, "goal_positions") or self.env.goal_positions is None:
+            return torch.zeros(self.env.num_envs, device=self.env.device)
+
         robot = self._get_robot_asset()
         _, dist, goal_dir = self._goal_vector_body()
         body_xy = robot.data.root_lin_vel_b[:, :2]
-        speed = torch.linalg.norm(body_xy, dim=1)
         projection = torch.sum(body_xy * goal_dir, dim=1)
+        yaw_rate = torch.abs(robot.data.root_ang_vel_b[:, 2])
+        lateral_speed = torch.abs(robot.data.root_lin_vel_b[:, 1])
 
-        near_gate = ((dist < near_dist) & (dist > complete_threshold)).float()
-        speed_gate = torch.clamp(speed - speed_deadband, min=0.0)
-        direction_shortfall = torch.clamp(required_projection - projection, min=0.0)
-        penalty = speed_gate * direction_shortfall
-        return near_gate * torch.clamp(penalty, 0.0, max_penalty)
+        near_gate = ((dist < near_dist) & (dist > complete_dist)).float()
+        no_progress = torch.clamp((min_progress_speed - projection) / max(min_progress_speed, 1e-6), 0.0, 1.0)
+        circling = torch.maximum(
+            torch.clamp((yaw_rate - yaw_rate_threshold) / max(yaw_rate_threshold, 1e-6), 0.0, 1.0),
+            torch.clamp((lateral_speed - lateral_speed_threshold) / max(lateral_speed_threshold, 1e-6), 0.0, 1.0),
+        )
+        return near_gate * no_progress * circling
+
+    def _reward_near_goal_finish_drive(
+        self,
+        near_dist: float = 1.6,
+        complete_dist: float = 0.6,
+        target_speed: float = 0.35,
+        yaw_rate_soft_limit: float = 0.35,
+        lateral_speed_soft_limit: float = 0.16,
+    ):
+        """Reward the final straight push into the goal capture radius."""
+        if not hasattr(self.env, "goal_positions") or self.env.goal_positions is None:
+            return torch.zeros(self.env.num_envs, device=self.env.device)
+
+        robot = self._get_robot_asset()
+        _, dist, goal_dir = self._goal_vector_body()
+        body_xy = robot.data.root_lin_vel_b[:, :2]
+        projection = torch.sum(body_xy * goal_dir, dim=1)
+        yaw_rate = torch.abs(robot.data.root_ang_vel_b[:, 2])
+        lateral_speed = torch.abs(robot.data.root_lin_vel_b[:, 1])
+
+        near_gate = ((dist < near_dist) & (dist > complete_dist)).float()
+        closeness = torch.clamp((near_dist - dist) / max(near_dist - complete_dist, 1e-6), 0.0, 1.0)
+        progress = torch.clamp(projection / max(target_speed, 1e-6), 0.0, 1.0)
+        steady_heading = 1.0 - torch.clamp(yaw_rate / max(yaw_rate_soft_limit, 1e-6), 0.0, 1.0)
+        centered_motion = 1.0 - torch.clamp(lateral_speed / max(lateral_speed_soft_limit, 1e-6), 0.0, 1.0)
+        return near_gate * closeness * progress * torch.clamp(0.5 * (steady_heading + centered_motion), 0.0, 1.0)
+
+    def _reward_near_goal_retreat_penalty(
+        self,
+        near_dist: float = 1.6,
+        complete_dist: float = 0.6,
+        retreat_deadband: float = 0.03,
+        target_speed: float = 0.25,
+    ):
+        """Strongly penalize moving away from the goal after the final approach starts."""
+        if not hasattr(self.env, "goal_positions") or self.env.goal_positions is None:
+            return torch.zeros(self.env.num_envs, device=self.env.device)
+
+        robot = self._get_robot_asset()
+        _, dist, goal_dir = self._goal_vector_body()
+        projection = torch.sum(robot.data.root_lin_vel_b[:, :2] * goal_dir, dim=1)
+        near_gate = ((dist < near_dist) & (dist > complete_dist)).float()
+        retreat = torch.clamp(-(projection + retreat_deadband) / max(target_speed, 1e-6), 0.0, 1.0)
+        closeness = torch.clamp((near_dist - dist) / max(near_dist - complete_dist, 1e-6), 0.0, 1.0)
+        return near_gate * retreat * (0.5 + 0.5 * closeness)
+
+    def _reward_goal_miss_penalty(
+        self,
+        near_dist: float = 3.5,
+        complete_dist: float = 0.6,
+        miss_margin: float = 0.45,
+        reset_dist: float = 5.0,
+    ):
+        """Penalize drifting away after the robot has already entered the finish area."""
+        if not hasattr(self.env, "goal_positions") or self.env.goal_positions is None:
+            return torch.zeros(self.env.num_envs, device=self.env.device)
+
+        _, current_dist = self._goal_delta_body()
+        num_envs = self.env.num_envs
+        device = self.env.device
+
+        if (
+            not hasattr(self.env, "_nav_near_goal_best_dist")
+            or self.env._nav_near_goal_best_dist.shape != current_dist.shape
+        ):
+            self.env._nav_near_goal_best_dist = torch.full_like(current_dist, reset_dist)
+            self.env._nav_near_goal_active = torch.zeros(num_envs, dtype=torch.bool, device=device)
+
+        if (
+            not hasattr(self.env, "_nav_near_goal_active")
+            or self.env._nav_near_goal_active.shape != current_dist.shape
+        ):
+            self.env._nav_near_goal_active = torch.zeros(num_envs, dtype=torch.bool, device=device)
+
+        active = self.env._nav_near_goal_active
+        entered = current_dist < near_dist
+        active[:] = active | entered
+        active[:] = active & (current_dist < reset_dist)
+
+        best_dist = self.env._nav_near_goal_best_dist
+        best_dist[:] = torch.where(active, torch.minimum(best_dist, current_dist), torch.full_like(best_dist, reset_dist))
+        miss = torch.clamp((current_dist - best_dist - miss_margin) / max(miss_margin, 1e-6), min=0.0, max=1.0)
+        miss = miss * active.float() * (current_dist > complete_dist).float()
+
+        try:
+            done = self.env.termination_manager.terminated | self.env.termination_manager.time_outs
+            if done.any():
+                active[done] = False
+                best_dist[done] = reset_dist
+        except Exception:
+            pass
+
+        return miss
 
     def _reward_goal_distance(self, scale: float = 8.0):
         """Dense bounded reward that increases as the robot gets closer."""
@@ -1521,48 +1165,6 @@ class RewardProcess(RewardProcessBase):
         goal_pos = self.env.goal_positions[:, :2]
         dist = torch.norm(goal_pos - robot_pos, dim=1)
         return (dist < threshold).float()
-
-    def _reward_goal_miss_penalty(
-        self,
-        near_dist: float = 1.8,
-        miss_margin: float = 0.18,
-        max_penalty_dist: float = 1.2,
-        complete_threshold: float = 0.6,
-    ):
-        """Penalize moving away after already entering the goal-capture neighborhood."""
-        if not hasattr(self.env, "goal_positions") or self.env.goal_positions is None:
-            return torch.zeros(self.env.num_envs, device=self.env.device)
-
-        _, dist = self._goal_delta_body()
-        best = getattr(self.env, "_goal_miss_best_dist", None)
-        valid = getattr(self.env, "_goal_miss_valid", None)
-        if best is None or best.shape != dist.shape:
-            self.env._goal_miss_best_dist = dist.detach().clone()
-            self.env._goal_miss_valid = torch.ones_like(dist, dtype=torch.bool)
-            return torch.zeros_like(dist)
-        if valid is None or valid.shape != dist.shape:
-            valid = torch.ones_like(dist, dtype=torch.bool)
-
-        reset_mask = torch.zeros_like(valid)
-        try:
-            term_mgr = self.env.termination_manager
-            reset_mask = (term_mgr.terminated | term_mgr.time_outs).bool()
-        except Exception:
-            pass
-
-        prev_best = torch.where(reset_mask | (~valid), dist, best.to(device=dist.device, dtype=dist.dtype))
-        entered_goal_area = prev_best < near_dist
-        complete = dist < complete_threshold
-        miss = torch.clamp(dist - prev_best - miss_margin, min=0.0, max=max_penalty_dist)
-        penalty = miss * entered_goal_area.float() * (~complete).float() * (~reset_mask).float()
-
-        self.env._goal_miss_best_dist = torch.where(
-            reset_mask | complete,
-            dist,
-            torch.minimum(prev_best, dist),
-        ).detach().clone()
-        self.env._goal_miss_valid = (~reset_mask).detach().clone()
-        return penalty
 
     def _reward_wall_proximity(
         self,
@@ -1630,91 +1232,6 @@ class RewardProcess(RewardProcessBase):
             temperature=temperature,
         )
         return wall_intensity * penalty * gate
-
-    def _reward_nav_wall_impact_penalty(
-        self,
-        obstacle_threshold: float = -0.24,
-        front_cols: int = 6,
-        body_y_start: int = 3,
-        body_y_end: int = 10,
-        wall_score_threshold: float = 0.35,
-        temperature: float = 0.08,
-        decel_deadband: float = 0.18,
-        speed_start: float = 0.25,
-        speed_full: float = 1.10,
-        maze_goal_dist_gate: float = 14.0,
-    ):
-        """Penalize wall impact inferred from a sudden forward-speed drop near a wall."""
-        robot = self._get_robot_asset()
-        vx = robot.data.root_lin_vel_b[:, 0]
-        grid = self._nav_or_height_wall_grid()
-        wall_score = self._front_wall_score(
-            grid,
-            obstacle_threshold=obstacle_threshold,
-            temperature=temperature,
-            front_cols=front_cols,
-            body_y_start=body_y_start,
-            body_y_end=body_y_end,
-        )
-
-        prev_vx = getattr(self.env, "_nav_wall_impact_prev_vx", None)
-        if prev_vx is None or prev_vx.shape != vx.shape:
-            self.env._nav_wall_impact_prev_vx = vx.detach().clone()
-            return torch.zeros_like(vx)
-
-        decel = torch.clamp(prev_vx.to(device=vx.device, dtype=vx.dtype) - vx - decel_deadband, min=0.0)
-        speed_scale = torch.clamp(
-            (prev_vx.to(device=vx.device, dtype=vx.dtype) - speed_start)
-            / max(speed_full - speed_start, 1.0e-6),
-            0.0,
-            1.0,
-        )
-        wall_gate = torch.clamp(
-            (wall_score - wall_score_threshold) / max(1.0 - wall_score_threshold, 1.0e-6),
-            0.0,
-            1.0,
-        )
-        maze_gate = self._goal_distance_gate(maze_goal_dist_gate)
-        self.env._nav_wall_impact_prev_vx = vx.detach().clone()
-        return wall_gate * decel * speed_scale * maze_gate
-
-    def _reward_nav_wall_stuck_push_penalty(
-        self,
-        obstacle_threshold: float = -0.24,
-        front_cols: int = 6,
-        body_y_start: int = 3,
-        body_y_end: int = 10,
-        wall_score_threshold: float = 0.42,
-        temperature: float = 0.08,
-        still_speed: float = 0.12,
-        goal_dist_threshold: float = 0.8,
-        min_command: float = 0.05,
-        maze_goal_dist_gate: float = 14.0,
-    ):
-        """Penalize staying nearly still while still commanded to push into a front wall."""
-        robot = self._get_robot_asset()
-        grid = self._nav_or_height_wall_grid()
-        wall_score = self._front_wall_score(
-            grid,
-            obstacle_threshold=obstacle_threshold,
-            temperature=temperature,
-            front_cols=front_cols,
-            body_y_start=body_y_start,
-            body_y_end=body_y_end,
-        )
-        wall_gate = torch.clamp(
-            (wall_score - wall_score_threshold) / max(1.0 - wall_score_threshold, 1.0e-6),
-            0.0,
-            1.0,
-        )
-        body_speed = torch.linalg.norm(robot.data.root_lin_vel_b[:, :2], dim=1)
-        cmd_vx = self._tracking_command("base_velocity")[:, 0]
-        _, goal_dist = self._goal_delta_body()
-        stuck_gate = (body_speed < still_speed).float()
-        push_gate = (cmd_vx > min_command).float()
-        not_done_gate = (goal_dist > goal_dist_threshold).float()
-        maze_gate = self._goal_distance_gate(maze_goal_dist_gate)
-        return wall_gate * stuck_gate * push_gate * not_done_gate * maze_gate
 
     def _reward_wall_stall_penalty(
         self,
@@ -1968,6 +1485,62 @@ class RewardProcess(RewardProcessBase):
         cmd_speed = torch.linalg.norm(cmd[:, :2], dim=1)
         body_speed = torch.linalg.norm(robot.data.root_lin_vel_b[:, :2], dim=1)
         return ((cmd_speed > min_command) & (body_speed < still_speed) & (dist > 0.8)).float()
+
+    def _reward_long_non_foot_contact(
+        self,
+        force_threshold: float = 5.0,
+        duration_s: float = 1.0,
+        step_dt: float = 0.02,
+        max_penalty: float = 2.0,
+        maze_only: bool = True,
+        maze_goal_dist_gate: float = 14.0,
+    ):
+        """Penalize sustained real contact on non-foot bodies, useful for corner jams."""
+        sensor_cfg = self._get_foot_sensor_cfg()
+        contact_sensor = self.env.scene.sensors[sensor_cfg.name]
+        forces = contact_sensor.data.net_forces_w
+        if forces is None or forces.ndim != 3:
+            return torch.zeros(self.env.num_envs, device=self.env.device)
+
+        num_bodies = forces.shape[1]
+        if num_bodies <= 0:
+            return torch.zeros(self.env.num_envs, device=self.env.device)
+
+        non_foot_mask = torch.ones(num_bodies, dtype=torch.bool, device=forces.device)
+        foot_ids = torch.as_tensor(sensor_cfg.body_ids, dtype=torch.long, device=forces.device)
+        foot_ids = foot_ids[(foot_ids >= 0) & (foot_ids < num_bodies)]
+        if foot_ids.numel() == 0:
+            return torch.zeros(self.env.num_envs, device=self.env.device)
+        non_foot_mask[foot_ids] = False
+        if not non_foot_mask.any():
+            return torch.zeros(self.env.num_envs, device=self.env.device)
+
+        contact_force = forces[:, non_foot_mask, :].norm(dim=-1).amax(dim=1)
+        active_contact = contact_force > force_threshold
+        if maze_only and hasattr(self.env, "goal_positions") and self.env.goal_positions is not None:
+            _, goal_dist = self._goal_delta_body()
+            active_contact = active_contact & (goal_dist < maze_goal_dist_gate)
+
+        if (
+            not hasattr(self.env, "_rl_non_foot_contact_steps")
+            or self.env._rl_non_foot_contact_steps.shape[0] != self.env.num_envs
+        ):
+            self.env._rl_non_foot_contact_steps = torch.zeros(
+                self.env.num_envs, dtype=torch.long, device=self.env.device
+            )
+
+        steps = self.env._rl_non_foot_contact_steps
+        steps[:] = torch.where(active_contact, steps + 1, torch.zeros_like(steps))
+        try:
+            done = self.env.termination_manager.terminated | self.env.termination_manager.time_outs
+            if done.any():
+                steps[done] = 0
+        except Exception:
+            pass
+
+        threshold_steps = max(int(duration_s / max(step_dt, 1e-6)), 1)
+        over = torch.clamp((steps.float() - float(threshold_steps)) / float(threshold_steps), min=0.0)
+        return torch.clamp(over + (steps >= threshold_steps).float(), min=0.0, max=max_penalty)
 
     def _reward_navigation_time(self):
         return torch.ones(self.env.num_envs, device=self.env.device)

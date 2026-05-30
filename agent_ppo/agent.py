@@ -26,68 +26,6 @@ from agent_ppo.algorithm.algorithm_ppo import AlgorithmPPO
 from tools.train_env_conf_validate import check_usr_conf
 
 
-def _obs_height_grid(obs, scan_start: int = 45, scan_size: int = 256):
-    if obs is None or not hasattr(obs, "shape") or obs.shape[-1] < scan_start + scan_size:
-        return None
-    side = int(scan_size ** 0.5)
-    if side * side != scan_size:
-        return None
-    return obs[:, scan_start:scan_start + scan_size].view(obs.shape[0], side, side)
-
-
-def _classify_pre_maze_terrain(obs, rl_nav_conf):
-    grid = _obs_height_grid(
-        obs,
-        scan_start=int(rl_nav_conf.get("scan_start", 45)),
-        scan_size=int(rl_nav_conf.get("scan_size", 256)),
-    )
-    if grid is None:
-        return None
-
-    row_start = max(int(rl_nav_conf.get("terrain_row_start", 3)), 0)
-    row_end = min(int(rl_nav_conf.get("terrain_row_end", 13)), grid.shape[1])
-    front_cols = min(int(rl_nav_conf.get("terrain_front_cols", 8)), grid.shape[2])
-    if row_end <= row_start or front_cols <= 1:
-        return None
-
-    sector = grid[:, row_start:row_end, :front_cols]
-    if sector.shape[1] == 0 or sector.shape[2] <= 1:
-        return None
-
-    lateral_std = sector.std(dim=1, unbiased=False).mean(dim=1)
-    dx = sector[:, :, 1:] - sector[:, :, :-1]
-    abs_dx = dx.abs()
-    if abs_dx.numel() == 0:
-        return None
-
-    q = float(rl_nav_conf.get("terrain_step_quantile", 0.85))
-    q = min(max(q, 0.0), 1.0)
-    step_strength = torch.quantile(abs_dx.flatten(1), q, dim=1)
-    sign_consistency = dx.mean(dim=(1, 2)).abs() / (abs_dx.mean(dim=(1, 2)) + 1e-6)
-    if dx.shape[2] > 1:
-        second_diff = (dx[:, :, 1:] - dx[:, :, :-1]).abs().mean(dim=(1, 2))
-    else:
-        second_diff = torch.zeros(obs.shape[0], device=obs.device, dtype=obs.dtype)
-
-    is_uniform = lateral_std < float(rl_nav_conf.get("terrain_lateral_std_threshold", 0.18))
-    not_wall = sector.amin(dim=(1, 2)) > float(rl_nav_conf.get("terrain_wall_height_threshold", -1.05))
-    terrain_like = is_uniform & not_wall & (
-        step_strength > float(rl_nav_conf.get("terrain_slope_delta_threshold", 0.035))
-    )
-    stair_like = terrain_like & (
-        (step_strength > float(rl_nav_conf.get("terrain_stair_delta_threshold", 0.10)))
-        | (second_diff > float(rl_nav_conf.get("terrain_stair_second_diff_threshold", 0.055)))
-    )
-    slope_like = terrain_like & ~stair_like & (
-        sign_consistency > float(rl_nav_conf.get("terrain_slope_sign_consistency_threshold", 0.55))
-    )
-
-    terrain_id = torch.zeros(obs.shape[0], dtype=torch.long, device=obs.device)
-    terrain_id = torch.where(slope_like, torch.ones_like(terrain_id), terrain_id)
-    terrain_id = torch.where(stair_like, torch.full_like(terrain_id, 2), terrain_id)
-    return terrain_id
-
-
 class Agent(BaseAgent):
     def __init__(self, agent_type="player", device="cuda", logger=None, monitor=None):
         self.cur_model_name = "ActorCritic"
@@ -122,67 +60,6 @@ class Agent(BaseAgent):
 
         self._init_flat(num_proprio, num_scan, num_goal_obs, stage)
 
-        train_stage_conf = {}
-        if is_eval and stage.task_type == "track":
-            train_stage_conf = self._load_train_stage_conf(stage)
-
-        # Pure-RL navigation: no local planner is used.  In evaluation, platform
-        # command ranges may be unrelated to this training objective, so keep the
-        # policy command observation aligned with the forward-walking anchor.
-        self.eval_command_override = None
-        self.eval_phase_command_enabled = False
-        self.eval_pre_maze_command = None
-        self.eval_slope_command = None
-        self.eval_stairs_command = None
-        self.eval_maze_command = None
-        self.eval_phase_maze_goal_dist_gate = 14.0
-        self.eval_rl_nav_conf = {}
-        if is_eval and stage.task_type == "track":
-            rl_nav_conf = train_stage_conf.get("rl_navigation", {}).copy()
-            rl_nav_conf.update(usr_conf.get("rl_navigation", {}))
-            self.eval_rl_nav_conf = rl_nav_conf.copy()
-            self.eval_phase_command_enabled = bool(rl_nav_conf.get("phase_command_enabled", False))
-            self.eval_phase_maze_goal_dist_gate = float(
-                rl_nav_conf.get("phase_maze_goal_dist_gate", 14.0)
-            )
-            fallback_vx = float(rl_nav_conf.get("fallback_lin_vel_x", 0.90))
-            slope_range = rl_nav_conf.get("slope_lin_vel_x", [fallback_vx, fallback_vx])
-            stairs_range = rl_nav_conf.get("stairs_lin_vel_x", [fallback_vx, fallback_vx])
-            maze_range = rl_nav_conf.get("maze_lin_vel_x", [0.45, 0.65])
-            self.eval_pre_maze_command = torch.tensor(
-                [fallback_vx, 0.0, 0.0],
-                device=self.device,
-                dtype=torch.float32,
-            )
-            if len(slope_range) == 2:
-                self.eval_slope_command = torch.tensor(
-                    [0.5 * (float(slope_range[0]) + float(slope_range[1])), 0.0, 0.0],
-                    device=self.device,
-                    dtype=torch.float32,
-                )
-            if len(stairs_range) == 2:
-                self.eval_stairs_command = torch.tensor(
-                    [0.5 * (float(stairs_range[0]) + float(stairs_range[1])), 0.0, 0.0],
-                    device=self.device,
-                    dtype=torch.float32,
-                )
-            if len(maze_range) == 2:
-                self.eval_maze_command = torch.tensor(
-                    [0.5 * (float(maze_range[0]) + float(maze_range[1])), 0.0, 0.0],
-                    device=self.device,
-                    dtype=torch.float32,
-                )
-            if bool(rl_nav_conf.get("eval_command_override", True)):
-                cmd = rl_nav_conf.get("eval_command", [0.55, 0.0, 0.0])
-                if len(cmd) == 3:
-                    self.eval_command_override = torch.tensor(
-                        cmd, device=self.device, dtype=torch.float32
-                    )
-                    self.logger.info(
-                        "[RLNavigation] Eval policy command obs override enabled: "
-                        f"{cmd}"
-                    )
-
         self.num_steps_per_env = stage.num_steps_per_env
         self.save_interval = stage.model_save_interval
 
@@ -214,38 +91,10 @@ class Agent(BaseAgent):
             return {}
 
     def _apply_eval_command_to_obs(self, obs):
-        if obs is None or obs.shape[-1] < 9:
-            return obs
-        if (
-            self.eval_phase_command_enabled
-            and self.eval_pre_maze_command is not None
-            and self.eval_maze_command is not None
-            and obs.shape[-1] >= 304
-        ):
-            nav_obs = obs.clone()
-            goal_dist = torch.clamp(nav_obs[:, 303], 0.0, 1.0) * 20.0
-            maze_phase = goal_dist < self.eval_phase_maze_goal_dist_gate
-            command = self.eval_pre_maze_command.to(device=obs.device, dtype=obs.dtype).expand(obs.shape[0], -1)
-            if bool(self.eval_rl_nav_conf.get("terrain_phase_speed_enabled", False)):
-                terrain_id = _classify_pre_maze_terrain(nav_obs, self.eval_rl_nav_conf)
-                if terrain_id is not None:
-                    if self.eval_slope_command is not None:
-                        slope_command = self.eval_slope_command.to(device=obs.device, dtype=obs.dtype).expand(obs.shape[0], -1)
-                        command = torch.where((terrain_id == 1).unsqueeze(1), slope_command, command)
-                    if self.eval_stairs_command is not None:
-                        stairs_command = self.eval_stairs_command.to(device=obs.device, dtype=obs.dtype).expand(obs.shape[0], -1)
-                        command = torch.where((terrain_id == 2).unsqueeze(1), stairs_command, command)
-            maze_command = self.eval_maze_command.to(device=obs.device, dtype=obs.dtype).expand(obs.shape[0], -1)
-            command = torch.where(maze_phase.unsqueeze(1), maze_command, command)
-            nav_obs[:, 6:9] = command
-            return nav_obs
-        if self.eval_command_override is None:
-            return obs
-        nav_obs = obs.clone()
-        nav_obs[:, 6:9] = self.eval_command_override.to(
-            device=obs.device, dtype=obs.dtype
-        )
-        return nav_obs
+        # Evaluation command adaptation is handled in PolicyObservationProcess,
+        # where the env sensors are available.  Keep this as a no-op to avoid
+        # double-patching obs[:, 6:9].
+        return obs
 
     def _init_flat(self, num_proprio, num_scan, num_goal_obs, stage):
         """

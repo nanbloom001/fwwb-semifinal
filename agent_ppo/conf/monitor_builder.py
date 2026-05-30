@@ -65,57 +65,6 @@ def build_monitor():
         .end_group()
 
         # ==============================================================
-        # Track result diagnostics from platform scorer counters only.
-        # These panels do not depend on custom rewards or rollout-side probes.
-        # ==============================================================
-        .add_group(group_name="Track结果诊断", group_name_en="track_result_diagnostics")
-        .add_panel(name="完成率", name_en="track_completion_ratio", type="line")
-            .add_metric(metrics_name="completion_pct",
-                        expr="100 * avg(completed_count{}) / clamp_min(avg(completed_count{}) + avg(abnormal_count{}) + avg(timeout_count{}), 1)")
-            .add_metric(metrics_name="abnormal_pct",
-                        expr="100 * avg(abnormal_count{}) / clamp_min(avg(completed_count{}) + avg(abnormal_count{}) + avg(timeout_count{}), 1)")
-            .add_metric(metrics_name="timeout_pct",
-                        expr="100 * avg(timeout_count{}) / clamp_min(avg(completed_count{}) + avg(abnormal_count{}) + avg(timeout_count{}), 1)")
-            .end_panel()
-        .add_panel(name="L样本基数", name_en="track_level_episode_count", type="line")
-            .add_metric(metrics_name="l0_count", expr="avg(completed_count_track_l0{}) + avg(abnormal_count_track_l0{}) + avg(timeout_count_track_l0{})")
-            .add_metric(metrics_name="l1_count", expr="avg(completed_count_track_l1{}) + avg(abnormal_count_track_l1{}) + avg(timeout_count_track_l1{})")
-            .add_metric(metrics_name="l2_count", expr="avg(completed_count_track_l2{}) + avg(abnormal_count_track_l2{}) + avg(timeout_count_track_l2{})")
-            .add_metric(metrics_name="l3_count", expr="avg(completed_count_track_l3{}) + avg(abnormal_count_track_l3{}) + avg(timeout_count_track_l3{})")
-            .add_metric(metrics_name="l4_count", expr="avg(completed_count_track_l4{}) + avg(abnormal_count_track_l4{}) + avg(timeout_count_track_l4{})")
-            .add_metric(metrics_name="l5_count", expr="avg(completed_count_track_l5{}) + avg(abnormal_count_track_l5{}) + avg(timeout_count_track_l5{})")
-            .add_metric(metrics_name="l6_count", expr="avg(completed_count_track_l6{}) + avg(abnormal_count_track_l6{}) + avg(timeout_count_track_l6{})")
-            .add_metric(metrics_name="l7_count", expr="avg(completed_count_track_l7{}) + avg(abnormal_count_track_l7{}) + avg(timeout_count_track_l7{})")
-            .add_metric(metrics_name="l8_count", expr="avg(completed_count_track_l8{}) + avg(abnormal_count_track_l8{}) + avg(timeout_count_track_l8{})")
-            .add_metric(metrics_name="l9_count", expr="avg(completed_count_track_l9{}) + avg(abnormal_count_track_l9{}) + avg(timeout_count_track_l9{})")
-            .end_panel()
-        .add_panel(name="L异常率", name_en="track_level_abnormal_pct", type="line")
-            .add_metric(metrics_name="l0_abn_pct", expr="100 * avg(abnormal_count_track_l0{}) / clamp_min(avg(completed_count_track_l0{}) + avg(abnormal_count_track_l0{}) + avg(timeout_count_track_l0{}), 1)")
-            .add_metric(metrics_name="l1_abn_pct", expr="100 * avg(abnormal_count_track_l1{}) / clamp_min(avg(completed_count_track_l1{}) + avg(abnormal_count_track_l1{}) + avg(timeout_count_track_l1{}), 1)")
-            .add_metric(metrics_name="l2_abn_pct", expr="100 * avg(abnormal_count_track_l2{}) / clamp_min(avg(completed_count_track_l2{}) + avg(abnormal_count_track_l2{}) + avg(timeout_count_track_l2{}), 1)")
-            .add_metric(metrics_name="l3_abn_pct", expr="100 * avg(abnormal_count_track_l3{}) / clamp_min(avg(completed_count_track_l3{}) + avg(abnormal_count_track_l3{}) + avg(timeout_count_track_l3{}), 1)")
-            .add_metric(metrics_name="l4_abn_pct", expr="100 * avg(abnormal_count_track_l4{}) / clamp_min(avg(completed_count_track_l4{}) + avg(abnormal_count_track_l4{}) + avg(timeout_count_track_l4{}), 1)")
-            .add_metric(metrics_name="l5_abn_pct", expr="100 * avg(abnormal_count_track_l5{}) / clamp_min(avg(completed_count_track_l5{}) + avg(abnormal_count_track_l5{}) + avg(timeout_count_track_l5{}), 1)")
-            .add_metric(metrics_name="l6_abn_pct", expr="100 * avg(abnormal_count_track_l6{}) / clamp_min(avg(completed_count_track_l6{}) + avg(abnormal_count_track_l6{}) + avg(timeout_count_track_l6{}), 1)")
-            .add_metric(metrics_name="l7_abn_pct", expr="100 * avg(abnormal_count_track_l7{}) / clamp_min(avg(completed_count_track_l7{}) + avg(abnormal_count_track_l7{}) + avg(timeout_count_track_l7{}), 1)")
-            .add_metric(metrics_name="l8_abn_pct", expr="100 * avg(abnormal_count_track_l8{}) / clamp_min(avg(completed_count_track_l8{}) + avg(abnormal_count_track_l8{}) + avg(timeout_count_track_l8{}), 1)")
-            .add_metric(metrics_name="l9_abn_pct", expr="100 * avg(abnormal_count_track_l9{}) / clamp_min(avg(completed_count_track_l9{}) + avg(abnormal_count_track_l9{}) + avg(timeout_count_track_l9{}), 1)")
-            .end_panel()
-        .add_panel(name="L超时率", name_en="track_level_timeout_pct", type="line")
-            .add_metric(metrics_name="l0_timeout_pct", expr="100 * avg(timeout_count_track_l0{}) / clamp_min(avg(completed_count_track_l0{}) + avg(abnormal_count_track_l0{}) + avg(timeout_count_track_l0{}), 1)")
-            .add_metric(metrics_name="l1_timeout_pct", expr="100 * avg(timeout_count_track_l1{}) / clamp_min(avg(completed_count_track_l1{}) + avg(abnormal_count_track_l1{}) + avg(timeout_count_track_l1{}), 1)")
-            .add_metric(metrics_name="l2_timeout_pct", expr="100 * avg(timeout_count_track_l2{}) / clamp_min(avg(completed_count_track_l2{}) + avg(abnormal_count_track_l2{}) + avg(timeout_count_track_l2{}), 1)")
-            .add_metric(metrics_name="l3_timeout_pct", expr="100 * avg(timeout_count_track_l3{}) / clamp_min(avg(completed_count_track_l3{}) + avg(abnormal_count_track_l3{}) + avg(timeout_count_track_l3{}), 1)")
-            .add_metric(metrics_name="l4_timeout_pct", expr="100 * avg(timeout_count_track_l4{}) / clamp_min(avg(completed_count_track_l4{}) + avg(abnormal_count_track_l4{}) + avg(timeout_count_track_l4{}), 1)")
-            .add_metric(metrics_name="l5_timeout_pct", expr="100 * avg(timeout_count_track_l5{}) / clamp_min(avg(completed_count_track_l5{}) + avg(abnormal_count_track_l5{}) + avg(timeout_count_track_l5{}), 1)")
-            .add_metric(metrics_name="l6_timeout_pct", expr="100 * avg(timeout_count_track_l6{}) / clamp_min(avg(completed_count_track_l6{}) + avg(abnormal_count_track_l6{}) + avg(timeout_count_track_l6{}), 1)")
-            .add_metric(metrics_name="l7_timeout_pct", expr="100 * avg(timeout_count_track_l7{}) / clamp_min(avg(completed_count_track_l7{}) + avg(abnormal_count_track_l7{}) + avg(timeout_count_track_l7{}), 1)")
-            .add_metric(metrics_name="l8_timeout_pct", expr="100 * avg(timeout_count_track_l8{}) / clamp_min(avg(completed_count_track_l8{}) + avg(abnormal_count_track_l8{}) + avg(timeout_count_track_l8{}), 1)")
-            .add_metric(metrics_name="l9_timeout_pct", expr="100 * avg(timeout_count_track_l9{}) / clamp_min(avg(completed_count_track_l9{}) + avg(abnormal_count_track_l9{}) + avg(timeout_count_track_l9{}), 1)")
-            .end_panel()
-        .end_group()
-
-        # ==============================================================
         # Group 1: PPO algorithm loss curves
         # Group 1: PPO 算法损失曲线
         # ==============================================================
@@ -143,6 +92,10 @@ def build_monitor():
             .add_metric(metrics_name="reward_track_lin_vel_xy",
                         expr="avg(reward_track_lin_vel_xy{})")
             .end_panel()
+        .add_panel(name="建议速度优势", name_en="reward_command_speed_advantage", type="line")
+            .add_metric(metrics_name="reward_command_speed_advantage",
+                        expr="avg(reward_command_speed_advantage{})")
+            .end_panel()
         .add_panel(name="偏航角速度跟踪", name_en="reward_track_ang_vel_z", type="line")
             .add_metric(metrics_name="reward_track_ang_vel_z",
                         expr="avg(reward_track_ang_vel_z{})")
@@ -165,6 +118,10 @@ def build_monitor():
         .add_panel(name="机身水平姿态惩罚", name_en="reward_flat_orientation", type="line")
             .add_metric(metrics_name="reward_flat_orientation",
                         expr="avg(reward_flat_orientation{})")
+            .end_panel()
+        .add_panel(name="姿态公式分", name_en="reward_pose_score_formula", type="line")
+            .add_metric(metrics_name="reward_pose_score_formula",
+                        expr="avg(reward_pose_score_formula{})")
             .end_panel()
         .add_panel(name="机身高度惩罚", name_en="reward_correct_base_height", type="line")
             .add_metric(metrics_name="reward_correct_base_height",
@@ -266,17 +223,13 @@ def build_monitor():
             .add_metric(metrics_name="reward_energy",
                         expr="avg(reward_energy{})")
             .end_panel()
+        .add_panel(name="能耗公式分", name_en="reward_energy_score_formula", type="line")
+            .add_metric(metrics_name="reward_energy_score_formula",
+                        expr="avg(reward_energy_score_formula{})")
+            .end_panel()
         .add_panel(name="关节扭矩惩罚", name_en="reward_joint_torques", type="line")
             .add_metric(metrics_name="reward_joint_torques",
                         expr="avg(reward_joint_torques{})")
-            .end_panel()
-        .add_panel(name="高难度压力", name_en="high_difficulty_pressure", type="line")
-            .add_metric(metrics_name="reward_high_difficulty_pose_pressure",
-                        expr="avg(reward_high_difficulty_pose_pressure{})")
-            .add_metric(metrics_name="reward_high_difficulty_ang_vel_xy",
-                        expr="avg(reward_high_difficulty_ang_vel_xy{})")
-            .add_metric(metrics_name="reward_high_difficulty_energy",
-                        expr="avg(reward_high_difficulty_energy{})")
             .end_panel()
         .end_group()
 
@@ -305,9 +258,21 @@ def build_monitor():
             .add_metric(metrics_name="reward_goal_backtrack_penalty",
                         expr="avg(reward_goal_backtrack_penalty{})")
             .end_panel()
-        .add_panel(name="近终点方向错误", name_en="reward_goal_near_wrong_direction_penalty", type="line")
-            .add_metric(metrics_name="reward_goal_near_wrong_direction_penalty",
-                        expr="avg(reward_goal_near_wrong_direction_penalty{})")
+        .add_panel(name="Near Goal Circling", name_en="reward_near_goal_circling_penalty", type="line")
+            .add_metric(metrics_name="reward_near_goal_circling_penalty",
+                        expr="avg(reward_near_goal_circling_penalty{})")
+            .end_panel()
+        .add_panel(name="近终点推进", name_en="reward_near_goal_finish_drive", type="line")
+            .add_metric(metrics_name="reward_near_goal_finish_drive",
+                        expr="avg(reward_near_goal_finish_drive{})")
+            .end_panel()
+        .add_panel(name="Near Goal Retreat", name_en="reward_near_goal_retreat_penalty", type="line")
+            .add_metric(metrics_name="reward_near_goal_retreat_penalty",
+                        expr="avg(reward_near_goal_retreat_penalty{})")
+            .end_panel()
+        .add_panel(name="Goal Miss", name_en="reward_goal_miss_penalty", type="line")
+            .add_metric(metrics_name="reward_goal_miss_penalty",
+                        expr="avg(reward_goal_miss_penalty{})")
             .end_panel()
         .add_panel(name="接近目标", name_en="reward_approach_goal", type="line")
             .add_metric(metrics_name="reward_approach_goal",
@@ -317,43 +282,33 @@ def build_monitor():
             .add_metric(metrics_name="reward_goal_distance",
                         expr="avg(reward_goal_distance{})")
             .end_panel()
-        .add_panel(name="到达目标", name_en="reward_reach_goal", type="line")
-            .add_metric(metrics_name="reward_reach_goal",
-                        expr="avg(reward_reach_goal{})")
-            .end_panel()
         .add_panel(name="任务完成", name_en="reward_task_complete", type="line")
             .add_metric(metrics_name="reward_task_complete",
                         expr="avg(reward_task_complete{})")
             .end_panel()
-        .add_panel(name="错过终点惩罚", name_en="reward_goal_miss_penalty", type="line")
-            .add_metric(metrics_name="reward_goal_miss_penalty",
-                        expr="avg(reward_goal_miss_penalty{})")
+        .add_panel(name="高压完成", name_en="reward_difficulty_pressure_complete", type="line")
+            .add_metric(metrics_name="reward_difficulty_pressure_complete",
+                        expr="avg(reward_difficulty_pressure_complete{})")
             .end_panel()
         .add_panel(name="导航时间", name_en="reward_navigation_time", type="line")
             .add_metric(metrics_name="reward_navigation_time",
                         expr="avg(reward_navigation_time{})")
             .end_panel()
-        .add_panel(name="地形时间压力", name_en="terrain_time_pressure", type="line")
-            .add_metric(metrics_name="reward_slope_time_pressure",
-                        expr="avg(reward_slope_time_pressure{})")
-            .add_metric(metrics_name="reward_low_mid_stair_time_pressure",
-                        expr="avg(reward_low_mid_stair_time_pressure{})")
+        .add_panel(name="得分引导", name_en="reward_score_guidance", type="line")
+            .add_metric(metrics_name="reward_score_guidance",
+                        expr="avg(reward_score_guidance{})")
             .end_panel()
         .add_panel(name="迷宫门控", name_en="reward_maze_context_gate", type="line")
             .add_metric(metrics_name="reward_maze_context_gate",
                         expr="avg(reward_maze_context_gate{})")
             .end_panel()
+        .add_panel(name="迷宫大转弯", name_en="reward_maze_anticipatory_turn", type="line")
+            .add_metric(metrics_name="reward_maze_anticipatory_turn",
+                        expr="avg(reward_maze_anticipatory_turn{})")
+            .end_panel()
         .add_panel(name="撞墙惩罚", name_en="reward_wall_collision", type="line")
             .add_metric(metrics_name="reward_wall_collision",
                         expr="avg(reward_wall_collision{})")
-            .end_panel()
-        .add_panel(name="撞墙冲击惩罚", name_en="reward_nav_wall_impact_penalty", type="line")
-            .add_metric(metrics_name="reward_nav_wall_impact_penalty",
-                        expr="avg(reward_nav_wall_impact_penalty{})")
-            .end_panel()
-        .add_panel(name="卡墙前推惩罚", name_en="reward_nav_wall_stuck_push_penalty", type="line")
-            .add_metric(metrics_name="reward_nav_wall_stuck_push_penalty",
-                        expr="avg(reward_nav_wall_stuck_push_penalty{})")
             .end_panel()
         .add_panel(name="贴墙停滞", name_en="reward_wall_stall_penalty", type="line")
             .add_metric(metrics_name="reward_wall_stall_penalty",
@@ -379,216 +334,96 @@ def build_monitor():
             .add_metric(metrics_name="reward_stuck_penalty",
                         expr="avg(reward_stuck_penalty{})")
             .end_panel()
-        .end_group()
-
-        # ==============================================================
-        # Group 9: Final terrain gate.  All ratio panels are percentages.
-        # Reward probe terms use a tiny weight, so ratios divide probes with
-        # the same weight; raw value panels multiply by 1e6 to recover units.
-        # ==============================================================
-        .add_group(group_name="最终地形门控", group_name_en="terrain_gate_final")
-        .add_panel(name="地形占比", name_en="gate_final_terrain_pct", type="line")
-            .add_metric(metrics_name="all_flat_pct",
-                        expr="100 * avg(reward_gate_final_flat{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="all_slope_pct",
-                        expr="100 * avg(reward_gate_final_slope{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="all_stairs_pct",
-                        expr="100 * avg(reward_gate_final_stairs{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="all_maze_pct",
-                        expr="100 * avg(reward_gate_final_maze{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="all_wall_or_invalid_pct",
-                        expr="100 * avg(reward_gate_final_invalid{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="flat_non_maze_pct",
-                        expr="100 * avg(reward_gate_final_flat{}) / clamp_min(avg(reward_gate_final_non_maze_sum{}), 1e-12)")
-            .add_metric(metrics_name="slope_non_maze_pct",
-                        expr="100 * avg(reward_gate_final_slope{}) / clamp_min(avg(reward_gate_final_non_maze_sum{}), 1e-12)")
-            .add_metric(metrics_name="stairs_non_maze_pct",
-                        expr="100 * avg(reward_gate_final_stairs{}) / clamp_min(avg(reward_gate_final_non_maze_sum{}), 1e-12)")
-            .add_metric(metrics_name="wall_or_invalid_non_maze_pct",
-                        expr="100 * avg(reward_gate_final_invalid{}) / clamp_min(avg(reward_gate_final_non_maze_sum{}), 1e-12)")
-            .end_panel()
-        .add_panel(name="有效难度占比", name_en="gate_final_valid_difficulty_pct", type="line")
-            .add_metric(metrics_name="final_low_valid_pct",
-                        expr="100 * avg(reward_gate_final_difficulty_low{}) / clamp_min(avg(reward_gate_final_difficulty_sum{}), 1e-12)")
-            .add_metric(metrics_name="final_mid_valid_pct",
-                        expr="100 * avg(reward_gate_final_difficulty_mid{}) / clamp_min(avg(reward_gate_final_difficulty_sum{}), 1e-12)")
-            .add_metric(metrics_name="final_high_valid_pct",
-                        expr="100 * avg(reward_gate_final_difficulty_high{}) / clamp_min(avg(reward_gate_final_difficulty_sum{}), 1e-12)")
-            .add_metric(metrics_name="nan_low_valid_pct",
-                        expr="100 * avg(reward_gate_nan_active_difficulty_low{}) / clamp_min(avg(reward_gate_nan_active_difficulty_sum{}), 1e-12)")
-            .add_metric(metrics_name="nan_mid_valid_pct",
-                        expr="100 * avg(reward_gate_nan_active_difficulty_mid{}) / clamp_min(avg(reward_gate_nan_active_difficulty_sum{}), 1e-12)")
-            .add_metric(metrics_name="nan_high_valid_pct",
-                        expr="100 * avg(reward_gate_nan_active_difficulty_high{}) / clamp_min(avg(reward_gate_nan_active_difficulty_sum{}), 1e-12)")
-            .add_metric(metrics_name="raw_low_valid_pct",
-                        expr="100 * avg(reward_gate_raw_active_difficulty_low{}) / clamp_min(avg(reward_gate_raw_active_difficulty_sum{}), 1e-12)")
-            .add_metric(metrics_name="raw_mid_valid_pct",
-                        expr="100 * avg(reward_gate_raw_active_difficulty_mid{}) / clamp_min(avg(reward_gate_raw_active_difficulty_sum{}), 1e-12)")
-            .add_metric(metrics_name="raw_high_valid_pct",
-                        expr="100 * avg(reward_gate_raw_active_difficulty_high{}) / clamp_min(avg(reward_gate_raw_active_difficulty_sum{}), 1e-12)")
-            .end_panel()
-        .add_panel(name="难度覆盖", name_en="gate_final_difficulty_coverage", type="line")
-            .add_metric(metrics_name="difficulty_valid_pct",
-                        expr="100 * avg(reward_gate_final_difficulty_sum{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="difficulty_not_applicable_pct",
-                        expr="100 * avg(reward_gate_final_difficulty_unknown{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="valid_slope_stairs_raw",
-                        expr="avg(reward_gate_final_difficulty_sum{}) * 1000000")
-            .end_panel()
-        .add_panel(name="训练压力覆盖", name_en="gate_training_pressure_pct", type="line")
-            .add_metric(metrics_name="slope_time_pressure_pct",
-                        expr="100 * avg(reward_gate_slope_time_pressure_active{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="low_mid_stair_time_pressure_pct",
-                        expr="100 * avg(reward_gate_low_mid_stair_time_pressure_active{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="high_diff_pressure_pct",
-                        expr="100 * avg(reward_gate_high_difficulty_pressure_active{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .end_panel()
-        .add_panel(name="运行状态与来源", name_en="gate_final_status_source_pct", type="line")
-            .add_metric(metrics_name="final_valid_pct",
-                        expr="100 * avg(reward_gate_final_gate_valid{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="raw_height_available_pct",
-                        expr="100 * avg(reward_gate_raw_available{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="nav_scanner_available_pct",
-                        expr="100 * avg(reward_gate_raw_nav_available{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="shadow_mode_pct",
-                        expr="100 * avg(reward_gate_mode_shadow{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="control_mode_pct",
-                        expr="100 * avg(reward_gate_mode_control{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="command_written_pct",
-                        expr="100 * avg(reward_gate_command_written{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="source_current_pct",
-                        expr="100 * avg(reward_gate_final_source_current{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="source_nan_pct",
-                        expr="100 * avg(reward_gate_final_source_nan{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="source_raw_fused_pct",
-                        expr="100 * avg(reward_gate_final_source_raw{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="source_sticky_pct",
-                        expr="100 * avg(reward_gate_final_source_sticky{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .end_panel()
-        .add_panel(name="Sticky稳定性", name_en="gate_final_sticky_stability", type="line")
-            .add_metric(metrics_name="hold_seconds",
-                        expr="avg(reward_gate_sticky_hold_steps{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12) * 0.02")
-            .add_metric(metrics_name="pending_confirm_steps",
-                        expr="avg(reward_gate_sticky_pending_count{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="flat_release_confirm_steps",
-                        expr="avg(reward_gate_sticky_flat_release_count{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="terrain_switch_env_pct",
-                        expr="100 * avg(reward_gate_terrain_switch{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="difficulty_switch_env_pct",
-                        expr="100 * avg(reward_gate_difficulty_switch{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="early_flat_release_pct",
-                        expr="100 * avg(reward_gate_sticky_early_flat_release{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="active_preempt_switch_pct",
-                        expr="100 * avg(reward_gate_sticky_active_preempt_switch{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .end_panel()
-        .add_panel(name="迷宫先验", name_en="gate_final_maze_prior", type="line")
-            .add_metric(metrics_name="maze_instant_pct",
-                        expr="100 * avg(reward_gate_maze_instant{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="maze_sticky_pct",
-                        expr="100 * avg(reward_gate_maze_phase{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="maze_confirm_steps",
-                        expr="avg(reward_gate_maze_confirm_count{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .end_panel()
-        .add_panel(name="难度缓存", name_en="gate_final_difficulty_cache", type="line")
-            .add_metric(metrics_name="cache_valid_pct",
-                        expr="100 * avg(reward_gate_track_cache_valid{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="cache_unknown_pct",
-                        expr="100 * avg(reward_gate_track_cache_unknown{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="cache_low_pct",
-                        expr="100 * avg(reward_gate_track_cache_low{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="cache_mid_pct",
-                        expr="100 * avg(reward_gate_track_cache_mid{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="cache_high_pct",
-                        expr="100 * avg(reward_gate_track_cache_high{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="cache_source_slope_pct",
-                        expr="100 * avg(reward_gate_track_cache_source_slope{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="cache_source_stairs_pct",
-                        expr="100 * avg(reward_gate_track_cache_source_stairs{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="maze_using_cache_pct",
-                        expr="100 * avg(reward_gate_maze_using_cached_difficulty{}) / clamp_min(avg(reward_gate_final_maze{}), 1e-12)")
-            .add_metric(metrics_name="cache_factor",
-                        expr="avg(reward_gate_track_cache_factor{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .end_panel()
-        .add_panel(name="上下台阶后验", name_en="gate_final_stair_direction", type="line")
-            .add_metric(metrics_name="stair_up_pct",
-                        expr="100 * avg(reward_gate_stair_up{}) / clamp_min(avg(reward_gate_final_stairs{}), 1e-12)")
-            .add_metric(metrics_name="stair_down_pct",
-                        expr="100 * avg(reward_gate_stair_down{}) / clamp_min(avg(reward_gate_final_stairs{}), 1e-12)")
-            .add_metric(metrics_name="stair_unknown_pct",
-                        expr="100 * avg(reward_gate_stair_unknown_dir{}) / clamp_min(avg(reward_gate_final_stairs{}), 1e-12)")
-            .add_metric(metrics_name="pitch_abs_rad",
-                        expr="avg(reward_gate_pitch_abs{}) * 1000000")
-            .add_metric(metrics_name="updown_confidence_pct",
-                        expr="avg(reward_gate_updown_confidence{}) * 100000000")
+        .add_panel(name="长时非足接触", name_en="reward_long_non_foot_contact", type="line")
+            .add_metric(metrics_name="reward_long_non_foot_contact",
+                        expr="avg(reward_long_non_foot_contact{})")
             .end_panel()
         .end_group()
 
         # ==============================================================
-        # Group 10: Gate source comparison and command verification.
+        # Track result and suggested-speed gate diagnostics. These metrics
+        # come from scorer episode info or rollout stats, not reward probes.
         # ==============================================================
-        .add_group(group_name="地形门控校验", group_name_en="terrain_gate_validation")
-        .add_panel(name="有效样本量", name_en="gate_validation_active_samples", type="line")
-            .add_metric(metrics_name="final_active_sum_raw",
-                        expr="avg(reward_gate_final_difficulty_sum{}) * 1000000")
-            .add_metric(metrics_name="nan_active_sum_raw",
-                        expr="avg(reward_gate_nan_active_difficulty_sum{}) * 1000000")
-            .add_metric(metrics_name="raw_active_sum_raw",
-                        expr="avg(reward_gate_raw_active_difficulty_sum{}) * 1000000")
-            .add_metric(metrics_name="final_non_maze_sum_raw",
-                        expr="avg(reward_gate_final_non_maze_sum{}) * 1000000")
-            .add_metric(metrics_name="final_terrain_sum_raw",
-                        expr="avg(reward_gate_final_terrain_sum{}) * 1000000")
+        .add_group(group_name="Track结果", group_name_en="track_results")
+        .add_panel(name="完成异常超时", name_en="track_outcome_pct", type="line")
+            .add_metric(metrics_name="completion_pct",
+                        expr="100 * avg(completed_count{}) / clamp_min(avg(completed_count{}) + avg(abnormal_count{}) + avg(timeout_count{}), 1)")
+            .add_metric(metrics_name="abnormal_pct",
+                        expr="100 * avg(abnormal_count{}) / clamp_min(avg(completed_count{}) + avg(abnormal_count{}) + avg(timeout_count{}), 1)")
+            .add_metric(metrics_name="timeout_pct",
+                        expr="100 * avg(timeout_count{}) / clamp_min(avg(completed_count{}) + avg(abnormal_count{}) + avg(timeout_count{}), 1)")
             .end_panel()
-        .add_panel(name="门控分歧", name_en="gate_validation_disagreement_pct", type="line")
-            .add_metric(metrics_name="nan_raw_stair_disagree_pct",
-                        expr="100 * avg(reward_gate_nan_raw_stair_disagree{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="nan_raw_slope_disagree_pct",
-                        expr="100 * avg(reward_gate_nan_raw_slope_disagree{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="nan_raw_wall_disagree_pct",
-                        expr="100 * avg(reward_gate_nan_raw_wall_disagree{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="raw_wall_non_maze_pct",
-                        expr="100 * avg(reward_gate_raw_wall_non_maze{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
+        .add_panel(name="L异常率", name_en="track_level_abnormal_pct", type="line")
+            .add_metric(metrics_name="l0_abn", expr="100 * avg(abnormal_count_track_l0{}) / clamp_min(avg(completed_count_track_l0{}) + avg(abnormal_count_track_l0{}) + avg(timeout_count_track_l0{}), 1)")
+            .add_metric(metrics_name="l1_abn", expr="100 * avg(abnormal_count_track_l1{}) / clamp_min(avg(completed_count_track_l1{}) + avg(abnormal_count_track_l1{}) + avg(timeout_count_track_l1{}), 1)")
+            .add_metric(metrics_name="l2_abn", expr="100 * avg(abnormal_count_track_l2{}) / clamp_min(avg(completed_count_track_l2{}) + avg(abnormal_count_track_l2{}) + avg(timeout_count_track_l2{}), 1)")
+            .add_metric(metrics_name="l3_abn", expr="100 * avg(abnormal_count_track_l3{}) / clamp_min(avg(completed_count_track_l3{}) + avg(abnormal_count_track_l3{}) + avg(timeout_count_track_l3{}), 1)")
+            .add_metric(metrics_name="l4_abn", expr="100 * avg(abnormal_count_track_l4{}) / clamp_min(avg(completed_count_track_l4{}) + avg(abnormal_count_track_l4{}) + avg(timeout_count_track_l4{}), 1)")
+            .add_metric(metrics_name="l5_abn", expr="100 * avg(abnormal_count_track_l5{}) / clamp_min(avg(completed_count_track_l5{}) + avg(abnormal_count_track_l5{}) + avg(timeout_count_track_l5{}), 1)")
+            .add_metric(metrics_name="l6_abn", expr="100 * avg(abnormal_count_track_l6{}) / clamp_min(avg(completed_count_track_l6{}) + avg(abnormal_count_track_l6{}) + avg(timeout_count_track_l6{}), 1)")
+            .add_metric(metrics_name="l7_abn", expr="100 * avg(abnormal_count_track_l7{}) / clamp_min(avg(completed_count_track_l7{}) + avg(abnormal_count_track_l7{}) + avg(timeout_count_track_l7{}), 1)")
+            .add_metric(metrics_name="l8_abn", expr="100 * avg(abnormal_count_track_l8{}) / clamp_min(avg(completed_count_track_l8{}) + avg(abnormal_count_track_l8{}) + avg(timeout_count_track_l8{}), 1)")
+            .add_metric(metrics_name="l9_abn", expr="100 * avg(abnormal_count_track_l9{}) / clamp_min(avg(completed_count_track_l9{}) + avg(abnormal_count_track_l9{}) + avg(timeout_count_track_l9{}), 1)")
             .end_panel()
-        .add_panel(name="raw几何信号", name_en="gate_validation_raw_geometry", type="line")
-            .add_metric(metrics_name="edge_sharpness_m",
-                        expr="avg(reward_gate_raw_edge_sharpness{}) * 1000000")
-            .add_metric(metrics_name="edge_locality",
-                        expr="avg(reward_gate_raw_edge_locality{}) * 1000000")
-            .add_metric(metrics_name="slope_smoothness",
-                        expr="avg(reward_gate_raw_slope_smoothness{}) * 1000000")
-            .add_metric(metrics_name="step_delta_m",
-                        expr="avg(reward_gate_raw_step_delta{}) * 1000000")
-            .add_metric(metrics_name="difficulty_signal",
-                        expr="avg(reward_gate_raw_difficulty_signal{}) * 1000000")
+        .add_panel(name="L超时率", name_en="track_level_timeout_pct", type="line")
+            .add_metric(metrics_name="l0_timeout", expr="100 * avg(timeout_count_track_l0{}) / clamp_min(avg(completed_count_track_l0{}) + avg(abnormal_count_track_l0{}) + avg(timeout_count_track_l0{}), 1)")
+            .add_metric(metrics_name="l1_timeout", expr="100 * avg(timeout_count_track_l1{}) / clamp_min(avg(completed_count_track_l1{}) + avg(abnormal_count_track_l1{}) + avg(timeout_count_track_l1{}), 1)")
+            .add_metric(metrics_name="l2_timeout", expr="100 * avg(timeout_count_track_l2{}) / clamp_min(avg(completed_count_track_l2{}) + avg(abnormal_count_track_l2{}) + avg(timeout_count_track_l2{}), 1)")
+            .add_metric(metrics_name="l3_timeout", expr="100 * avg(timeout_count_track_l3{}) / clamp_min(avg(completed_count_track_l3{}) + avg(abnormal_count_track_l3{}) + avg(timeout_count_track_l3{}), 1)")
+            .add_metric(metrics_name="l4_timeout", expr="100 * avg(timeout_count_track_l4{}) / clamp_min(avg(completed_count_track_l4{}) + avg(abnormal_count_track_l4{}) + avg(timeout_count_track_l4{}), 1)")
+            .add_metric(metrics_name="l5_timeout", expr="100 * avg(timeout_count_track_l5{}) / clamp_min(avg(completed_count_track_l5{}) + avg(abnormal_count_track_l5{}) + avg(timeout_count_track_l5{}), 1)")
+            .add_metric(metrics_name="l6_timeout", expr="100 * avg(timeout_count_track_l6{}) / clamp_min(avg(completed_count_track_l6{}) + avg(abnormal_count_track_l6{}) + avg(timeout_count_track_l6{}), 1)")
+            .add_metric(metrics_name="l7_timeout", expr="100 * avg(timeout_count_track_l7{}) / clamp_min(avg(completed_count_track_l7{}) + avg(abnormal_count_track_l7{}) + avg(timeout_count_track_l7{}), 1)")
+            .add_metric(metrics_name="l8_timeout", expr="100 * avg(timeout_count_track_l8{}) / clamp_min(avg(completed_count_track_l8{}) + avg(abnormal_count_track_l8{}) + avg(timeout_count_track_l8{}), 1)")
+            .add_metric(metrics_name="l9_timeout", expr="100 * avg(timeout_count_track_l9{}) / clamp_min(avg(completed_count_track_l9{}) + avg(abnormal_count_track_l9{}) + avg(timeout_count_track_l9{}), 1)")
             .end_panel()
-        .add_panel(name="raw nav墙体", name_en="gate_validation_raw_nav_wall", type="line")
-            .add_metric(metrics_name="front_wall_score",
-                        expr="avg(reward_gate_raw_nav_front_wall_score{}) * 1000000")
-            .add_metric(metrics_name="left_wall_score",
-                        expr="avg(reward_gate_raw_nav_left_wall_score{}) * 1000000")
-            .add_metric(metrics_name="right_wall_score",
-                        expr="avg(reward_gate_raw_nav_right_wall_score{}) * 1000000")
-            .add_metric(metrics_name="front_blocked_pct",
-                        expr="avg(reward_gate_raw_nav_front_blocked{}) * 100000000")
-            .add_metric(metrics_name="open_side",
-                        expr="avg(reward_gate_raw_nav_open_side{}) * 1000000")
+        .end_group()
+
+        .add_group(group_name="建议速度门控", group_name_en="suggested_speed_gate")
+        .add_panel(name="建议速度", name_en="suggested_speed_vx", type="line")
+            .add_metric(metrics_name="target_vx",
+                        expr="avg(reward_speed_gate_target_vx{}) * 1000000000")
+            .add_metric(metrics_name="worker_vx",
+                        expr="avg(reward_speed_gate_worker_vx{}) * 1000000000")
+            .add_metric(metrics_name="write_pct",
+                        expr="avg(reward_speed_gate_written{}) * 100000000000")
             .end_panel()
-        .add_panel(name="命令同步", name_en="gate_validation_command_sync", type="line")
-            .add_metric(metrics_name="worker_cmd_vx_mps",
-                        expr="avg(reward_gate_worker_cmd_vx{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="target_cmd_vx_mps",
-                        expr="avg(reward_gate_target_cmd_vx{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="policy_cmd_error_mps",
-                        expr="avg(reward_gate_policy_cmd_error{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="critic_cmd_error_mps",
-                        expr="avg(reward_gate_critic_cmd_error{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
-            .add_metric(metrics_name="actual_minus_cmd_vx_mps",
-                        expr="avg(reward_gate_actual_minus_cmd_vx{}) / clamp_min(avg(reward_gate_final_terrain_sum{}), 1e-12)")
+        .add_panel(name="地形占比", name_en="suggested_terrain_pct", type="line")
+            .add_metric(metrics_name="flat_pct",
+                        expr="100 * avg(reward_speed_gate_flat{}) / clamp_min(avg(reward_speed_gate_sum{}), 1e-12)")
+            .add_metric(metrics_name="slope_pct",
+                        expr="100 * avg(reward_speed_gate_slope{}) / clamp_min(avg(reward_speed_gate_sum{}), 1e-12)")
+            .add_metric(metrics_name="stairs_pct",
+                        expr="100 * avg(reward_speed_gate_stairs{}) / clamp_min(avg(reward_speed_gate_sum{}), 1e-12)")
+            .add_metric(metrics_name="maze_pct",
+                        expr="100 * avg(reward_speed_gate_maze{}) / clamp_min(avg(reward_speed_gate_sum{}), 1e-12)")
+            .add_metric(metrics_name="invalid_pct",
+                        expr="100 * avg(reward_speed_gate_invalid{}) / clamp_min(avg(reward_speed_gate_sum{}), 1e-12)")
+            .end_panel()
+        .add_panel(name="门控状态", name_en="gate_worker_status", type="line")
+            .add_metric(metrics_name="valid_pct",
+                        expr="100 * avg(reward_speed_gate_valid{}) / clamp_min(avg(reward_speed_gate_sum{}), 1e-12)")
+            .add_metric(metrics_name="terrain_sum",
+                        expr="avg(reward_speed_gate_sum{}) * 1000000000")
+            .end_panel()
+        .add_panel(name="墙体信号", name_en="wall_gate_signal", type="line")
+            .add_metric(metrics_name="front_wall",
+                        expr="avg(reward_speed_gate_nav_front{}) * 1000000000")
+            .add_metric(metrics_name="front_block_pct",
+                        expr="avg(reward_speed_gate_nav_block{}) * 100000000000")
+            .end_panel()
+        .add_panel(name="粘性门控", name_en="sticky_gate_state", type="line")
+            .add_metric(metrics_name="hold_steps",
+                        expr="avg(reward_speed_gate_hold_steps{}) * 1000000000")
+            .add_metric(metrics_name="pending",
+                        expr="avg(reward_speed_gate_pending{}) * 1000000000")
+            .add_metric(metrics_name="maze_confirm",
+                        expr="avg(reward_speed_gate_maze_confirm{}) * 1000000000")
             .end_panel()
         .end_group()
 
         # Group 9: Physical observations (SI units, weight-independent)
-        # Group 10: 物理观测量（SI 单位，与 reward 权重无关）
+        # Group 8: 物理观测量（SI 单位，与 reward 权重无关）
         #
         # These panels show the *physical* quantities that the reward functions
         # operate on, NOT the weighted reward values.  They let you answer
