@@ -72,13 +72,30 @@ class RewardProcess(RewardProcessBase):
         return self._gate_metric("maze_confirm_count")
 
     def _tracking_command(self, command_name: str = "base_velocity"):
-        return self.env.command_manager.get_command(command_name)
+        command_manager = self.env.command_manager
+        return command_manager.get_command(command_name)
+
+    def _body_forward_speed(self):
+        return self._get_robot_asset().data.root_lin_vel_b[:, 0]
+
+    @staticmethod
+    def _xy_norm(xy: torch.Tensor):
+        return torch.linalg.norm(xy, dim=1)
+
+    def _blank_reward(self):
+        return torch.zeros(self.env.num_envs, device=self.env.device)
+
+    def _unit_reward(self):
+        return torch.empty(self.env.num_envs, device=self.env.device).fill_(1.0)
+
+    @staticmethod
+    def _contact_force_peak(contact_sensor, body_ids):
+        return contact_sensor.data.net_forces_w_history[:, :, body_ids, :].norm(dim=-1).amax(dim=1)
 
     @staticmethod
     def _quat_to_roll_pitch(quat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Extract roll and pitch from WXYZ quaternions, matching BaseScorer."""
-        w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
-
+        w, x, y, z = quat.unbind(dim=1)
         sinr_cosp = 2.0 * (w * x + y * z)
         cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
         roll = torch.atan2(sinr_cosp, cosr_cosp)
@@ -95,9 +112,10 @@ class RewardProcess(RewardProcessBase):
 
     def _reward_track_lin_vel_xy(self, std: float = 0.25, command_name: str = "base_velocity"):
         asset = self._get_robot_asset()
-        cmd = self._tracking_command(command_name)
-        error = cmd[:, :2] - asset.data.root_lin_vel_b[:, :2]
-        return torch.exp(-torch.sum(torch.square(error), dim=1) / max(std * std, 1e-6))
+        cmd_xy = self._tracking_command(command_name)[:, :2]
+        vel_error = cmd_xy - asset.data.root_lin_vel_b[:, :2]
+        squared_error = torch.linalg.vector_norm(vel_error, dim=1).square()
+        return torch.exp(-squared_error / max(std * std, 1e-6))
 
     def _reward_command_speed_advantage(
         self,
@@ -117,20 +135,22 @@ class RewardProcess(RewardProcessBase):
         grows with surplus speed, with a cap to avoid overwhelming posture.
         """
         asset = self._get_robot_asset()
-        cmd_vx = self._tracking_command(command_name)[:, 0]
-        actual_vx = asset.data.root_lin_vel_b[:, 0]
+        target_vx = self._tracking_command(command_name)[:, 0]
+        speed_delta = asset.data.root_lin_vel_b[:, 0] - target_vx
 
-        surplus = actual_vx - cmd_vx
-        faster = torch.clamp(surplus - deadband, min=0.0, max=max_surplus) / max(surplus_scale, 1e-6)
-        slower = torch.clamp(-surplus - deadband, min=0.0, max=max_lag) / max(lag_scale, 1e-6)
-        active = cmd_vx > min_command
-        return active.float() * (faster - lag_penalty_scale * slower)
+        surplus_part = torch.clamp(speed_delta - deadband, min=0.0, max=max_surplus)
+        lag_part = torch.clamp(-speed_delta - deadband, min=0.0, max=max_lag)
+        reward_part = surplus_part / max(surplus_scale, 1e-6)
+        penalty_part = lag_part / max(lag_scale, 1e-6)
+        active = (target_vx > min_command).float()
+        return active * (reward_part - lag_penalty_scale * penalty_part)
 
     def _reward_track_ang_vel_z(self, std: float = 0.25, command_name: str = "base_velocity"):
         asset = self._get_robot_asset()
-        cmd = self._tracking_command(command_name)
-        error = cmd[:, 2] - asset.data.root_ang_vel_b[:, 2]
-        return torch.exp(-torch.square(error / max(std, 1e-6)))
+        target_yaw_rate = self._tracking_command(command_name)[:, 2]
+        yaw_rate_error = target_yaw_rate - asset.data.root_ang_vel_b[:, 2]
+        inv_std = 1.0 / max(std, 1e-6)
+        return torch.exp(-(yaw_rate_error * inv_std).square())
 
     def _reward_feet_air_time(self, command_name: str = "base_velocity", threshold: float = 0.5):
         """Reward long steps (feet air time above threshold when moving).
@@ -142,10 +162,11 @@ class RewardProcess(RewardProcessBase):
         contact_sensor = self.env.scene.sensors[sensor_cfg.name]
         if contact_sensor.cfg.track_air_time is False:
             raise RuntimeError("Activate ContactSensor's track_air_time!")
-        first_contact = contact_sensor.data.current_air_time[:, sensor_cfg.body_ids] == 0.0
-        last_air_time = contact_sensor.data.last_air_time[:, sensor_cfg.body_ids]
-        reward = torch.sum((last_air_time - threshold) * first_contact, dim=1)
-        is_moving = torch.norm(self._tracking_command(command_name)[:, :2], dim=1) > 0.1
+        foot_ids = sensor_cfg.body_ids
+        first_contact = contact_sensor.data.current_air_time[:, foot_ids].eq(0.0)
+        air_time_margin = contact_sensor.data.last_air_time[:, foot_ids] - threshold
+        reward = (air_time_margin * first_contact).sum(dim=1)
+        is_moving = self._xy_norm(self._tracking_command(command_name)[:, :2]) > 0.1
         return reward * is_moving.float()
 
     def _reward_feet_clearance(
@@ -177,15 +198,10 @@ class RewardProcess(RewardProcessBase):
         contact_sensor = self.env.scene.sensors[sensor_cfg.name]
         asset = self.env.scene[asset_cfg.name]
 
-        contact_forces = (
-            contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
-            .norm(dim=-1)
-            .max(dim=1)[0]
-        )
-        swing = contact_forces <= 1.0
+        swing = self._contact_force_peak(contact_sensor, sensor_cfg.body_ids) <= 1.0
         foot_height = asset.data.body_pos_w[:, asset_cfg.body_ids, 2] - asset.data.root_pos_w[:, 2].unsqueeze(1)
         command = self._tracking_command(command_name)
-        command_speed = torch.norm(command[:, :2], dim=1)
+        command_speed = self._xy_norm(command[:, :2])
 
         terrain_extra = torch.zeros(self.env.num_envs, device=self.env.device)
         height_scanner = self.env.scene.sensors.get("height_scanner")
@@ -194,7 +210,7 @@ class RewardProcess(RewardProcessBase):
             grid = scan.view(self.env.num_envs, 16, 16)
             forward_window = grid[:, body_y_start:body_y_end, near_x_start:near_x_end]
             if forward_window.shape[-1] > 1 and forward_window.shape[1] > 0:
-                step_deltas = torch.abs(forward_window[:, :, 1:] - forward_window[:, :, :-1]).flatten(1)
+                step_deltas = (forward_window[:, :, 1:] - forward_window[:, :, :-1]).abs().flatten(1)
                 local_step = torch.quantile(step_deltas, delta_quantile, dim=1)
                 terrain_extra = torch.clamp(
                     terrain_height_scale * local_step,
@@ -205,9 +221,10 @@ class RewardProcess(RewardProcessBase):
         speed_extra = speed_height_scale * torch.clamp(command_speed, 0.0, 1.0)
         dynamic_target_height = target_height + terrain_extra + speed_extra
         height_error = (foot_height - dynamic_target_height.unsqueeze(1)) / max(std, 1e-6)
-        clearance_reward = torch.exp(-torch.square(height_error))
+        clearance_reward = torch.exp(-height_error.square())
         is_moving = command_speed > 0.1
-        return torch.sum(clearance_reward * swing.float(), dim=1) * is_moving.float() / max(len(asset_cfg.body_ids), 1)
+        per_foot_reward = clearance_reward * swing.float()
+        return per_foot_reward.sum(dim=1) * is_moving.float() / max(len(asset_cfg.body_ids), 1)
 
     def _reward_feet_swing_forward(
         self,
@@ -228,19 +245,15 @@ class RewardProcess(RewardProcessBase):
         contact_sensor = self.env.scene.sensors[sensor_cfg.name]
         asset = self.env.scene[asset_cfg.name]
 
-        contact_forces = (
-            contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
-            .norm(dim=-1)
-            .max(dim=1)[0]
-        )
-        swing = contact_forces <= 1.0
+        swing = self._contact_force_peak(contact_sensor, sensor_cfg.body_ids) <= 1.0
         foot_forward = asset.data.body_pos_w[:, asset_cfg.body_ids, 0] - asset.data.root_pos_w[:, 0].unsqueeze(1)
         shortfall = torch.clamp(target_forward - foot_forward, min=0.0)
-        forward_reward = torch.exp(-torch.square(shortfall / max(std, 1e-6)))
+        forward_reward = torch.exp(-(shortfall / max(std, 1e-6)).square())
 
         command = self._tracking_command(command_name)
         has_forward_command = command[:, 0] > min_command
-        return torch.sum(forward_reward * swing.float(), dim=1) * has_forward_command.float() / max(len(asset_cfg.body_ids), 1)
+        active_reward = forward_reward * swing.float()
+        return active_reward.sum(dim=1) * has_forward_command.float() / max(len(asset_cfg.body_ids), 1)
 
     def _reward_feet_slide(self):
         """Penalize feet sliding on the ground (velocity while in contact).
@@ -253,9 +266,7 @@ class RewardProcess(RewardProcessBase):
         asset_cfg = self._get_foot_asset_cfg()
         contact_sensor = self.env.scene.sensors[sensor_cfg.name]
         asset = self.env.scene[asset_cfg.name]
-        contacts = (
-            contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :].norm(dim=-1).max(dim=1)[0] > 1.0
-        )
+        contacts = self._contact_force_peak(contact_sensor, sensor_cfg.body_ids) > 1.0
         body_vel = asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :2]
         return torch.sum(body_vel.norm(dim=-1) * contacts, dim=1)
 
@@ -360,10 +371,8 @@ class RewardProcess(RewardProcessBase):
         """Penalize staying nearly still when an XY velocity command is present."""
         asset = self._get_robot_asset()
         cmd = self._tracking_command(command_name)
-        cmd_speed = torch.linalg.norm(cmd[:, :2], dim=1)
-        body_speed = torch.linalg.norm(asset.data.root_lin_vel_b[:, :2], dim=1)
-
-        commanded_to_move = cmd_speed > cmd_threshold
+        commanded_to_move = self._xy_norm(cmd[:, :2]) > cmd_threshold
+        body_speed = self._xy_norm(asset.data.root_lin_vel_b[:, :2])
         stillness = torch.clamp(
             (still_speed_threshold - body_speed) / max(still_speed_threshold, 1e-6),
             min=0.0,
@@ -390,22 +399,23 @@ class RewardProcess(RewardProcessBase):
 
         cmd_xy = cmd[:, :2]
         actual_xy = asset.data.root_lin_vel_b[:, :2]
-        cmd_speed = torch.linalg.norm(cmd_xy, dim=1)
+        cmd_speed = self._xy_norm(cmd_xy)
         moving_cmd = cmd_speed > min_command
 
-        vel_error = torch.sum(torch.square(cmd_xy - actual_xy), dim=1)
+        vel_error = (cmd_xy - actual_xy).square().sum(dim=1)
         tracking_score = torch.exp(-vel_error / max(tracking_std * tracking_std, 1e-6))
 
         roll, pitch = self._quat_to_roll_pitch(asset.data.root_quat_w)
-        pose_deviation = torch.abs(roll) + torch.abs(pitch)
+        pose_deviation = roll.abs() + pitch.abs()
         pose_deviation = torch.nan_to_num(pose_deviation, nan=0.0, posinf=0.0, neginf=0.0)
         posture_score = torch.exp(-5.0 * pose_deviation)
 
-        power = torch.sum(torch.abs(asset.data.applied_torque * asset.data.joint_vel), dim=1)
+        power = (asset.data.applied_torque * asset.data.joint_vel).abs().sum(dim=1)
         energy_score = torch.exp(-power / max(power_scale, 1e-6))
 
         posture_weight = min(max(posture_weight, 0.0), 1.0)
-        score_hint = posture_weight * posture_score + (1.0 - posture_weight) * energy_score
+        energy_weight = 1.0 - posture_weight
+        score_hint = posture_weight * posture_score + energy_weight * energy_score
         return moving_cmd.float() * tracking_score * score_hint
 
     def _reward_feet_stumble(self):
@@ -427,7 +437,9 @@ class RewardProcess(RewardProcessBase):
         防止策略学会"倒地不起"以规避其他惩罚。
         """
         term_mgr = self.env.termination_manager
-        failure = term_mgr.terminated & ~term_mgr.time_outs
+        episode_ended = term_mgr.terminated
+        timeout = term_mgr.time_outs
+        failure = episode_ended & ~timeout
         try:
             if "goal_reached" in term_mgr.active_terms:
                 failure = failure & ~term_mgr.get_term("goal_reached")
@@ -442,11 +454,13 @@ class RewardProcess(RewardProcessBase):
         a_t - 2*a_{t-1} + a_{t-2} 的平方和，比一阶 action_rate 更能抑制抖动。
         在 env 上缓存 prev_prev_action 以跨调用维持状态。
         """
-        curr = self.env.action_manager.action
-        prev = self.env.action_manager.prev_action
+        action_mgr = self.env.action_manager
+        curr = action_mgr.action
+        prev = action_mgr.prev_action
         if not hasattr(self.env, "_smooth_prev_prev"):
             self.env._smooth_prev_prev = prev.clone()
-        accel = curr - 2.0 * prev + self.env._smooth_prev_prev
+        prev_prev = self.env._smooth_prev_prev
+        accel = curr - prev - (prev - prev_prev)
         self.env._smooth_prev_prev = prev.clone()
         return torch.sum(torch.square(accel), dim=1)
 
@@ -457,7 +471,8 @@ class RewardProcess(RewardProcessBase):
         对应赛题 energy 评分项，鼓励高效步态。
         """
         asset = self._get_robot_asset()
-        return torch.sum(torch.abs(asset.data.applied_torque * asset.data.joint_vel), dim=1)
+        joint_power = (asset.data.applied_torque * asset.data.joint_vel).abs()
+        return joint_power.sum(dim=1)
 
     def _reward_energy_score_formula(self):
         """Platform-aligned energy score: exp(-0.01 * sum(|torque × joint_vel|)).
@@ -466,15 +481,14 @@ class RewardProcess(RewardProcessBase):
         energy_score = 100 * exp(-0.01 * mean_energy) 的指数核一致。
         输出范围 (0, 1]，功率越低奖励越接近 1，直接引导策略降低能耗。
         """
-        asset = self._get_robot_asset()
-        power = torch.sum(torch.abs(asset.data.applied_torque * asset.data.joint_vel), dim=1)
+        power = self._reward_energy()
         return torch.exp(-0.01 * power)
 
     def _reward_pose_score_formula(self):
         """Platform-aligned posture score: exp(-5 * (|roll| + |pitch|))."""
         asset = self._get_robot_asset()
         roll, pitch = self._quat_to_roll_pitch(asset.data.root_quat_w)
-        pose_deviation = torch.abs(roll) + torch.abs(pitch)
+        pose_deviation = roll.abs() + pitch.abs()
         pose_deviation = torch.nan_to_num(pose_deviation, nan=0.0, posinf=0.0, neginf=0.0)
         return torch.exp(-5.0 * pose_deviation)
 
@@ -629,7 +643,8 @@ class RewardProcess(RewardProcessBase):
             target_height: Target base height in meters. / 目标机身高度（米）。
         """
         asset = self._get_robot_asset()
-        return torch.square(asset.data.root_pos_w[:, 2] - target_height)
+        height_error = asset.data.root_pos_w[:, 2].sub(float(target_height))
+        return height_error.square()
 
     def _reward_hip_to_default(self):
         """Penalize hip joint deviation from default angle (squared sum).
@@ -656,7 +671,7 @@ class RewardProcess(RewardProcessBase):
         Ref: agent_diy/feature/reward_process.py
         """
         asset = self._get_robot_asset()
-        return torch.sum(torch.square(asset.data.joint_vel), dim=1)
+        return asset.data.joint_vel.square().sum(dim=1)
 
     def _reward_base_lateral_vel(self, command_name: str = "base_velocity"):
         """Penalize untracked lateral (Y-axis) velocity to prevent crab walking.
@@ -676,20 +691,6 @@ class RewardProcess(RewardProcessBase):
         actual_vy = asset.data.root_lin_vel_b[:, 1]
         return torch.square(actual_vy - cmd_vy)
 
-    def _reward_uncommanded_yaw_rate(
-        self,
-        command_name: str = "base_velocity",
-        yaw_cmd_threshold: float = 0.05,
-        deadband: float = 0.05,
-    ):
-        """Penalize yaw rotation when the yaw command is near zero."""
-        asset = self._get_robot_asset()
-        cmd_yaw = self._tracking_command(command_name)[:, 2]
-        yaw_rate = torch.abs(asset.data.root_ang_vel_b[:, 2])
-        no_turn_cmd = torch.abs(cmd_yaw) < yaw_cmd_threshold
-        excess_yaw = torch.clamp(yaw_rate - deadband, min=0.0)
-        return no_turn_cmd.float() * torch.square(excess_yaw)
-
     def _reward_air_time_variance_penalty(self):
         """Penalize variance in per-foot air time to enforce gait rhythm symmetry.
 
@@ -703,86 +704,53 @@ class RewardProcess(RewardProcessBase):
         last_air_time = contact_sensor.data.last_air_time[:, sensor_cfg.body_ids]
         return torch.var(torch.clamp(last_air_time, max=0.5), dim=1)
 
-    def _reward_pivot_turning(
-        self,
-        lin_vel_threshold: float = 0.2,
-        ang_vel_threshold: float = 0.5,
-        command_name: str = "base_velocity",
-        yaw_cmd_threshold: float = 0.25,
-    ):
-        """Penalize uncommanded pivoting: rotating on the spot without lifting feet.
-
-        惩罚非指令要求的原地蹭脚转弯——线速度低（< lin_vel_threshold）但偏航角速度高
-        （> ang_vel_threshold），且没有明显 yaw 命令时，仍有多脚接触地面则给予惩罚。
-        鼓励通过迈步（lift & place）完成转弯，而非用脚蹭地旋转，减少关节磨损和
-        步态不自然。
-        When the local navigator explicitly commands a large yaw rate, this
-        penalty is gated off so emergency in-place turns do not fight the rule
-        controller.
-        Ref: custom_rewards.py penalize_pivot_turning
-
-        Args:
-            lin_vel_threshold: Max horizontal speed (m/s) for pivoting detection.
-                               判定原地旋转的最大水平速度阈值 (m/s)。
-            ang_vel_threshold: Min yaw rate (rad/s) for pivoting detection.
-                               判定原地旋转的最小偏航角速度阈值 (rad/s)。
-            command_name: Velocity command name.
-            yaw_cmd_threshold: Yaw command above which pivoting is considered commanded.
-        """
-        asset = self._get_robot_asset()
-        sensor_cfg = self._get_foot_sensor_cfg()
-        contact_sensor = self.env.scene.sensors[sensor_cfg.name]
-        cmd_yaw = torch.abs(self._tracking_command(command_name)[:, 2])
-
-        base_lin_vel = asset.data.root_lin_vel_b
-        base_ang_vel = asset.data.root_ang_vel_b
-
-        horizontal_speed = torch.norm(base_lin_vel[:, :2], dim=1)
-        commanded_turn = cmd_yaw > yaw_cmd_threshold
-        is_pivoting = (horizontal_speed < lin_vel_threshold) & (
-            torch.abs(base_ang_vel[:, 2]) > ang_vel_threshold
-        ) & ~commanded_turn
-
-        contact_forces = (
-            contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
-            .norm(dim=-1)
-            .max(dim=1)[0]
-        )
-        feet_in_contact = contact_forces > 1.0
-        num_contacting_feet = torch.sum(feet_in_contact.float(), dim=1)
-
-        return num_contacting_feet * is_pivoting.float()
-
     # -----------------------------------------------------------------------
     # Goal-reaching rewards (activated only in track terrain)
     # 目标到达奖励（仅 track 地形时激活）
     # -----------------------------------------------------------------------
 
-    def _goal_delta_body(self):
-        if not hasattr(self.env, "goal_positions") or self.env.goal_positions is None:
-            return torch.zeros(self.env.num_envs, 2, device=self.env.device), torch.zeros(
-                self.env.num_envs,
-                device=self.env.device,
-            )
+    def _zero_goal_state(self):
+        """Return empty goal geometry tensors with the standard Track shapes."""
+        zero_xy = torch.zeros(self.env.num_envs, 2, device=self.env.device)
+        zero_dist = torch.zeros(self.env.num_envs, device=self.env.device)
+        return zero_xy, zero_dist
 
+    def _robot_root_pose_for_goal(self):
         try:
             robot = self.env.scene["robot"]
-            root_pos_w = robot.data.root_pos_w
-            quat = robot.data.root_quat_w
+            return robot.data.root_pos_w, robot.data.root_quat_w
         except Exception:
-            return torch.zeros(self.env.num_envs, 2, device=self.env.device), torch.zeros(
-                self.env.num_envs,
-                device=self.env.device,
-            )
+            return None, None
 
-        delta_w = self.env.goal_positions[:, :2] - root_pos_w[:, :2]
-        qw, qx, qy, qz = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
-        heading = torch.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
-        cos_h = torch.cos(-heading)
-        sin_h = torch.sin(-heading)
-        local_x = cos_h * delta_w[:, 0] - sin_h * delta_w[:, 1]
-        local_y = sin_h * delta_w[:, 0] + cos_h * delta_w[:, 1]
-        return torch.stack((local_x, local_y), dim=1), torch.linalg.norm(delta_w, dim=1)
+    @staticmethod
+    def _heading_from_quat_wxyz(quat: torch.Tensor):
+        qw, qx, qy, qz = quat.unbind(dim=1)
+        return torch.atan2(
+            2.0 * (qw * qz + qx * qy),
+            1.0 - 2.0 * (qy * qy + qz * qz),
+        )
+
+    @staticmethod
+    def _rotate_world_xy_to_body(delta_w: torch.Tensor, heading: torch.Tensor):
+        cos_yaw = torch.cos(heading)
+        sin_yaw = torch.sin(heading)
+        body_x = cos_yaw * delta_w[:, 0] + sin_yaw * delta_w[:, 1]
+        body_y = -sin_yaw * delta_w[:, 0] + cos_yaw * delta_w[:, 1]
+        return torch.stack((body_x, body_y), dim=1)
+
+    def _goal_delta_body(self):
+        goal_positions = getattr(self.env, "goal_positions", None)
+        if goal_positions is None:
+            return self._zero_goal_state()
+
+        root_pos_w, root_quat_w = self._robot_root_pose_for_goal()
+        if root_pos_w is None or root_quat_w is None:
+            return self._zero_goal_state()
+
+        goal_delta_w = goal_positions[:, :2] - root_pos_w[:, :2]
+        heading = self._heading_from_quat_wxyz(root_quat_w)
+        goal_delta_b = self._rotate_world_xy_to_body(goal_delta_w, heading)
+        return goal_delta_b, torch.linalg.norm(goal_delta_w, dim=1)
 
     # -----------------------------------------------------------------------
     # Scan helper — pure height_scanner grid, no navigation.py dependency
@@ -792,14 +760,24 @@ class RewardProcess(RewardProcessBase):
         scanner = self.env.scene.sensors.get("height_scanner")
         if scanner is None:
             return None
-        scan = scanner.data.pos_w[:, 2:3] - scanner.data.ray_hits_w[..., 2]
-        return scan.view(self.env.num_envs, 16, 16)
+        sensor_height = scanner.data.pos_w[:, 2:3]
+        hit_height = scanner.data.ray_hits_w[..., 2]
+        return (sensor_height - hit_height).reshape(self.env.num_envs, 16, 16)
 
     def _goal_vector_body(self):
         local_goal, dist = self._goal_delta_body()
-        denom = torch.clamp(dist, min=1e-6).unsqueeze(1)
-        goal_dir = local_goal / denom
+        goal_dir = torch.nn.functional.normalize(local_goal, p=2.0, dim=1, eps=1e-6)
         return local_goal, dist, goal_dir
+
+    @staticmethod
+    def _distance_gate(dist: torch.Tensor, threshold: float):
+        return (dist > threshold).float()
+
+    def _goal_velocity_projection(self):
+        robot = self._get_robot_asset()
+        _, dist, goal_dir = self._goal_vector_body()
+        projection = torch.sum(robot.data.root_lin_vel_b[:, :2] * goal_dir, dim=1)
+        return projection, dist, goal_dir
 
     def _wall_score_from_sector(
         self,
@@ -809,7 +787,23 @@ class RewardProcess(RewardProcessBase):
     ):
         if sector.shape[1] == 0 or sector.shape[2] == 0:
             return torch.zeros(sector.shape[0], device=sector.device)
-        return torch.sigmoid((obstacle_threshold - sector) / max(temperature, 1e-6)).mean(dim=(1, 2))
+        wall_logits = (obstacle_threshold - sector) / max(temperature, 1e-6)
+        wall_prob = torch.sigmoid(wall_logits)
+        return wall_prob.flatten(start_dim=1).mean(dim=1)
+
+    def _maze_wall_gate(
+        self,
+        grid: torch.Tensor,
+        goal_dist_gate: float,
+        obstacle_threshold: float,
+        temperature: float,
+    ):
+        return self._maze_context_gate(
+            grid,
+            goal_dist_gate=goal_dist_gate,
+            obstacle_threshold=obstacle_threshold,
+            temperature=temperature,
+        )
 
     def _fractional_side_wall_mean(self, wall_prob: torch.Tensor, side_width: float, left: bool):
         """Mean side wall probability with fractional row support, e.g. width=4.5."""
@@ -898,12 +892,15 @@ class RewardProcess(RewardProcessBase):
     ):
         """Diagnostic only: 1 when wall rewards are allowed to behave as maze logic."""
         grid = self._height_grid()
+        gate_kwargs = {
+            "goal_dist_gate": goal_dist_gate,
+            "obstacle_threshold": obstacle_threshold,
+            "temperature": temperature,
+            "front_cols": front_cols,
+        }
         return self._maze_context_gate(
             grid,
-            goal_dist_gate=goal_dist_gate,
-            obstacle_threshold=obstacle_threshold,
-            temperature=temperature,
-            front_cols=front_cols,
+            **gate_kwargs,
         )
 
     def _maze_front_wall_turn_features(
@@ -998,37 +995,32 @@ class RewardProcess(RewardProcessBase):
         max_reward: float = 1.0,
     ):
         """Reward moving forward in the robot head/body direction."""
-        robot = self._get_robot_asset()
-        vx = robot.data.root_lin_vel_b[:, 0]
-        return torch.clamp(vx / max(target_speed, 1e-6), min=0.0, max=max_reward)
+        normalized_vx = self._body_forward_speed() / max(target_speed, 1e-6)
+        return torch.clamp(normalized_vx, min=0.0, max=max_reward)
 
     def _reward_backward_penalty(self, deadband: float = 0.03):
         """Penalize walking backward relative to the robot head direction."""
-        robot = self._get_robot_asset()
-        vx = robot.data.root_lin_vel_b[:, 0]
-        return torch.clamp(-(vx + deadband), min=0.0)
+        reverse_speed = -(self._body_forward_speed() + deadband)
+        return torch.clamp(reverse_speed, min=0.0)
 
     def _reward_goal_heading_alignment(self, std: float = 0.75):
-        """Reward facing the target with the head before moving forward."""
-        _, dist, goal_dir = self._goal_vector_body()
-        # goal_dir[:, 0] = cos(target angle in body frame).
-        angle_error = torch.atan2(goal_dir[:, 1], goal_dir[:, 0])
-        return torch.exp(-torch.square(angle_error / max(std, 1e-6))) * (dist > 0.6).float()
+        """Reward body-frame heading consistency with the Track goal direction."""
+        _, dist, direction_b = self._goal_vector_body()
+        heading_error = torch.atan2(direction_b[:, 1], direction_b[:, 0])
+        scaled_error = heading_error / max(std, 1e-6)
+        return torch.exp(-(scaled_error * scaled_error)) * self._distance_gate(dist, 0.6)
 
     def _reward_goal_velocity_projection(self, max_speed: float = 0.75):
-        """Reward body velocity projected onto the target direction."""
-        robot = self._get_robot_asset()
-        _, dist, goal_dir = self._goal_vector_body()
-        body_xy = robot.data.root_lin_vel_b[:, :2]
-        projection = torch.sum(body_xy * goal_dir, dim=1)
-        return torch.clamp(projection / max(max_speed, 1e-6), min=-1.0, max=1.0) * (dist > 0.6).float()
+        """Reward useful velocity along the current goal ray."""
+        projection, dist, _ = self._goal_velocity_projection()
+        bounded_projection = torch.clamp(projection / max(max_speed, 1e-6), min=-1.0, max=1.0)
+        return bounded_projection * self._distance_gate(dist, 0.6)
 
     def _reward_goal_backtrack_penalty(self, deadband: float = 0.02):
-        """Penalize velocity whose projection moves away from the target."""
-        robot = self._get_robot_asset()
-        _, dist, goal_dir = self._goal_vector_body()
-        projection = torch.sum(robot.data.root_lin_vel_b[:, :2] * goal_dir, dim=1)
-        return torch.clamp(-(projection + deadband), min=0.0) * (dist > 0.8).float()
+        """Penalize movement whose body-frame projection increases goal distance."""
+        projection, dist, _ = self._goal_velocity_projection()
+        retreat_speed = torch.clamp(-(projection + deadband), min=0.0)
+        return retreat_speed * self._distance_gate(dist, 0.8)
 
     def _reward_near_goal_circling_penalty(
         self,
@@ -1043,9 +1035,7 @@ class RewardProcess(RewardProcessBase):
             return torch.zeros(self.env.num_envs, device=self.env.device)
 
         robot = self._get_robot_asset()
-        _, dist, goal_dir = self._goal_vector_body()
-        body_xy = robot.data.root_lin_vel_b[:, :2]
-        projection = torch.sum(body_xy * goal_dir, dim=1)
+        projection, dist, _ = self._goal_velocity_projection()
         yaw_rate = torch.abs(robot.data.root_ang_vel_b[:, 2])
         lateral_speed = torch.abs(robot.data.root_lin_vel_b[:, 1])
 
@@ -1070,9 +1060,7 @@ class RewardProcess(RewardProcessBase):
             return torch.zeros(self.env.num_envs, device=self.env.device)
 
         robot = self._get_robot_asset()
-        _, dist, goal_dir = self._goal_vector_body()
-        body_xy = robot.data.root_lin_vel_b[:, :2]
-        projection = torch.sum(body_xy * goal_dir, dim=1)
+        projection, dist, _ = self._goal_velocity_projection()
         yaw_rate = torch.abs(robot.data.root_ang_vel_b[:, 2])
         lateral_speed = torch.abs(robot.data.root_lin_vel_b[:, 1])
 
@@ -1095,8 +1083,7 @@ class RewardProcess(RewardProcessBase):
             return torch.zeros(self.env.num_envs, device=self.env.device)
 
         robot = self._get_robot_asset()
-        _, dist, goal_dir = self._goal_vector_body()
-        projection = torch.sum(robot.data.root_lin_vel_b[:, :2] * goal_dir, dim=1)
+        projection, dist, _ = self._goal_velocity_projection()
         near_gate = ((dist < near_dist) & (dist > complete_dist)).float()
         retreat = torch.clamp(-(projection + retreat_deadband) / max(target_speed, 1e-6), 0.0, 1.0)
         closeness = torch.clamp((near_dist - dist) / max(near_dist - complete_dist, 1e-6), 0.0, 1.0)
@@ -1153,17 +1140,11 @@ class RewardProcess(RewardProcessBase):
     def _reward_goal_distance(self, scale: float = 8.0):
         """Dense bounded reward that increases as the robot gets closer."""
         _, dist = self._goal_delta_body()
-        return torch.exp(-dist / max(scale, 1e-6))
+        return dist.neg().div(max(scale, 1e-6)).exp()
 
     def _reward_task_complete(self, threshold: float = 0.6):
-        """Large sparse completion reward aligned with the official goal radius."""
-        if not hasattr(self.env, "goal_positions") or self.env.goal_positions is None:
-            return torch.zeros(self.env.num_envs, device=self.env.device)
-
-        robot = self._get_robot_asset()
-        robot_pos = robot.data.root_pos_w[:, :2]
-        goal_pos = self.env.goal_positions[:, :2]
-        dist = torch.norm(goal_pos - robot_pos, dim=1)
+        """Sparse completion reward using the same goal geometry helper as dense terms."""
+        _, dist = self._goal_delta_body()
         return (dist < threshold).float()
 
     def _reward_wall_proximity(
@@ -1183,11 +1164,11 @@ class RewardProcess(RewardProcessBase):
             return torch.zeros(self.env.num_envs, device=self.env.device)
         sector = grid[:, body_y_start:body_y_end, :front_cols]
         wall_score = self._wall_score_from_sector(sector, obstacle_threshold, temperature)
-        gate = self._maze_context_gate(
+        gate = self._maze_wall_gate(
             grid,
-            goal_dist_gate=maze_goal_dist_gate,
-            obstacle_threshold=maze_gate_obstacle_threshold,
-            temperature=temperature,
+            maze_goal_dist_gate,
+            maze_gate_obstacle_threshold,
+            temperature,
         )
         return torch.clamp(wall_score - wall_score_threshold, min=0.0) * gate
 
@@ -1214,22 +1195,18 @@ class RewardProcess(RewardProcessBase):
         sector = grid[:, body_y_start:body_y_end, :front_cols]
         wall_score = self._wall_score_from_sector(sector, obstacle_threshold, temperature)
         forward_speed = torch.clamp(robot.data.root_lin_vel_b[:, 0], min=0.0)
-        wall_intensity = torch.clamp(
-            (wall_score - wall_score_threshold) / max(1.0 - wall_score_threshold, 1e-6),
-            min=0.0,
-            max=1.0,
-        )
+        wall_intensity = torch.clamp((wall_score - wall_score_threshold) / max(1.0 - wall_score_threshold, 1e-6), 0.0, 1.0)
         speed_ratio = torch.clamp(
             (forward_speed - slow_speed) / max(impact_speed - slow_speed, 1e-6),
             min=0.0,
             max=1.0,
         )
         penalty = touch_penalty + (impact_penalty - touch_penalty) * torch.square(speed_ratio)
-        gate = self._maze_context_gate(
+        gate = self._maze_wall_gate(
             grid,
-            goal_dist_gate=maze_goal_dist_gate,
-            obstacle_threshold=maze_gate_obstacle_threshold,
-            temperature=temperature,
+            maze_goal_dist_gate,
+            maze_gate_obstacle_threshold,
+            temperature,
         )
         return wall_intensity * penalty * gate
 
@@ -1266,14 +1243,14 @@ class RewardProcess(RewardProcessBase):
             max=1.0,
         )
 
-        body_speed = torch.linalg.norm(robot.data.root_lin_vel_b[:, :2], dim=1)
+        body_speed = self._xy_norm(robot.data.root_lin_vel_b[:, :2])
         _, goal_dist = self._goal_delta_body()
         stall_gate = (body_speed < still_speed).float() * (goal_dist > goal_dist_threshold).float()
-        maze_gate = self._maze_context_gate(
+        maze_gate = self._maze_wall_gate(
             grid,
-            goal_dist_gate=maze_goal_dist_gate,
-            obstacle_threshold=maze_gate_obstacle_threshold,
-            temperature=temperature,
+            maze_goal_dist_gate,
+            maze_gate_obstacle_threshold,
+            temperature,
         )
         return wall_intensity * stall_gate * maze_gate
 
@@ -1291,10 +1268,11 @@ class RewardProcess(RewardProcessBase):
         if grid is None:
             return torch.zeros(self.env.num_envs, device=self.env.device)
         sector = grid[:, body_y_start:body_y_end, :front_cols]
-        gate = self._maze_context_gate(
+        gate = self._maze_wall_gate(
             grid,
-            goal_dist_gate=maze_goal_dist_gate,
-            obstacle_threshold=maze_gate_obstacle_threshold,
+            maze_goal_dist_gate,
+            maze_gate_obstacle_threshold,
+            0.18,
         )
         return (sector > obstacle_threshold).float().mean(dim=(1, 2)) * gate
 
@@ -1341,11 +1319,11 @@ class RewardProcess(RewardProcessBase):
             right_weight.sum(dim=1), min=1e-6
         )
         imbalance = torch.abs(left_dist - right_dist) / torch.clamp(left_dist + right_dist, min=1e-6)
-        maze_gate = self._maze_context_gate(
+        maze_gate = self._maze_wall_gate(
             grid,
-            goal_dist_gate=maze_goal_dist_gate,
-            obstacle_threshold=maze_gate_obstacle_threshold,
-            temperature=temperature,
+            maze_goal_dist_gate,
+            maze_gate_obstacle_threshold,
+            temperature,
         )
         return corridor_gate * imbalance * maze_gate
 
@@ -1361,7 +1339,7 @@ class RewardProcess(RewardProcessBase):
         from the maze goal.
         """
         robot = self._get_robot_asset()
-        pos = robot.data.root_pos_w[:, :2]
+        current_xy = robot.data.root_pos_w[:, :2]
         num_envs = self.env.num_envs
         device = self.env.device
 
@@ -1376,21 +1354,23 @@ class RewardProcess(RewardProcessBase):
 
         visit_pos = self.env._rl_nav_visit_pos
         valid = self.env._rl_nav_visit_valid
-        dist_to_seen = torch.linalg.norm(visit_pos - pos.unsqueeze(1), dim=2)
+        dist_to_seen = torch.linalg.norm(visit_pos - current_xy.unsqueeze(1), dim=2)
         dist_to_seen = torch.where(valid, dist_to_seen, torch.full_like(dist_to_seen, 1e6))
         novel = dist_to_seen.min(dim=1).values > radius
 
         _, goal_dist, goal_dir = self._goal_vector_body()
         angle_error = torch.atan2(goal_dir[:, 1], goal_dir[:, 0])
-        toward_goal_gate = torch.exp(-torch.square(angle_error / max(goal_heading_std, 1e-6)))
-        reward = novel.float() * toward_goal_gate * (goal_dist > 1.0).float()
+        inv_heading_std = 1.0 / max(goal_heading_std, 1e-6)
+        toward_goal_gate = torch.exp(-(angle_error * inv_heading_std).square())
+        far_from_goal = self._distance_gate(goal_dist, 1.0)
+        reward = novel.float() * toward_goal_gate * far_from_goal
 
         ptr = self.env._rl_nav_visit_ptr
         env_ids = torch.arange(num_envs, device=device)
         if novel.any():
             add_ids = env_ids[novel]
             add_ptr = ptr[novel]
-            visit_pos[add_ids, add_ptr] = pos[novel]
+            visit_pos[add_ids, add_ptr] = current_xy[novel]
             valid[add_ids, add_ptr] = True
             ptr[novel] = (add_ptr + 1) % memory_size
 
@@ -1405,51 +1385,9 @@ class RewardProcess(RewardProcessBase):
 
         return reward
 
-    def _reward_wall_buffer(
-        self,
-        obstacle_threshold: float = -0.75,
-        front_rows: int = 5,
-        body_y_start: int = 3,
-        body_y_end: int = 13,
-        wall_score_threshold: float = 0.35,
-        temperature: float = 0.18,
-    ):
-        """Penalize only clear wall-like front blocks.
-
-        height_scan is not semantic: stairs and slopes also create height
-        changes. This term therefore uses a stricter wall score instead of
-        punishing every non-flat or narrow patch.
-        """
-        grid = self._height_grid()
-        if grid is None:
-            return torch.zeros(self.env.num_envs, device=self.env.device)
-        near = grid[:, body_y_start:body_y_end, :front_rows]
-        wall_score = torch.sigmoid((obstacle_threshold - near) / max(temperature, 1e-6)).mean(dim=(1, 2))
-        return torch.clamp(wall_score - wall_score_threshold, min=0.0)
-
-    def _reward_forward_free_space(self, obstacle_threshold: float = -0.30, front_rows: int = 6,
-                                   body_y_start: int = 3, body_y_end: int = 13):
-        """Reward forward velocity scaled by front openness.
-
-        When the path ahead is clear the robot gets full credit for forward
-        speed; when blocked the reward is suppressed, discouraging wall-
-        hugging that occasionally yields approach_goal progress.
-
-        Pure visual gating — no nav_route_info.
-        前方畅通时奖励前进速度，前方堵塞时抑制——纯视觉门控。
-        """
-        robot = self._get_robot_asset()
-        grid = self._height_grid()
-        forward_speed = robot.data.root_lin_vel_b[:, 0].clamp(min=0.0)
-        if grid is None:
-            return forward_speed
-        near = grid[:, body_y_start:body_y_end, :front_rows]
-        open_score = (near > obstacle_threshold).float().mean(dim=(1, 2))
-        return forward_speed * open_score
-
     def _reward_approach_goal(self):
         if not hasattr(self.env, "goal_positions") or self.env.goal_positions is None:
-            return torch.zeros(self.env.num_envs, device=self.env.device)
+            return self._blank_reward()
 
         _, current_dist = self._goal_delta_body()
         if (
@@ -1469,7 +1407,8 @@ class RewardProcess(RewardProcessBase):
                 self.env.num_envs, dtype=torch.bool, device=self.env.device
             )
 
-        delta = current_dist - self.env._nav_previous_goal_dist
+        previous_dist = self.env._nav_previous_goal_dist
+        delta = current_dist - previous_dist
         term_mgr = self.env.termination_manager
         reset_mask = term_mgr.terminated | term_mgr.time_outs
         valid_mask = self.env._nav_previous_goal_valid & ~reset_mask
@@ -1482,9 +1421,10 @@ class RewardProcess(RewardProcessBase):
         robot = self._get_robot_asset()
         _, dist = self._goal_delta_body()
         cmd = self._tracking_command("base_velocity")
-        cmd_speed = torch.linalg.norm(cmd[:, :2], dim=1)
-        body_speed = torch.linalg.norm(robot.data.root_lin_vel_b[:, :2], dim=1)
-        return ((cmd_speed > min_command) & (body_speed < still_speed) & (dist > 0.8)).float()
+        commanded_motion = self._xy_norm(cmd[:, :2]) > min_command
+        nearly_static = self._xy_norm(robot.data.root_lin_vel_b[:, :2]) < still_speed
+        still_relevant = self._distance_gate(dist, 0.8).bool()
+        return (commanded_motion & nearly_static & still_relevant).float()
 
     def _reward_long_non_foot_contact(
         self,
@@ -1543,25 +1483,4 @@ class RewardProcess(RewardProcessBase):
         return torch.clamp(over + (steps >= threshold_steps).float(), min=0.0, max=max_penalty)
 
     def _reward_navigation_time(self):
-        return torch.ones(self.env.num_envs, device=self.env.device)
-
-    def _reward_reach_goal(self, threshold: float = 0.6):
-        """Reward for reaching the maze exit (returns 1.0 when distance < 0.6 m).
-        到达迷宫出口奖励（distance < 0.6 m 时返回 1.0）。
-
-        Note:
-            The threshold must match the threshold of _goal_reached_termination
-            in tools/unitree_rl_lab/.../velocity_env_cfg.py (currently 0.6 m),
-            otherwise a "termination-reward dead zone" will appear.
-            threshold 必须与 tools/unitree_rl_lab/.../velocity_env_cfg.py 中
-            _goal_reached_termination 的 threshold 一致（当前 0.6 m），
-            否则会产生"终止-奖励死区"。
-        """
-        if not hasattr(self.env, "goal_positions") or self.env.goal_positions is None:
-            return torch.zeros(self.env.num_envs, device=self.env.device)
-
-        robot = self._get_robot_asset()
-        robot_pos = robot.data.root_pos_w[:, :2]
-        goal_pos = self.env.goal_positions[:, :2]
-        dist = torch.norm(goal_pos - robot_pos, dim=1)
-        return (dist < threshold).float()
+        return self._unit_reward()

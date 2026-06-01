@@ -449,15 +449,13 @@ def _compute_advantages_and_returns(
     last_obs = obs
     last_critic_obs = critic_obs
     if usr_conf is not None and last_obs is not None:
-        last_obs, last_critic_obs, _ = apply_track_phase_command(
+        last_obs, last_critic_obs, _ = _apply_phase_command_for_rollout(
             last_obs,
             last_critic_obs,
             env,
-            usr_conf.get("rl_navigation", {}),
+            usr_conf,
             logger,
             update_state=False,
-            update_env_command=False,
-            set_env_command_fn=set_env_base_velocity_command,
         )
 
     value_obs = last_critic_obs if last_critic_obs is not None else last_obs
@@ -529,19 +527,89 @@ def _compute_timeout_bootstrap_values(obs, critic_obs, env, agent, infos, logger
     value_obs = obs
     value_critic_obs = critic_obs
     if usr_conf is not None:
-        value_obs, value_critic_obs, _ = apply_track_phase_command(
+        value_obs, value_critic_obs, _ = _apply_phase_command_for_rollout(
             value_obs,
             value_critic_obs,
             env,
-            usr_conf.get("rl_navigation", {}),
+            usr_conf,
             logger,
             update_state=False,
-            update_env_command=False,
-            set_env_command_fn=set_env_base_velocity_command,
         )
 
     value_input = value_critic_obs if value_critic_obs is not None else value_obs
     return agent.algorithm.actor_critic.evaluate(value_input.detach()).detach()
+
+
+def _phase_command_conf(usr_conf):
+    return usr_conf.get("rl_navigation", {})
+
+
+def _apply_phase_command_for_rollout(obs, critic_obs, env, usr_conf, logger, update_state=True):
+    return apply_track_phase_command(
+        obs,
+        critic_obs,
+        env,
+        _phase_command_conf(usr_conf),
+        logger,
+        update_state=update_state,
+        update_env_command=update_state,
+        set_env_command_fn=set_env_base_velocity_command,
+    )
+
+
+def _record_phase_stats(nav_metric_values, phase_stats):
+    for key, value in phase_stats.items():
+        nav_metric_values[key].append(value.float().mean())
+
+
+def _unpack_predict_result(predict_result):
+    if len(predict_result) == 8:
+        (
+            actions,
+            values,
+            actions_log_prob,
+            action_mean,
+            action_sigma,
+            detach_obs,
+            detach_critic_obs,
+            hidden_states,
+        ) = predict_result
+    elif len(predict_result) == 7:
+        (
+            actions,
+            values,
+            actions_log_prob,
+            action_mean,
+            action_sigma,
+            detach_obs,
+            detach_critic_obs,
+        ) = predict_result
+        hidden_states = None
+    else:
+        raise ValueError(f"Unexpected agent.predict return length: {len(predict_result)}")
+
+    return (
+        actions,
+        values,
+        actions_log_prob,
+        action_mean,
+        action_sigma,
+        detach_obs,
+        detach_critic_obs,
+        hidden_states,
+    )
+
+
+def _clip_policy_actions(actions, agent, step_index, logger):
+    command_actions = torch.clip(actions, -6.0, 6.0).to(agent.device)
+    if step_index == 0:
+        logger.info(
+            "clipped_action summary: "
+            f"min={float(command_actions.min().item()):.4f} "
+            f"max={float(command_actions.max().item()):.4f} "
+            f"mean={float(command_actions.mean().item()):.4f}"
+        )
+    return command_actions
 
 
 def _aggregate_navigation_stats(nav_metric_values):
@@ -550,6 +618,15 @@ def _aggregate_navigation_stats(nav_metric_values):
         if values:
             aggregated[key] = torch.stack(values).mean().item()
     return aggregated
+
+
+def _collect_rollout_monitor_stats(storage, usr_conf, logger, nav_metric_values, env, critic_obs):
+    storage_stats = _sample_rollout_tracking_stats(storage, usr_conf, logger)
+    storage_stats.update(_aggregate_navigation_stats(nav_metric_values))
+    # sample_physics_stats catches sensor-access errors internally, so it is safe
+    # to keep this monitor hook active in local and platform runs.
+    storage_stats.update(sample_physics_stats(env, logger, critic_obs=critic_obs))
+    return storage_stats
 
 
 def run_episodes_(
@@ -585,58 +662,33 @@ def run_episodes_(
     # 绛栫暐鎵ц寰幆
     with torch.inference_mode():
         for i in range(agent.num_steps_per_env):
-            policy_obs, policy_critic_obs, phase_stats = apply_track_phase_command(
+            policy_obs, policy_critic_obs, phase_stats = _apply_phase_command_for_rollout(
                 obs,
                 critic_obs,
                 env,
-                usr_conf.get("rl_navigation", {}),
+                usr_conf,
                 logger,
-                set_env_command_fn=set_env_base_velocity_command,
             )
-            for key, value in phase_stats.items():
-                nav_metric_values[key].append(value.float().mean())
+            _record_phase_stats(nav_metric_values, phase_stats)
 
             # Predict actions
             # 棰勬祴鍔ㄤ綔
             predict_data = (policy_obs, policy_critic_obs)
-            predict_result = agent.predict(predict_data)
-
-            if len(predict_result) == 8:
-                (
-                    actions,
-                    values,
-                    actions_log_prob,
-                    action_mean,
-                    action_sigma,
-                    detach_obs,
-                    detach_critic_obs,
-                    hidden_states,
-                ) = predict_result
-            elif len(predict_result) == 7:
-                (
-                    actions,
-                    values,
-                    actions_log_prob,
-                    action_mean,
-                    action_sigma,
-                    detach_obs,
-                    detach_critic_obs,
-                ) = predict_result
-                hidden_states = None
-            else:
-                raise ValueError(f"Unexpected agent.predict return length: {len(predict_result)}")
+            (
+                actions,
+                values,
+                actions_log_prob,
+                action_mean,
+                action_sigma,
+                detach_obs,
+                detach_critic_obs,
+                hidden_states,
+            ) = _unpack_predict_result(agent.predict(predict_data))
             joint_actions = actions
 
             # Clip joint actions for env
             # 瑁佸壀鍏宠妭鍔ㄤ綔
-            command_actions = torch.clip(joint_actions, -6.0, 6.0).to(agent.device)
-            if i == 0:
-                logger.info(
-                    "clipped_action summary: "
-                    f"min={float(command_actions.min().item()):.4f} "
-                    f"max={float(command_actions.max().item()):.4f} "
-                    f"mean={float(command_actions.mean().item()):.4f}"
-                )
+            command_actions = _clip_policy_actions(joint_actions, agent, i, logger)
 
             # Environment interaction
             # 鐜浜や簰
@@ -701,15 +753,12 @@ def run_episodes_(
             env=env,
             usr_conf=usr_conf,
         )
-        storage_stats.update(_sample_rollout_tracking_stats(storage, usr_conf, logger))
-        storage_stats.update(_aggregate_navigation_stats(nav_metric_values))
+        storage_stats.update(
+            _collect_rollout_monitor_stats(storage, usr_conf, logger, nav_metric_values, env, critic_obs)
+        )
         last_obs = torch.clone(obs)
 
     # Note: batch generation now handled by AlgorithmPPO.learn()
     # Storage will be cleared after learning
     # 娉細batch 鐢熸垚宸茬敱 AlgorithmPPO.learn() 澶勭悊锛?    # storage 灏嗗湪璁粌瀹屾垚鍚庤娓呯┖銆?
-    # Append a physics snapshot (averaged across all envs).
-    # Wrapped in try/except inside sample_physics_stats, so always safe.
-    storage_stats.update(sample_physics_stats(env, logger, critic_obs=critic_obs))
-
     return last_obs, critic_obs, storage_stats

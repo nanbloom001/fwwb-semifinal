@@ -242,16 +242,29 @@ class RolloutStorage:
         Generate recurrent mini-batches as full time sequences.
         Shuffle environment IDs, keep the time axis intact.
         """
-        envs_per_batch = self.num_envs // num_mini_batches
+        envs_per_batch = self._envs_per_recurrent_batch(num_mini_batches)
+        usable_envs = envs_per_batch * num_mini_batches
+        for _ in range(num_epochs):
+            shuffled_env_ids = torch.randperm(
+                self.num_envs,
+                requires_grad=False,
+                device=self.device,
+            )[:usable_envs]
+            for batch_id in range(num_mini_batches):
+                yield self._create_recurrent_mini_batch(
+                    self._slice_recurrent_env_ids(shuffled_env_ids, batch_id, envs_per_batch)
+                )
+
+    def _envs_per_recurrent_batch(self, num_mini_batches):
+        envs_per_batch = self.num_envs // int(num_mini_batches)
         if envs_per_batch <= 0:
             raise ValueError(f"num_mini_batches={num_mini_batches} exceeds num_envs={self.num_envs}")
+        return envs_per_batch
 
-        usable_envs = envs_per_batch * num_mini_batches
-        for epoch in range(num_epochs):
-            env_perm = torch.randperm(self.num_envs, requires_grad=False, device=self.device)[:usable_envs]
-            for i in range(num_mini_batches):
-                env_ids = env_perm[i * envs_per_batch : (i + 1) * envs_per_batch]
-                yield self._create_recurrent_mini_batch(env_ids)
+    @staticmethod
+    def _slice_recurrent_env_ids(env_ids, batch_id, envs_per_batch):
+        start = batch_id * envs_per_batch
+        return env_ids[start : start + envs_per_batch]
 
     def _flatten_buffers(self):
         """Flatten all buffer tensors for batch generation.
@@ -297,6 +310,14 @@ class RolloutStorage:
             None,
         )
 
+    def _select_recurrent_hidden_states(self, env_ids):
+        if self.saved_hidden_states_a is None or self.saved_hidden_states_c is None:
+            return (None, None)
+        return (
+            self.saved_hidden_states_a[0][0, :, env_ids, :].detach(),
+            self.saved_hidden_states_c[0][0, :, env_ids, :].detach(),
+        )
+
     def _create_recurrent_mini_batch(self, env_ids):
         observations = self.observations[:, env_ids]
         critic_observations = (
@@ -305,15 +326,8 @@ class RolloutStorage:
             else observations
         )
 
-        if self.saved_hidden_states_a is not None and self.saved_hidden_states_c is not None:
-            hidden_states = (
-                self.saved_hidden_states_a[0][0, :, env_ids, :].detach(),
-                self.saved_hidden_states_c[0][0, :, env_ids, :].detach(),
-            )
-        else:
-            hidden_states = (None, None)
-
-        masks = 1.0 - self.dones[:, env_ids].float()
+        hidden_states = self._select_recurrent_hidden_states(env_ids)
+        masks = torch.ones_like(self.dones[:, env_ids], dtype=torch.float32) - self.dones[:, env_ids].float()
         return (
             observations,
             critic_observations,

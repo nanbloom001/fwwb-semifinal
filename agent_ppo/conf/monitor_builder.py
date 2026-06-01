@@ -1,502 +1,394 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
 ###########################################################################
-# Copyright © 1998 - 2026 Tencent. All Rights Reserved.
+# Copyright (c) 1998 - 2026 Tencent. All Rights Reserved.
 ###########################################################################
-"""
-Author: Tencent AI Arena Authors
-"""
+"""Monitor configuration for the current track-navigation training line."""
 
 from kaiwudrl.common.monitor.monitor_config_builder import MonitorConfigBuilder
 
 
-def build_monitor():
-    """
-    # This function is used to create monitoring panel configurations for custom indicators.
-    # 该函数用于创建自定义指标的监控面板配置。
-    #
-    # Panel organization (Phase-0: flat-ground gait shaping):
-    # 面板组织（Phase-0 平地步态塑形）：
-    #
-    # Group 1: 算法指标   — PPO loss curves
-    # Group 2: 速度跟踪   — velocity tracking rewards (primary positive signal)
-    # Group 3: 姿态质量   — posture rewards (Phase-0 primary training objective)
-    # Group 4: 步态质量   — gait quality rewards (Phase-0 secondary objective)
-    # Group 5: 稳定/接触  — stability & contact penalties
-    # Group 6: 关节/动作  — joint & action smoothness penalties
-    # Group 7: 能耗       — energy / torque penalties (competition scoring)
+DISPLAY_NAME_LIMIT = 20
 
-    Returns:
-        dict: monitor configuration dictionary
-        返回值：监控配置字典
-    """
-    monitor = MonitorConfigBuilder()
+DISPLAY_NAMES = {
+    "track_navigation_training": "track_nav",
+    "direct_score_and_completion": "score_complete",
+    "time_and_progress_proxy": "time_progress",
+    "posture_energy_support": "pose_energy",
+    "gait_and_stillness": "gait_still",
+    "maze_safety_and_finish": "maze_safety",
+    "suggested_speed_gate_probes": "speed_gate_probe",
+    "suggested_speed_gate_summary": "speed_gate",
+    "velocity_curriculum": "vel_curriculum",
+    "training_progress": "train_progress",
+    "difficulty_pressure_complete": "diff_pressure",
+    "goal_velocity_projection": "goal_vel_proj",
+    "forward_heading_velocity": "heading_vel",
+    "command_speed_advantage": "cmd_speed_adv",
+    "joint_position_penalty": "joint_pos_penalty",
+    "action_smoothness": "action_smooth",
+    "air_time_variance_penalty": "air_time_var",
+    "commanded_still_penalty": "cmd_still_penalty",
+    "goal_heading_alignment": "goal_heading",
+    "near_goal_finish_drive": "near_finish_drive",
+    "near_goal_retreat_penalty": "near_retreat",
+    "near_goal_circling_penalty": "near_circling",
+    "maze_anticipatory_turn": "maze_turn",
+    "directed_exploration": "direct_explore",
+    "long_non_foot_contact": "non_foot_contact",
+    "speed_gate_target_vx": "gate_target_vx",
+    "speed_gate_worker_vx": "gate_worker_vx",
+    "speed_gate_nav_front": "gate_nav_front",
+    "speed_gate_nav_block": "gate_nav_block",
+    "speed_gate_hold_steps": "gate_hold_steps",
+    "speed_gate_maze_confirm": "gate_maze_confirm",
+    "vel_curriculum_tracking_ratio": "vel_track_ratio",
+    "vel_curriculum_tracking_reward": "vel_track_reward",
+    "level_abnormal_pct": "level_abn_pct",
+    "level_timeout_pct": "level_timeout_pct",
+    "command_vx_and_write_pct": "cmd_vx_write",
+    "wall_gate_signal": "wall_gate",
+    "sticky_gate_state": "sticky_gate",
+    "velocity_error_stat": "vel_error_stat",
+    "obs_lin_vel_x_error": "obs_vx_error",
+    "obs_lin_vel_y_error": "obs_vy_error",
+}
 
-    config_dict = (
-        monitor.title("四足机器人导航")
-        # ==============================================================
-        # Group 0: Training progress — reward-weight-agnostic convergence signals
-        # Group 0: 训练进展 — 与 reward 权重无关的收敛信号
-        #
-        # mean_episode_length: average steps per episode.
-        #   Monotonically rising → robot survives longer → genuine convergence.
-        #   Plateau at low value → robot keeps falling → weight or algo problem.
-        #
-        # mean_episode_reward: cumulative reward summed over one episode.
-        #   Combines all weighted terms; the one true "fitness" curve.
-        #   Use this to compare runs with different weight configurations.
-        #
-        # mean_episode_length: 每 episode 的平均存活步数。
-        #   单调上升 → 机器人越来越耐摔 → 真正收敛。
-        #   早期很低并长期平台 → 机器人一直倒 → 权重或算法有问题。
-        #
-        # mean_episode_reward: 每 episode 全部加权奖励之和。
-        #   是唯一综合所有项的真实适应度曲线，用来跨配置对比训练。
-        # ==============================================================
-        .add_group(group_name="训练进展", group_name_en="training_progress")
-        .add_panel(name="平均 episode 步数", name_en="mean_episode_length", type="line")
-            .add_metric(metrics_name="mean_episode_length",
-                        expr="avg(mean_episode_length{})")
-            .end_panel()
-        .add_panel(name="每 episode 累计奖励", name_en="mean_episode_reward", type="line")
-            .add_metric(metrics_name="mean_episode_reward",
-                        expr="avg(mean_episode_reward{})")
-            .end_panel()
-        .end_group()
 
-        # ==============================================================
-        # Group 1: PPO algorithm loss curves
-        # Group 1: PPO 算法损失曲线
-        # ==============================================================
-        .add_group(group_name="算法指标", group_name_en="algorithm")
-        .add_panel(name="总损失", name_en="total_loss", type="line")
-            .add_metric(metrics_name="total_loss", expr="avg(total_loss{})")
-            .end_panel()
-        .add_panel(name="价值损失", name_en="value_loss", type="line")
-            .add_metric(metrics_name="value_loss", expr="avg(value_loss{})")
-            .end_panel()
-        .add_panel(name="策略损失", name_en="policy_loss", type="line")
-            .add_metric(metrics_name="policy_loss", expr="avg(policy_loss{})")
-            .end_panel()
-        .add_panel(name="熵损失", name_en="entropy_loss", type="line")
-            .add_metric(metrics_name="entropy_loss", expr="avg(entropy_loss{})")
-            .end_panel()
-        .end_group()
+def _display_name(name: str) -> str:
+    display = DISPLAY_NAMES.get(name, name)
+    return display[:DISPLAY_NAME_LIMIT]
 
-        # ==============================================================
-        # Group 2: Velocity tracking (primary positive reward signal)
-        # Group 2: 速度跟踪（主正向奖励信号）
-        # ==============================================================
-        .add_group(group_name="速度跟踪", group_name_en="velocity_tracking")
-        .add_panel(name="线速度跟踪", name_en="reward_track_lin_vel_xy", type="line")
-            .add_metric(metrics_name="reward_track_lin_vel_xy",
-                        expr="avg(reward_track_lin_vel_xy{})")
-            .end_panel()
-        .add_panel(name="建议速度优势", name_en="reward_command_speed_advantage", type="line")
-            .add_metric(metrics_name="reward_command_speed_advantage",
-                        expr="avg(reward_command_speed_advantage{})")
-            .end_panel()
-        .add_panel(name="偏航角速度跟踪", name_en="reward_track_ang_vel_z", type="line")
-            .add_metric(metrics_name="reward_track_ang_vel_z",
-                        expr="avg(reward_track_ang_vel_z{})")
-            .end_panel()
-        .add_panel(name="课程追踪比例", name_en="vel_curriculum_tracking_ratio", type="line")
-            .add_metric(metrics_name="vel_curriculum_tracking_ratio",
-                        expr="avg(vel_curriculum_tracking_ratio{})")
-            .end_panel()
-        .add_panel(name="速度课程等级", name_en="vel_curriculum_stage", type="line")
-            .add_metric(metrics_name="vel_curriculum_stage",
-                        expr="avg(vel_curriculum_stage{})")
-            .end_panel()
-        .end_group()
 
-        # ==============================================================
-        # Group 3: Posture quality (Phase-0 PRIMARY objective)
-        # Group 3: 姿态质量（Phase-0 核心训练目标）
-        # ==============================================================
-        .add_group(group_name="姿态质量", group_name_en="posture_quality")
-        .add_panel(name="机身水平姿态惩罚", name_en="reward_flat_orientation", type="line")
-            .add_metric(metrics_name="reward_flat_orientation",
-                        expr="avg(reward_flat_orientation{})")
-            .end_panel()
-        .add_panel(name="姿态公式分", name_en="reward_pose_score_formula", type="line")
-            .add_metric(metrics_name="reward_pose_score_formula",
-                        expr="avg(reward_pose_score_formula{})")
-            .end_panel()
-        .add_panel(name="机身高度惩罚", name_en="reward_correct_base_height", type="line")
-            .add_metric(metrics_name="reward_correct_base_height",
-                        expr="avg(reward_correct_base_height{})")
-            .end_panel()
-        .add_panel(name="全身关节偏离惩罚", name_en="reward_joint_position_penalty", type="line")
-            .add_metric(metrics_name="reward_joint_position_penalty",
-                        expr="avg(reward_joint_position_penalty{})")
-            .end_panel()
-        .add_panel(name="侧向漂移惩罚", name_en="reward_base_lateral_vel", type="line")
-            .add_metric(metrics_name="reward_base_lateral_vel",
-                        expr="avg(reward_base_lateral_vel{})")
-            .end_panel()
-        .add_panel(name="pitch roll 角速度惩罚", name_en="reward_ang_vel_xy", type="line")
-            .add_metric(metrics_name="reward_ang_vel_xy",
-                        expr="avg(reward_ang_vel_xy{})")
-            .end_panel()
-        .end_group()
+def _avg(metric_name: str) -> str:
+    return f"avg({metric_name}{{}})"
 
-        # ==============================================================
-        # Group 4: Gait quality (Phase-0 secondary objective)
-        # Group 4: 步态质量（Phase-0 次要训练目标）
-        # ==============================================================
-        .add_group(group_name="步态质量", group_name_en="gait_quality")
-        .add_panel(name="脚部滞空时间奖励", name_en="reward_feet_air_time", type="line")
-            .add_metric(metrics_name="reward_feet_air_time",
-                        expr="avg(reward_feet_air_time{})")
-            .end_panel()
-        .add_panel(name="关节速度惩罚", name_en="reward_dof_vel", type="line")
-            .add_metric(metrics_name="reward_dof_vel",
-                        expr="avg(reward_dof_vel{})")
-            .end_panel()
-        .add_panel(name="步态对称性惩罚", name_en="reward_air_time_variance_penalty", type="line")
-            .add_metric(metrics_name="reward_air_time_variance_penalty",
-                        expr="avg(reward_air_time_variance_penalty{})")
-            .end_panel()
-        .add_panel(name="原地旋转惩罚", name_en="reward_pivot_turning", type="line")
-            .add_metric(metrics_name="reward_pivot_turning",
-                        expr="avg(reward_pivot_turning{})")
-            .end_panel()
-        .add_panel(name="脚部打滑惩罚", name_en="reward_feet_slide", type="line")
-            .add_metric(metrics_name="reward_feet_slide",
-                        expr="avg(reward_feet_slide{})")
-            .end_panel()
-        .add_panel(name="脚撞台阶边缘惩罚", name_en="reward_feet_stumble", type="line")
-            .add_metric(metrics_name="reward_feet_stumble",
-                        expr="avg(reward_feet_stumble{})")
-            .end_panel()
-        .end_group()
 
-        # ==============================================================
-        # Group 5: Stability & contact penalties
-        # Group 5: 稳定性与接触惩罚
-        # ==============================================================
-        .add_group(group_name="稳定接触", group_name_en="stability_contact")
-        .add_panel(name="垂直速度惩罚", name_en="reward_lin_vel_z", type="line")
-            .add_metric(metrics_name="reward_lin_vel_z",
-                        expr="avg(reward_lin_vel_z{})")
-            .end_panel()
-        .add_panel(name="非预期接触惩罚", name_en="reward_undesired_contacts", type="line")
-            .add_metric(metrics_name="reward_undesired_contacts",
-                        expr="avg(reward_undesired_contacts{})")
-            .end_panel()
-        .add_panel(name="终止惩罚", name_en="reward_termination", type="line")
-            .add_metric(metrics_name="reward_termination",
-                        expr="avg(reward_termination{})")
-            .end_panel()
-        .add_panel(name="关节位置极限惩罚", name_en="reward_dof_pos_limits", type="line")
-            .add_metric(metrics_name="reward_dof_pos_limits",
-                        expr="avg(reward_dof_pos_limits{})")
-            .end_panel()
-        .end_group()
+def _reward(reward_name: str) -> str:
+    return f"reward_{reward_name}"
 
-        # ==============================================================
-        # Group 6: Joint & action smoothness penalties
-        # Group 6: 关节与动作平滑惩罚
-        # ==============================================================
-        .add_group(group_name="关节动作平滑", group_name_en="joint_action_smoothness")
-        .add_panel(name="关节加速度惩罚", name_en="reward_joint_acc", type="line")
-            .add_metric(metrics_name="reward_joint_acc",
-                        expr="avg(reward_joint_acc{})")
-            .end_panel()
-        .add_panel(name="动作变化率惩罚 一阶", name_en="reward_action_rate", type="line")
-            .add_metric(metrics_name="reward_action_rate",
-                        expr="avg(reward_action_rate{})")
-            .end_panel()
-        .add_panel(name="动作平滑惩罚 二阶", name_en="reward_action_smoothness", type="line")
-            .add_metric(metrics_name="reward_action_smoothness",
-                        expr="avg(reward_action_smoothness{})")
-            .end_panel()
-        .end_group()
 
-        # ==============================================================
-        # Group 7: Energy / torque (competition scoring items)
-        # Group 7: 能耗 / 扭矩（赛题评分项）
-        # ==============================================================
-        .add_group(group_name="能耗扭矩", group_name_en="energy_torque")
-        .add_panel(name="能耗惩罚", name_en="reward_energy", type="line")
-            .add_metric(metrics_name="reward_energy",
-                        expr="avg(reward_energy{})")
-            .end_panel()
-        .add_panel(name="能耗公式分", name_en="reward_energy_score_formula", type="line")
-            .add_metric(metrics_name="reward_energy_score_formula",
-                        expr="avg(reward_energy_score_formula{})")
-            .end_panel()
-        .add_panel(name="关节扭矩惩罚", name_en="reward_joint_torques", type="line")
-            .add_metric(metrics_name="reward_joint_torques",
-                        expr="avg(reward_joint_torques{})")
-            .end_panel()
-        .end_group()
-
-        # ==============================================================
-        # ==============================================================
-        # Group 8: RL navigation rewards
-        # ==============================================================
-        .add_group(group_name="RL导航", group_name_en="rl_navigation")
-        .add_panel(name="前进头向", name_en="reward_forward_heading_velocity", type="line")
-            .add_metric(metrics_name="reward_forward_heading_velocity",
-                        expr="avg(reward_forward_heading_velocity{})")
-            .end_panel()
-        .add_panel(name="后退惩罚", name_en="reward_backward_penalty", type="line")
-            .add_metric(metrics_name="reward_backward_penalty",
-                        expr="avg(reward_backward_penalty{})")
-            .end_panel()
-        .add_panel(name="目标朝向", name_en="reward_goal_heading_alignment", type="line")
-            .add_metric(metrics_name="reward_goal_heading_alignment",
-                        expr="avg(reward_goal_heading_alignment{})")
-            .end_panel()
-        .add_panel(name="目标推进", name_en="reward_goal_velocity_projection", type="line")
-            .add_metric(metrics_name="reward_goal_velocity_projection",
-                        expr="avg(reward_goal_velocity_projection{})")
-            .end_panel()
-        .add_panel(name="逆向惩罚", name_en="reward_goal_backtrack_penalty", type="line")
-            .add_metric(metrics_name="reward_goal_backtrack_penalty",
-                        expr="avg(reward_goal_backtrack_penalty{})")
-            .end_panel()
-        .add_panel(name="Near Goal Circling", name_en="reward_near_goal_circling_penalty", type="line")
-            .add_metric(metrics_name="reward_near_goal_circling_penalty",
-                        expr="avg(reward_near_goal_circling_penalty{})")
-            .end_panel()
-        .add_panel(name="近终点推进", name_en="reward_near_goal_finish_drive", type="line")
-            .add_metric(metrics_name="reward_near_goal_finish_drive",
-                        expr="avg(reward_near_goal_finish_drive{})")
-            .end_panel()
-        .add_panel(name="Near Goal Retreat", name_en="reward_near_goal_retreat_penalty", type="line")
-            .add_metric(metrics_name="reward_near_goal_retreat_penalty",
-                        expr="avg(reward_near_goal_retreat_penalty{})")
-            .end_panel()
-        .add_panel(name="Goal Miss", name_en="reward_goal_miss_penalty", type="line")
-            .add_metric(metrics_name="reward_goal_miss_penalty",
-                        expr="avg(reward_goal_miss_penalty{})")
-            .end_panel()
-        .add_panel(name="接近目标", name_en="reward_approach_goal", type="line")
-            .add_metric(metrics_name="reward_approach_goal",
-                        expr="avg(reward_approach_goal{})")
-            .end_panel()
-        .add_panel(name="目标距离", name_en="reward_goal_distance", type="line")
-            .add_metric(metrics_name="reward_goal_distance",
-                        expr="avg(reward_goal_distance{})")
-            .end_panel()
-        .add_panel(name="任务完成", name_en="reward_task_complete", type="line")
-            .add_metric(metrics_name="reward_task_complete",
-                        expr="avg(reward_task_complete{})")
-            .end_panel()
-        .add_panel(name="高压完成", name_en="reward_difficulty_pressure_complete", type="line")
-            .add_metric(metrics_name="reward_difficulty_pressure_complete",
-                        expr="avg(reward_difficulty_pressure_complete{})")
-            .end_panel()
-        .add_panel(name="导航时间", name_en="reward_navigation_time", type="line")
-            .add_metric(metrics_name="reward_navigation_time",
-                        expr="avg(reward_navigation_time{})")
-            .end_panel()
-        .add_panel(name="得分引导", name_en="reward_score_guidance", type="line")
-            .add_metric(metrics_name="reward_score_guidance",
-                        expr="avg(reward_score_guidance{})")
-            .end_panel()
-        .add_panel(name="迷宫门控", name_en="reward_maze_context_gate", type="line")
-            .add_metric(metrics_name="reward_maze_context_gate",
-                        expr="avg(reward_maze_context_gate{})")
-            .end_panel()
-        .add_panel(name="迷宫大转弯", name_en="reward_maze_anticipatory_turn", type="line")
-            .add_metric(metrics_name="reward_maze_anticipatory_turn",
-                        expr="avg(reward_maze_anticipatory_turn{})")
-            .end_panel()
-        .add_panel(name="撞墙惩罚", name_en="reward_wall_collision", type="line")
-            .add_metric(metrics_name="reward_wall_collision",
-                        expr="avg(reward_wall_collision{})")
-            .end_panel()
-        .add_panel(name="贴墙停滞", name_en="reward_wall_stall_penalty", type="line")
-            .add_metric(metrics_name="reward_wall_stall_penalty",
-                        expr="avg(reward_wall_stall_penalty{})")
-            .end_panel()
-        .add_panel(name="离墙惩罚", name_en="reward_wall_proximity", type="line")
-            .add_metric(metrics_name="reward_wall_proximity",
-                        expr="avg(reward_wall_proximity{})")
-            .end_panel()
-        .add_panel(name="空旷奖励", name_en="reward_open_space", type="line")
-            .add_metric(metrics_name="reward_open_space",
-                        expr="avg(reward_open_space{})")
-            .end_panel()
-        .add_panel(name="中心偏离", name_en="reward_corridor_centering", type="line")
-            .add_metric(metrics_name="reward_corridor_centering",
-                        expr="avg(reward_corridor_centering{})")
-            .end_panel()
-        .add_panel(name="探索奖励", name_en="reward_directed_exploration", type="line")
-            .add_metric(metrics_name="reward_directed_exploration",
-                        expr="avg(reward_directed_exploration{})")
-            .end_panel()
-        .add_panel(name="停滞惩罚", name_en="reward_stuck_penalty", type="line")
-            .add_metric(metrics_name="reward_stuck_penalty",
-                        expr="avg(reward_stuck_penalty{})")
-            .end_panel()
-        .add_panel(name="长时非足接触", name_en="reward_long_non_foot_contact", type="line")
-            .add_metric(metrics_name="reward_long_non_foot_contact",
-                        expr="avg(reward_long_non_foot_contact{})")
-            .end_panel()
-        .end_group()
-
-        # ==============================================================
-        # Track result and suggested-speed gate diagnostics. These metrics
-        # come from scorer episode info or rollout stats, not reward probes.
-        # ==============================================================
-        .add_group(group_name="Track结果", group_name_en="track_results")
-        .add_panel(name="完成异常超时", name_en="track_outcome_pct", type="line")
-            .add_metric(metrics_name="completion_pct",
-                        expr="100 * avg(completed_count{}) / clamp_min(avg(completed_count{}) + avg(abnormal_count{}) + avg(timeout_count{}), 1)")
-            .add_metric(metrics_name="abnormal_pct",
-                        expr="100 * avg(abnormal_count{}) / clamp_min(avg(completed_count{}) + avg(abnormal_count{}) + avg(timeout_count{}), 1)")
-            .add_metric(metrics_name="timeout_pct",
-                        expr="100 * avg(timeout_count{}) / clamp_min(avg(completed_count{}) + avg(abnormal_count{}) + avg(timeout_count{}), 1)")
-            .end_panel()
-        .add_panel(name="L异常率", name_en="track_level_abnormal_pct", type="line")
-            .add_metric(metrics_name="l0_abn", expr="100 * avg(abnormal_count_track_l0{}) / clamp_min(avg(completed_count_track_l0{}) + avg(abnormal_count_track_l0{}) + avg(timeout_count_track_l0{}), 1)")
-            .add_metric(metrics_name="l1_abn", expr="100 * avg(abnormal_count_track_l1{}) / clamp_min(avg(completed_count_track_l1{}) + avg(abnormal_count_track_l1{}) + avg(timeout_count_track_l1{}), 1)")
-            .add_metric(metrics_name="l2_abn", expr="100 * avg(abnormal_count_track_l2{}) / clamp_min(avg(completed_count_track_l2{}) + avg(abnormal_count_track_l2{}) + avg(timeout_count_track_l2{}), 1)")
-            .add_metric(metrics_name="l3_abn", expr="100 * avg(abnormal_count_track_l3{}) / clamp_min(avg(completed_count_track_l3{}) + avg(abnormal_count_track_l3{}) + avg(timeout_count_track_l3{}), 1)")
-            .add_metric(metrics_name="l4_abn", expr="100 * avg(abnormal_count_track_l4{}) / clamp_min(avg(completed_count_track_l4{}) + avg(abnormal_count_track_l4{}) + avg(timeout_count_track_l4{}), 1)")
-            .add_metric(metrics_name="l5_abn", expr="100 * avg(abnormal_count_track_l5{}) / clamp_min(avg(completed_count_track_l5{}) + avg(abnormal_count_track_l5{}) + avg(timeout_count_track_l5{}), 1)")
-            .add_metric(metrics_name="l6_abn", expr="100 * avg(abnormal_count_track_l6{}) / clamp_min(avg(completed_count_track_l6{}) + avg(abnormal_count_track_l6{}) + avg(timeout_count_track_l6{}), 1)")
-            .add_metric(metrics_name="l7_abn", expr="100 * avg(abnormal_count_track_l7{}) / clamp_min(avg(completed_count_track_l7{}) + avg(abnormal_count_track_l7{}) + avg(timeout_count_track_l7{}), 1)")
-            .add_metric(metrics_name="l8_abn", expr="100 * avg(abnormal_count_track_l8{}) / clamp_min(avg(completed_count_track_l8{}) + avg(abnormal_count_track_l8{}) + avg(timeout_count_track_l8{}), 1)")
-            .add_metric(metrics_name="l9_abn", expr="100 * avg(abnormal_count_track_l9{}) / clamp_min(avg(completed_count_track_l9{}) + avg(abnormal_count_track_l9{}) + avg(timeout_count_track_l9{}), 1)")
-            .end_panel()
-        .add_panel(name="L超时率", name_en="track_level_timeout_pct", type="line")
-            .add_metric(metrics_name="l0_timeout", expr="100 * avg(timeout_count_track_l0{}) / clamp_min(avg(completed_count_track_l0{}) + avg(abnormal_count_track_l0{}) + avg(timeout_count_track_l0{}), 1)")
-            .add_metric(metrics_name="l1_timeout", expr="100 * avg(timeout_count_track_l1{}) / clamp_min(avg(completed_count_track_l1{}) + avg(abnormal_count_track_l1{}) + avg(timeout_count_track_l1{}), 1)")
-            .add_metric(metrics_name="l2_timeout", expr="100 * avg(timeout_count_track_l2{}) / clamp_min(avg(completed_count_track_l2{}) + avg(abnormal_count_track_l2{}) + avg(timeout_count_track_l2{}), 1)")
-            .add_metric(metrics_name="l3_timeout", expr="100 * avg(timeout_count_track_l3{}) / clamp_min(avg(completed_count_track_l3{}) + avg(abnormal_count_track_l3{}) + avg(timeout_count_track_l3{}), 1)")
-            .add_metric(metrics_name="l4_timeout", expr="100 * avg(timeout_count_track_l4{}) / clamp_min(avg(completed_count_track_l4{}) + avg(abnormal_count_track_l4{}) + avg(timeout_count_track_l4{}), 1)")
-            .add_metric(metrics_name="l5_timeout", expr="100 * avg(timeout_count_track_l5{}) / clamp_min(avg(completed_count_track_l5{}) + avg(abnormal_count_track_l5{}) + avg(timeout_count_track_l5{}), 1)")
-            .add_metric(metrics_name="l6_timeout", expr="100 * avg(timeout_count_track_l6{}) / clamp_min(avg(completed_count_track_l6{}) + avg(abnormal_count_track_l6{}) + avg(timeout_count_track_l6{}), 1)")
-            .add_metric(metrics_name="l7_timeout", expr="100 * avg(timeout_count_track_l7{}) / clamp_min(avg(completed_count_track_l7{}) + avg(abnormal_count_track_l7{}) + avg(timeout_count_track_l7{}), 1)")
-            .add_metric(metrics_name="l8_timeout", expr="100 * avg(timeout_count_track_l8{}) / clamp_min(avg(completed_count_track_l8{}) + avg(abnormal_count_track_l8{}) + avg(timeout_count_track_l8{}), 1)")
-            .add_metric(metrics_name="l9_timeout", expr="100 * avg(timeout_count_track_l9{}) / clamp_min(avg(completed_count_track_l9{}) + avg(abnormal_count_track_l9{}) + avg(timeout_count_track_l9{}), 1)")
-            .end_panel()
-        .end_group()
-
-        .add_group(group_name="建议速度门控", group_name_en="suggested_speed_gate")
-        .add_panel(name="建议速度", name_en="suggested_speed_vx", type="line")
-            .add_metric(metrics_name="target_vx",
-                        expr="avg(reward_speed_gate_target_vx{}) * 1000000000")
-            .add_metric(metrics_name="worker_vx",
-                        expr="avg(reward_speed_gate_worker_vx{}) * 1000000000")
-            .add_metric(metrics_name="write_pct",
-                        expr="avg(reward_speed_gate_written{}) * 100000000000")
-            .end_panel()
-        .add_panel(name="地形占比", name_en="suggested_terrain_pct", type="line")
-            .add_metric(metrics_name="flat_pct",
-                        expr="100 * avg(reward_speed_gate_flat{}) / clamp_min(avg(reward_speed_gate_sum{}), 1e-12)")
-            .add_metric(metrics_name="slope_pct",
-                        expr="100 * avg(reward_speed_gate_slope{}) / clamp_min(avg(reward_speed_gate_sum{}), 1e-12)")
-            .add_metric(metrics_name="stairs_pct",
-                        expr="100 * avg(reward_speed_gate_stairs{}) / clamp_min(avg(reward_speed_gate_sum{}), 1e-12)")
-            .add_metric(metrics_name="maze_pct",
-                        expr="100 * avg(reward_speed_gate_maze{}) / clamp_min(avg(reward_speed_gate_sum{}), 1e-12)")
-            .add_metric(metrics_name="invalid_pct",
-                        expr="100 * avg(reward_speed_gate_invalid{}) / clamp_min(avg(reward_speed_gate_sum{}), 1e-12)")
-            .end_panel()
-        .add_panel(name="门控状态", name_en="gate_worker_status", type="line")
-            .add_metric(metrics_name="valid_pct",
-                        expr="100 * avg(reward_speed_gate_valid{}) / clamp_min(avg(reward_speed_gate_sum{}), 1e-12)")
-            .add_metric(metrics_name="terrain_sum",
-                        expr="avg(reward_speed_gate_sum{}) * 1000000000")
-            .end_panel()
-        .add_panel(name="墙体信号", name_en="wall_gate_signal", type="line")
-            .add_metric(metrics_name="front_wall",
-                        expr="avg(reward_speed_gate_nav_front{}) * 1000000000")
-            .add_metric(metrics_name="front_block_pct",
-                        expr="avg(reward_speed_gate_nav_block{}) * 100000000000")
-            .end_panel()
-        .add_panel(name="粘性门控", name_en="sticky_gate_state", type="line")
-            .add_metric(metrics_name="hold_steps",
-                        expr="avg(reward_speed_gate_hold_steps{}) * 1000000000")
-            .add_metric(metrics_name="pending",
-                        expr="avg(reward_speed_gate_pending{}) * 1000000000")
-            .add_metric(metrics_name="maze_confirm",
-                        expr="avg(reward_speed_gate_maze_confirm{}) * 1000000000")
-            .end_panel()
-        .end_group()
-
-        # Group 9: Physical observations (SI units, weight-independent)
-        # Group 8: 物理观测量（SI 单位，与 reward 权重无关）
-        #
-        # These panels show the *physical* quantities that the reward functions
-        # operate on, NOT the weighted reward values.  They let you answer
-        # "is the robot actually converging in terms of real physics?"
-        # independently of whether you've tuned the reward weights well.
-        #
-        # 这些面板显示奖励函数实际计算所用的物理量（SI 单位），
-        # 而非加权后的奖励值。用于独立于权重设置判断"机器人物理收敛了吗"。
-        #
-        # obs_lin_vel_x_error: mean |cmd_vx - actual_vx| (m/s)
-        #   → 速度追踪误差（前向）；收敛后应趋近 0 m/s。
-        #     值持续 >0.3 m/s 且 reward 已平台 → 权重可能有矛盾梯度。
-        #
-        # obs_lin_vel_y_error: mean |cmd_vy - actual_vy| (m/s)
-        #   → 速度追踪误差（侧向）；正常约 0.1 m/s 以内。
-        #
-        # obs_actual_vel_x: mean actual forward speed (m/s)
-        #   → 机器人实际平均前向速度；Stage-0 目标 0.25 m/s，随阶段升高。
-        #
-        # obs_base_height: mean base height (m)
-        #   → 机身高度均值；目标 0.38 m。
-        #     偏低说明腿弯曲不足（或摔倒率高）；偏高说明过度伸展。
-        #
-        # obs_ang_vel_xy: mean |ω_pitch, ω_roll| magnitude (rad/s)
-        #   → pitch/roll 角速度幅值；反映机身倾斜程度。
-        #     正常行走约 0.3–0.8 rad/s；持续 >1.5 说明姿态不稳定。
-        # ==============================================================
-        .add_group(group_name="物理观测量", group_name_en="physics_obs")
-        .add_panel(name="前向速度对照", name_en="velocity_x_stat", type="stat")
-            .add_metric(metrics_name="cmd_vx",
-                        expr="avg(obs_cmd_vel_x{})")
-            .add_metric(metrics_name="actual_vx",
-                        expr="avg(obs_actual_vel_x{})")
-            .end_panel()
-        .add_panel(name="侧向速度对照", name_en="velocity_y_stat", type="stat")
-            .add_metric(metrics_name="cmd_vy",
-                        expr="avg(obs_cmd_vel_y{})")
-            .add_metric(metrics_name="actual_vy",
-                        expr="avg(obs_actual_vel_y{})")
-            .end_panel()
-        .add_panel(name="偏航速度对照", name_en="velocity_yaw_stat", type="stat")
-            .add_metric(metrics_name="cmd_yaw",
-                        expr="avg(obs_cmd_yaw{})")
-            .add_metric(metrics_name="actual_yaw",
-                        expr="avg(obs_actual_yaw{})")
-            .end_panel()
-        .add_panel(name="速度误差对照", name_en="velocity_error_stat", type="stat")
-            .add_metric(metrics_name="vx_error",
-                        expr="avg(obs_lin_vel_x_error{})")
-            .add_metric(metrics_name="yaw_error",
-                        expr="avg(obs_yaw_error{})")
-            .end_panel()
-        .add_panel(name="前向速度追踪误差", name_en="obs_lin_vel_x_error", type="line")
-            .add_metric(metrics_name="obs_lin_vel_x_error",
-                        expr="avg(obs_lin_vel_x_error{})")
-            .end_panel()
-        .add_panel(name="侧向速度追踪误差", name_en="obs_lin_vel_y_error", type="line")
-            .add_metric(metrics_name="obs_lin_vel_y_error",
-                        expr="avg(obs_lin_vel_y_error{})")
-            .end_panel()
-        .add_panel(name="实际前向速度", name_en="obs_actual_vel_x", type="line")
-            .add_metric(metrics_name="obs_actual_vel_x",
-                        expr="avg(obs_actual_vel_x{})")
-            .end_panel()
-        .add_panel(name="机身高度", name_en="obs_base_height", type="line")
-            .add_metric(metrics_name="obs_base_height",
-                        expr="avg(obs_base_height{})")
-            .end_panel()
-        .add_panel(name="pitch roll 角速度", name_en="obs_ang_vel_xy", type="line")
-            .add_metric(metrics_name="obs_ang_vel_xy",
-                        expr="avg(obs_ang_vel_xy{})")
-            .end_panel()
-        .end_group()
-        .build()
+def _track_rate(outcome_name: str, level: int | None = None) -> str:
+    if level is None:
+        done = "completed_count"
+        abnormal = "abnormal_count"
+        timeout = "timeout_count"
+    else:
+        suffix = f"_track_l{level}"
+        done = f"completed_count{suffix}"
+        abnormal = f"abnormal_count{suffix}"
+        timeout = f"timeout_count{suffix}"
+    return (
+        f"100 * avg({outcome_name}{{}}) / "
+        f"clamp_min(avg({done}{{}}) + avg({abnormal}{{}}) + avg({timeout}{{}}), 1)"
     )
-    return config_dict
+
+
+def _add_panel(builder, panel_name: str, metric_name: str, expr: str | None = None, panel_type: str = "line"):
+    builder.add_panel(name=_display_name(panel_name), name_en=panel_name, type=panel_type)
+    builder.add_metric(metrics_name=metric_name, expr=expr or _avg(metric_name))
+    builder.end_panel()
+
+
+def _add_multi_panel(builder, panel_name: str, metrics: tuple[tuple[str, str], ...], panel_type: str = "line"):
+    builder.add_panel(name=_display_name(panel_name), name_en=panel_name, type=panel_type)
+    for metric_name, expr in metrics:
+        builder.add_metric(metrics_name=metric_name, expr=expr)
+    builder.end_panel()
+
+
+def _add_group(builder, group_name: str, panels: tuple[tuple, ...]):
+    builder.add_group(group_name=_display_name(group_name), group_name_en=group_name)
+    for panel in panels:
+        if len(panel) == 2:
+            panel_name, metric_name = panel
+            _add_panel(builder, panel_name, metric_name)
+        elif len(panel) == 3 and isinstance(panel[1], tuple):
+            panel_name, metrics, panel_type = panel
+            _add_multi_panel(builder, panel_name, metrics, panel_type)
+        else:
+            panel_name, metric_name, expr = panel
+            _add_panel(builder, panel_name, metric_name, expr)
+    builder.end_group()
+
+
+def _level_outcome_metrics(kind: str) -> tuple[tuple[str, str], ...]:
+    source = "abnormal_count" if kind == "abnormal" else "timeout_count"
+    suffix = "abn" if kind == "abnormal" else "timeout"
+    return tuple(
+        (
+            f"l{level}_{suffix}",
+            _track_rate(f"{source}_track_l{level}", level),
+        )
+        for level in range(10)
+    )
+
+
+REWARD_GROUPS = (
+    (
+        "direct_score_and_completion",
+        (
+            ("task_complete", _reward("task_complete")),
+            ("difficulty_pressure_complete", _reward("difficulty_pressure_complete")),
+            ("pose_score_formula", _reward("pose_score_formula")),
+            ("energy_score_formula", _reward("energy_score_formula")),
+            ("termination", _reward("termination")),
+            ("undesired_contacts", _reward("undesired_contacts")),
+        ),
+    ),
+    (
+        "time_and_progress_proxy",
+        (
+            ("goal_velocity_projection", _reward("goal_velocity_projection")),
+            ("forward_heading_velocity", _reward("forward_heading_velocity")),
+            ("track_lin_vel_xy", _reward("track_lin_vel_xy")),
+            ("command_speed_advantage", _reward("command_speed_advantage")),
+            ("approach_goal", _reward("approach_goal")),
+            ("goal_distance", _reward("goal_distance")),
+            ("navigation_time", _reward("navigation_time")),
+            ("backward_penalty", _reward("backward_penalty")),
+            ("goal_backtrack_penalty", _reward("goal_backtrack_penalty")),
+        ),
+    ),
+    (
+        "posture_energy_support",
+        (
+            ("flat_orientation", _reward("flat_orientation")),
+            ("correct_base_height", _reward("correct_base_height")),
+            ("posture_stability", _reward("posture_stability")),
+            ("ang_vel_xy", _reward("ang_vel_xy")),
+            ("base_lateral_vel", _reward("base_lateral_vel")),
+            ("lin_vel_z", _reward("lin_vel_z")),
+            ("hip_to_default", _reward("hip_to_default")),
+            ("joint_position_penalty", _reward("joint_position_penalty")),
+            ("dof_pos_limits", _reward("dof_pos_limits")),
+            ("energy", _reward("energy")),
+            ("joint_torques", _reward("joint_torques")),
+            ("joint_acc", _reward("joint_acc")),
+            ("dof_vel", _reward("dof_vel")),
+            ("action_rate", _reward("action_rate")),
+            ("action_smoothness", _reward("action_smoothness")),
+            ("score_guidance", _reward("score_guidance")),
+        ),
+    ),
+    (
+        "gait_and_stillness",
+        (
+            ("track_ang_vel_z", _reward("track_ang_vel_z")),
+            ("feet_air_time", _reward("feet_air_time")),
+            ("feet_clearance", _reward("feet_clearance")),
+            ("feet_swing_forward", _reward("feet_swing_forward")),
+            ("feet_slide", _reward("feet_slide")),
+            ("feet_stumble", _reward("feet_stumble")),
+            ("air_time_variance_penalty", _reward("air_time_variance_penalty")),
+            ("stand_still_motion", _reward("stand_still_motion")),
+            ("commanded_still_penalty", _reward("commanded_still_penalty")),
+        ),
+    ),
+    (
+        "maze_safety_and_finish",
+        (
+            ("goal_heading_alignment", _reward("goal_heading_alignment")),
+            ("near_goal_finish_drive", _reward("near_goal_finish_drive")),
+            ("near_goal_retreat_penalty", _reward("near_goal_retreat_penalty")),
+            ("near_goal_circling_penalty", _reward("near_goal_circling_penalty")),
+            ("goal_miss_penalty", _reward("goal_miss_penalty")),
+            ("maze_context_gate", _reward("maze_context_gate")),
+            ("maze_anticipatory_turn", _reward("maze_anticipatory_turn")),
+            ("wall_collision", _reward("wall_collision")),
+            ("wall_stall_penalty", _reward("wall_stall_penalty")),
+            ("wall_proximity", _reward("wall_proximity")),
+            ("open_space", _reward("open_space")),
+            ("corridor_centering", _reward("corridor_centering")),
+            ("directed_exploration", _reward("directed_exploration")),
+            ("stuck_penalty", _reward("stuck_penalty")),
+            ("long_non_foot_contact", _reward("long_non_foot_contact")),
+        ),
+    ),
+    (
+        "suggested_speed_gate_probes",
+        (
+            ("speed_gate_flat", _reward("speed_gate_flat")),
+            ("speed_gate_slope", _reward("speed_gate_slope")),
+            ("speed_gate_stairs", _reward("speed_gate_stairs")),
+            ("speed_gate_maze", _reward("speed_gate_maze")),
+            ("speed_gate_invalid", _reward("speed_gate_invalid")),
+            ("speed_gate_sum", _reward("speed_gate_sum")),
+            ("speed_gate_valid", _reward("speed_gate_valid")),
+            ("speed_gate_target_vx", _reward("speed_gate_target_vx")),
+            ("speed_gate_worker_vx", _reward("speed_gate_worker_vx")),
+            ("speed_gate_written", _reward("speed_gate_written")),
+            ("speed_gate_nav_front", _reward("speed_gate_nav_front")),
+            ("speed_gate_nav_block", _reward("speed_gate_nav_block")),
+            ("speed_gate_hold_steps", _reward("speed_gate_hold_steps")),
+            ("speed_gate_pending", _reward("speed_gate_pending")),
+            ("speed_gate_maze_confirm", _reward("speed_gate_maze_confirm")),
+        ),
+    ),
+)
+
+
+def _add_reward_groups(builder):
+    for group_name, rewards in REWARD_GROUPS:
+        panels = tuple((panel_name, metric_name) for panel_name, metric_name in rewards)
+        _add_group(builder, group_name, panels)
+
+
+def _add_track_results(builder):
+    _add_group(
+        builder,
+        "track_results",
+        (
+            (
+                "outcome_pct",
+                (
+                    ("completion_pct", _track_rate("completed_count")),
+                    ("abnormal_pct", _track_rate("abnormal_count")),
+                    ("timeout_pct", _track_rate("timeout_count")),
+                ),
+                "line",
+            ),
+            ("level_abnormal_pct", _level_outcome_metrics("abnormal"), "line"),
+            ("level_timeout_pct", _level_outcome_metrics("timeout"), "line"),
+        ),
+    )
+
+
+def _add_gate_summary(builder):
+    denom = "clamp_min(avg(reward_speed_gate_sum{}), 1e-12)"
+    _add_group(
+        builder,
+        "suggested_speed_gate_summary",
+        (
+            (
+                "command_vx_and_write_pct",
+                (
+                    ("target_vx", "avg(reward_speed_gate_target_vx{}) * 1000000000"),
+                    ("worker_vx", "avg(reward_speed_gate_worker_vx{}) * 1000000000"),
+                    ("write_pct", "avg(reward_speed_gate_written{}) * 100000000000"),
+                ),
+                "line",
+            ),
+            (
+                "terrain_pct",
+                (
+                    ("flat_pct", f"100 * avg(reward_speed_gate_flat{{}}) / {denom}"),
+                    ("slope_pct", f"100 * avg(reward_speed_gate_slope{{}}) / {denom}"),
+                    ("stairs_pct", f"100 * avg(reward_speed_gate_stairs{{}}) / {denom}"),
+                    ("maze_pct", f"100 * avg(reward_speed_gate_maze{{}}) / {denom}"),
+                    ("invalid_pct", f"100 * avg(reward_speed_gate_invalid{{}}) / {denom}"),
+                ),
+                "line",
+            ),
+            (
+                "gate_status",
+                (
+                    ("valid_pct", f"100 * avg(reward_speed_gate_valid{{}}) / {denom}"),
+                    ("terrain_sum", "avg(reward_speed_gate_sum{}) * 1000000000"),
+                ),
+                "line",
+            ),
+            (
+                "wall_gate_signal",
+                (
+                    ("front_wall", "avg(reward_speed_gate_nav_front{}) * 1000000000"),
+                    ("front_block_pct", "avg(reward_speed_gate_nav_block{}) * 100000000000"),
+                ),
+                "line",
+            ),
+            (
+                "sticky_gate_state",
+                (
+                    ("hold_steps", "avg(reward_speed_gate_hold_steps{}) * 1000000000"),
+                    ("pending", "avg(reward_speed_gate_pending{}) * 1000000000"),
+                    ("maze_confirm", "avg(reward_speed_gate_maze_confirm{}) * 1000000000"),
+                ),
+                "line",
+            ),
+        ),
+    )
+
+
+def build_monitor():
+    """Build monitor panels without tying dashboard structure to old experiments."""
+    monitor = MonitorConfigBuilder()
+    monitor.title(_display_name("track_navigation_training"))
+
+    _add_group(
+        monitor,
+        "training_progress",
+        (
+            ("mean_episode_length", "mean_episode_length"),
+            ("mean_episode_reward", "mean_episode_reward"),
+            ("episode_reward", "episode_reward"),
+        ),
+    )
+    _add_group(
+        monitor,
+        "algorithm",
+        (
+            ("total_loss", "total_loss"),
+            ("value_loss", "value_loss"),
+            ("policy_loss", "policy_loss"),
+            ("entropy_loss", "entropy_loss"),
+        ),
+    )
+    _add_group(
+        monitor,
+        "velocity_curriculum",
+        (
+            ("vel_curriculum_stage", "vel_curriculum_stage"),
+            ("vel_curriculum_tracking_ratio", "vel_curriculum_tracking_ratio"),
+            ("vel_curriculum_tracking_reward", "vel_curriculum_tracking_reward"),
+        ),
+    )
+
+    _add_track_results(monitor)
+    _add_reward_groups(monitor)
+    _add_gate_summary(monitor)
+
+    _add_group(
+        monitor,
+        "physics_obs",
+        (
+            (
+                "velocity_x_stat",
+                (
+                    ("cmd_vx", _avg("obs_cmd_vel_x")),
+                    ("actual_vx", _avg("obs_actual_vel_x")),
+                ),
+                "stat",
+            ),
+            (
+                "velocity_y_stat",
+                (
+                    ("cmd_vy", _avg("obs_cmd_vel_y")),
+                    ("actual_vy", _avg("obs_actual_vel_y")),
+                ),
+                "stat",
+            ),
+            (
+                "velocity_yaw_stat",
+                (
+                    ("cmd_yaw", _avg("obs_cmd_yaw")),
+                    ("actual_yaw", _avg("obs_actual_yaw")),
+                ),
+                "stat",
+            ),
+            (
+                "velocity_error_stat",
+                (
+                    ("vx_error", _avg("obs_lin_vel_x_error")),
+                    ("yaw_error", _avg("obs_yaw_error")),
+                ),
+                "stat",
+            ),
+            ("obs_lin_vel_x_error", "obs_lin_vel_x_error"),
+            ("obs_lin_vel_y_error", "obs_lin_vel_y_error"),
+            ("obs_actual_vel_x", "obs_actual_vel_x"),
+            ("obs_base_height", "obs_base_height"),
+            ("obs_ang_vel_xy", "obs_ang_vel_xy"),
+        ),
+    )
+
+    return monitor.build()

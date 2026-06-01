@@ -10,7 +10,6 @@ Author: Tencent AI Arena Authors
 
 import torch
 import numpy as np
-import os
 
 torch.manual_seed(0)
 torch.cuda.manual_seed_all(0)
@@ -20,7 +19,7 @@ import torch.optim as optim
 
 from kaiwudrl.interface.agent import BaseAgent
 from agent_ppo.feature.definition import ActData
-from agent_ppo.conf.conf import Config, _load_toml
+from agent_ppo.conf.conf import Config
 from agent_ppo.model.actor_critic import ActorCritic
 from agent_ppo.algorithm.algorithm_ppo import AlgorithmPPO
 from tools.train_env_conf_validate import check_usr_conf
@@ -57,6 +56,8 @@ class Agent(BaseAgent):
         # policy obs = proprio + scan + goal
         # 策略观测 = 本体感知 + 扫描 + 目标
         self.num_obs = num_proprio + num_scan + num_goal_obs
+        # Command and goal-feature patching lives in the observation processors,
+        # where env sensors and command-manager state are still available.
 
         self._init_flat(num_proprio, num_scan, num_goal_obs, stage)
 
@@ -75,26 +76,6 @@ class Agent(BaseAgent):
         )
 
         super().__init__(agent_type, device, logger, monitor)
-
-    def _load_train_stage_conf(self, stage):
-        train_conf_file = f"agent_ppo/conf/train_env_conf_{stage.task_type}_{stage.name}.toml"
-        if not os.path.exists(train_conf_file):
-            return {}
-        try:
-            return _load_toml(train_conf_file)
-        except Exception as exc:
-            if self.logger is not None:
-                self.logger.warning(
-                    f"[RLNavigation] Failed to load train stage config "
-                    f"from {train_conf_file}: {exc}"
-                )
-            return {}
-
-    def _apply_eval_command_to_obs(self, obs):
-        # Evaluation command adaptation is handled in PolicyObservationProcess,
-        # where the env sensors are available.  Keep this as a no-op to avoid
-        # double-patching obs[:, 6:9].
-        return obs
 
     def _init_flat(self, num_proprio, num_scan, num_goal_obs, stage):
         """
@@ -127,6 +108,8 @@ class Agent(BaseAgent):
             clip_param=getattr(stage, "clip_param", 0.2),
             entropy_coef=getattr(stage, "entropy_coef", 0.01),
             desired_kl=getattr(stage, "desired_kl", 0.01),
+            min_learning_rate=getattr(stage, "min_learning_rate", 1e-5),
+            max_learning_rate=getattr(stage, "max_learning_rate", 1e-2),
             num_mini_batches=stage.num_mini_batches,
             num_learning_epochs=stage.num_learning_epochs,
         )
@@ -138,7 +121,6 @@ class Agent(BaseAgent):
         """
         (obs) = list_obs_data
         with torch.no_grad():
-            obs = self._apply_eval_command_to_obs(obs)
             actions = self.algorithm.actor_critic.act_inference(obs)
             return [ActData(action=actions)]
 
@@ -162,8 +144,6 @@ class Agent(BaseAgent):
         (obs, critic_obs) = list_obs_data
 
         with torch.no_grad():
-            if self.is_eval:
-                obs = self._apply_eval_command_to_obs(obs)
             hidden_states = None
             if getattr(self.algorithm.actor_critic, "is_recurrent", False):
                 current_hidden = self.algorithm.actor_critic.get_hidden_states()
@@ -232,27 +212,23 @@ class Agent(BaseAgent):
         if min_std_cfg is None and max_std_cfg is None:
             return
 
+        def _cfg_tensor(cfg, ref_tensor):
+            if cfg is None:
+                return None
+            candidate = torch.as_tensor(cfg, device=self.device, dtype=ref_tensor.dtype)
+            return candidate if candidate.shape == ref_tensor.shape else None
+
         def _bound_std(std_tensor):
-            posinf_value = 1.0e6
-            if max_std_cfg is not None:
-                max_std = torch.tensor(max_std_cfg, device=self.device, dtype=std_tensor.dtype)
-                if max_std.shape == std_tensor.data.shape:
-                    posinf_value = float(torch.max(max_std).item())
-            bounded = torch.nan_to_num(
-                std_tensor.data,
-                nan=1.0,
-                posinf=posinf_value,
-                neginf=0.0,
-            )
-            if min_std_cfg is not None:
-                min_std = torch.tensor(min_std_cfg, device=self.device, dtype=std_tensor.dtype)
-                if min_std.shape == bounded.shape:
-                    bounded = torch.maximum(bounded, min_std)
-            if max_std_cfg is not None:
-                max_std = torch.tensor(max_std_cfg, device=self.device, dtype=std_tensor.dtype)
-                if max_std.shape == bounded.shape:
-                    bounded = torch.minimum(bounded, max_std)
-            std_tensor.data.copy_(bounded)
+            current_std = std_tensor.data
+            min_std = _cfg_tensor(min_std_cfg, current_std)
+            max_std = _cfg_tensor(max_std_cfg, current_std)
+            finite_cap = float(max_std.max().item()) if max_std is not None else 1.0e6
+            bounded_std = torch.nan_to_num(current_std, nan=1.0, posinf=finite_cap, neginf=0.0)
+            if min_std is not None:
+                bounded_std = torch.maximum(bounded_std, min_std)
+            if max_std is not None:
+                bounded_std = torch.minimum(bounded_std, max_std)
+            current_std.copy_(bounded_std)
 
         with torch.no_grad():
             if hasattr(self.model, "std"):

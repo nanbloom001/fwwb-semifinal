@@ -85,7 +85,9 @@ class CustomConfig(StageConfig):
     # After adding a new training stage, a corresponding training config file
     # must be created in the same directory.
     # Filename convention: train_env_conf_<task_type>_<stage.name>.toml
-    # Refer to train_env_conf_standard_locomotion.toml as an example.
+    # The current delivery path uses train_env_conf_track_nav.toml as the
+    # maintained example; legacy standard locomotion configs are intentionally
+    # not part of the active agent_ppo payload.
     #
     # TODO：可参考 LocomotionConfig 自行设计 track 地形导航训练阶段。
     # 需要明确：
@@ -98,7 +100,7 @@ class CustomConfig(StageConfig):
     #
     # 新增训练阶段后，需在同目录创建对应训练配置文件。
     # 文件命名规则：train_env_conf_<task_type>_<stage.name>.toml
-    # 可参考 train_env_conf_standard_locomotion.toml。
+    # Active agent_ppo configs should follow train_env_conf_track_nav.toml.
     pass
 
 
@@ -119,7 +121,9 @@ class TrackNavConfig(StageConfig):
     task_type = "track"
     num_goal_obs = 3   # goal direction (2D) + goal distance (1D)
     num_critic_observations = 319  # 316 + 3
-    lr = 1.5e-5
+    lr = 1e-7
+    min_learning_rate = 1e-7
+    max_learning_rate = 1e-7
     num_learning_epochs = 3
     num_mini_batches = 4
     num_steps_per_env = 48
@@ -127,8 +131,8 @@ class TrackNavConfig(StageConfig):
     desired_kl = 0.004
     init_noise_std = 0.95
     min_normalized_std = [0.05, 0.025, 0.05] * 4
-    max_normalized_std = [0.30, 0.18, 0.30] * 4
-    model_save_interval = 40
+    max_normalized_std = [0.3, 0.18, 0.3] * 4
+    model_save_interval = 5
 
 
 class Config:

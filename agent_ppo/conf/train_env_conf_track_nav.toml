@@ -58,10 +58,10 @@ gate_reward_metrics_enabled = true
 gate_diagnostics_enabled = false
 raw_terrain_gate_enabled = true
 suggested_speed_fallback = 0.68
-pre_maze_lin_vel_x = [0.75, 0.75]
-slope_lin_vel_x = [0.75, 0.75]
-stairs_lin_vel_x = [0.60, 0.60]
-maze_lin_vel_x = [0.60, 0.60]
+pre_maze_lin_vel_x = [0.8, 0.8]
+slope_lin_vel_x = [0.80, 0.80]
+stairs_lin_vel_x = [0.7, 0.70]
+maze_lin_vel_x = [0.70, 0.70]
 phase_maze_goal_dist_gate = 8.5
 phase_maze_distance_mode = "longitudinal"
 phase_maze_goal_longitudinal_min = -1.0
@@ -73,7 +73,7 @@ terrain_phase_speed_enabled = true
 terrain_sticky_confirm_steps = 4
 terrain_sticky_flat_release_steps = 10
 terrain_sticky_slope_hold_steps = 30
-terrain_sticky_stairs_hold_steps = 50
+terrain_sticky_stairs_hold_steps = 25
 terrain_sticky_wall_hold_steps = 40
 terrain_flat_release_edge_max = 0.025
 terrain_flat_release_delta_max = 0.025
@@ -151,10 +151,10 @@ weight = -4.5e-7
 weight = -4.8e-5
 
 [rewards.energy_score_formula]
-weight = 1.55
+weight = 1.35
 
 [rewards.joint_torques]
-weight = -2.4e-5
+weight = -2.8e-5
 
 [rewards.dof_pos_limits]
 weight = -0.3
@@ -165,10 +165,10 @@ weight = -0.30
 target_height = 0.38
 
 [rewards.action_rate]
-weight = -0.014
+weight = -0.018
 
 [rewards.action_smoothness]
-weight = -0.014
+weight = -0.018
 
 [rewards.undesired_contacts]
 weight = -0.62
@@ -227,7 +227,7 @@ weight = 1.0e-9
 weight = -1.10
 
 [rewards.pose_score_formula]
-weight = 2.70
+weight = 2.7
 
 [rewards.posture_stability]
 weight = -1.0
