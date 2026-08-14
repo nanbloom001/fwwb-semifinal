@@ -1,6 +1,6 @@
 # Arena Frontend Monitor
 
-This module is separate from `agent_diy/codex_rpc_bridge`.
+This module works standalone (no internal RPC bridge required).
 
 It is for Tencent Arena's web frontend only:
 

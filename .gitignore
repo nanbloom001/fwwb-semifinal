@@ -36,4 +36,29 @@ ckpt/
 # 本地系统文件/归档
 .DS_Store
 代码归档/
+
+# 竞赛文书与材料（保留在本地，不参与版本控制与发布）
+文书*/
+文书_备份*/
+网页GPT*/
+reports/
+*.docx
+*.doc
+*.pptx
+*.xlsx
+*.pdf
+
+# 本地平台/运行参考数据（不发布）
+external/
+arena_frontend_monitor_runtime/
+.codex_rpc/
+agent_diy/codex_rpc_bridge_runtime/
+hjc3-6/
+hjc3-6.zip
+nan10-8750/
+nan10 8750.zip
+wk/
+yjy.zip
+
+# 内部文档（不发布）
 docs/秘密武器.md

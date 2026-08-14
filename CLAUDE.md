@@ -25,7 +25,7 @@ Training is launched on the Tencent Arena platform, not locally. There is no sta
 agent_ppo/                    # Active training agent (PPO + GAE, asymmetric actor-critic)
 ├── conf/
 │   ├── conf.py               # StageConfig classes, model dims, hyperparams; Config.CURRENT selects stage
-│   ├── train_env_conf_standard_locomotion.toml  # Terrain, rewards, velocity curriculum config
+│   ├── train_env_conf_track_nav.toml            # Track-nav stage config (terrain/rewards/curriculum)
 │   └── monitor_builder.py    # 9-group monitoring panel definitions
 ├── feature/
 │   ├── policy_observation_process.py   # 301-dim policy obs (45 proprio + 256 height scan)

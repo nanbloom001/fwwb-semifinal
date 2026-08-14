@@ -67,7 +67,7 @@ Config.CURRENT = Nan10StairBridgeConfig
 该阶段会加载：
 
 ```text
-agent_ppo/conf/train_env_conf_standard_nan10_stair_bridge.toml
+agent_ppo/conf/train_env_conf_track_nav.toml
 ```
 
 当前 PPO 关键参数：
@@ -276,7 +276,7 @@ agent_ppo/conf/conf.py
 ### 4.3 当前训练 TOML
 
 ```text
-agent_ppo/conf/train_env_conf_standard_nan10_stair_bridge.toml
+agent_ppo/conf/train_env_conf_track_nav.toml
 ```
 
 这是当前最重要的配置文件。它定义：
@@ -779,7 +779,7 @@ docs/TRAINING_HANDOFF_GUIDE.md
 docs/HANDOFF.md
 docs/change_records/2026-05-22_nan10_longrun_reward_regression_analysis.md
 agent_ppo/conf/conf.py
-agent_ppo/conf/train_env_conf_standard_nan10_stair_bridge.toml
+agent_ppo/conf/train_env_conf_track_nav.toml
 agent_ppo/feature/reward_process.py
 agent_ppo/workflow/train_workflow.py
 agent_ppo/conf/monitor_builder.py
@@ -795,26 +795,11 @@ git status --short
 
 如果存在未提交改动，先确认这些改动是否就是最新训练逻辑。不要只拿旧 commit 训练。
 
-### 8.3 同步到容器
+### 8.3 同步到训练环境
 
-先 dry-run：
-
-```bash
-bash agent_diy/codex_rpc_bridge/sync_repo_to_container.sh --dest /workspace/code --dry-run
-```
-
-确认文件列表后再 apply：
-
-```bash
-CODEX_RPC_TOKEN="<normal token>" \
-CODEX_RPC_ADMIN_TOKEN="<admin token>" \
-bash agent_diy/codex_rpc_bridge/sync_repo_to_container.sh --dest /workspace/code --apply --py-compile
-```
-
-注意：
-
-- routine sync 不应上传 `agent_diy`、大日志、runtime、backup、token。
-- 如果 RPC 不通，在容器内运行 `bash agent_diy/codex_rpc_bridge/start_rpc.sh`。
+开源版本已移除内部 RPC 同步工具（`agent_diy/codex_rpc_bridge` 等）。
+请使用你所在训练平台（如腾讯开悟 IDE）的代码上传/同步方式，将本仓库代码同步到训练环境，
+并在容器内先做短训验证（见 8.4）。
 
 ### 8.4 短训验证
 

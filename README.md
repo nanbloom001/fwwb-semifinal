@@ -1,14 +1,21 @@
 # fwwb-RL-dog
 
-> 腾讯开悟四足机器人运动控制竞赛训练仓库（legged_robot_competition_26 · IDE 22.0.3）
+> Unitree Go2 四足机器人强化学习训练仓库 —— PPO + GAE / Asymmetric Actor-Critic / Isaac Sim + Isaac Lab / KaiwuDRL
 
 ---
 
 ## 项目简介
 
-本仓库用于 Unitree Go2 四足机器人在 Isaac Sim / KaiwuDRL 环境中的强化学习训练，当前主线方案为 PPO + GAE 的 asymmetric actor-critic。当前代码已经从早期“近似平地塑形”推进到 standard 模式下开放完整难度带、但仍从最低档起步的课程训练版本，并补齐了训练诊断、物理量监控、观测维度校验与近零速稳定性约束。
+本仓库用于 Unitree Go2 四足机器人在 Isaac Sim / KaiwuDRL 环境中的强化学习训练，支持 **standard（标准地形穿越）** 与 **track（路线导航）** 两种任务模式。
 
-standard 地形模式比赛评分维度如下：
+当前主线方案为 PPO + GAE 的 asymmetric actor-critic：
+
+- Policy 观测 301 维 = 45 维本体感觉 + 256 维高度扫描
+- Critic 观测 316 维 = 60 维特权本体感觉 + 256 维高度扫描
+- 12 维连续动作，经 `action_scale=0.25` 映射到 PD 目标关节角
+- 训练侧实现了速度课程（VelocityCurriculum）、地形课程、奖励退火、观测维度运行时断言等工程化能力
+
+Standard 模式评分维度（满分 100）：
 
 | 维度 | 权重 | 说明 |
 |---|---|---|
@@ -17,31 +24,55 @@ standard 地形模式比赛评分维度如下：
 | energy | 20% | 能耗（扭矩 × 速度） |
 | posture | 20% | 机身姿态稳定性 |
 
+Track 模式评分：`total = completion_ratio × (0.4 × time + 0.4 × posture + 0.2 × energy)`，先保证完成率，再优化速度/姿态/能耗。
+
 ---
 
 ## 仓库结构
 
 ```
 .
-├── agent_ppo/                  # 当前主训练智能体
-│   ├── algorithm/              # PPO + GAE
+├── agent_ppo/                  # 当前主训练智能体（PPO + GAE）
+│   ├── algorithm/              # PPO + GAE 实现（含 NaN/Inf 防护）
 │   ├── conf/
-│   │   ├── conf.py             # Stage 配置、网络维度、训练超参
+│   │   ├── conf.py             # Stage 配置、模型维度、训练超参；Config.CURRENT 切换阶段
 │   │   ├── monitor_builder.py  # 监控分组与指标面板
-│   │   └── train_env_conf_standard_locomotion.toml
-│   │                           # 标准地形训练配置：地形 / 命令 / 奖励 / 速度课程
-│   ├── feature/                # policy/critic 观测处理与 reward_process
+│   │   └── train_env_conf_track_nav.toml   # 当前 track 阶段配置（地形/命令/奖励/课程）
+│   ├── feature/                # policy/critic 观测处理、自定义奖励、速度课程、地形门控等
 │   ├── model/                  # Actor-Critic 网络
 │   └── workflow/
-│       └── train_workflow.py   # 主训练循环、监控上报、VelocityCurriculum
-├── agent_diy/                  # 自定义智能体模板（未作为当前主线）
+│       └── train_workflow.py   # 主训练循环、速度课程、监控上报
+├── agent_diy/                  # 备选智能体模板（含 standard / track 多阶段 TOML 配置模板）
 ├── conf/                       # 平台级 app/algo 配置
 ├── isaac_env/                  # Isaac 环境接口
-├── legged-robot/               # 赛题说明、开发指南、框架文档
-├── CHANGES.md                  # 本轮代码与配置改动汇总
+├── arena_frontend_monitor/     # 训练监控数据抓取与后处理脚本
+├── legged-robot/               # 赛题说明、开发指南与框架文档（公开材料归档）
+├── docs/                       # 训练交接指南与调研记录
+├── CHANGES.md                  # 代码与配置改动汇总
 ├── kaiwu.json                  # 平台元数据
 └── train_test.py               # 本地快速测试入口
 ```
+
+---
+
+## 快速开始
+
+项目依赖 KaiwuDRL 与 Isaac Lab，需在腾讯开悟（Tencent Kaiwu）训练环境或等价环境中运行。
+
+```bash
+# 本地快速冒烟测试（需 KaiwuDRL 环境）
+python train_test.py
+
+# 本地语法检查（无单元测试，用 py_compile 代替）
+python3 -m py_compile agent_ppo/agent.py
+python3 -m py_compile agent_ppo/workflow/train_workflow.py
+python3 -m py_compile agent_ppo/feature/reward_process.py
+```
+
+`train_test.py` 中可切换 `algorithm_name`（`"ppo"` / `"diy"`），并设置了小批量快速验证参数。
+
+**切换训练阶段**：修改 `agent_ppo/conf/conf.py` 中的 `Config.CURRENT`，并保证对应的
+`train_env_conf_<task_type>_<stage.name>.toml` 存在。
 
 ---
 
@@ -49,136 +80,81 @@ standard 地形模式比赛评分维度如下：
 
 | 组件 | 详情 |
 |---|---|
-| 算法 | PPO + GAE（λ=0.95, γ=0.99） |
+| 算法 | PPO + GAE（λ=0.95，γ=0.99） |
 | 网络结构 | Asymmetric Actor-Critic |
 | Actor | MLP [301→512→256→128→12]，ELU 激活 |
-| Critic | MLP [316→512→256→128→1]，含 LayerNorm |
-| Policy 观测 | 301 维 = 45 proprio + 256 height scan |
-| Critic 观测 | 316 维 = 60 critic proprio + 256 height scan |
-| 动作 | 12 维连续动作，输出经 `action_scale=0.25` 映射到 PD 目标关节角 |
+| Critic | MLP [316→512→256→128→1]，LayerNorm + ELU |
+| Policy 观测 | 301 维 = 45 proprio + 256 height scan（track 阶段可附加 3 维目标特征） |
+| Critic 观测 | 316 维 = 60 privileged proprio + 256 height scan |
+| 动作 | 12 维连续动作，`[-1, 1]`，经 `action_scale=0.25` 映射到 PD 目标关节角 |
 
-说明：当前 policy 与 critic 观测处理器都加入了运行时维度断言，用于尽早暴露 height scan 缺失或观测布局漂移问题。
+policy / critic 观测处理器内置**运行时维度断言**，用于尽早暴露 height scan 缺失或观测布局漂移。
 
 ### Track 观测补充
 
-- `height_scanner` 已包含在默认 301 维 policy obs 的 `[45:301]`，是 16x16
-  前方高度扫描；默认 observation term 已做 `scale=2.5` 和 `clip=[-5, 5]`。
-  自定义 reward/obs 中读取原始几何高度差时使用：
-  `sensor.data.pos_w[:, 2:3] - sensor.data.ray_hits_w[..., 2]`。
-- `nav_scanner` 默认不在 301 维 obs 中。它是约 `13x11=143` rays 的前瞻
-  遮挡扫描，覆盖前方约 `2.5m x 2.0m`，适合迷宫转向/堵路判断。推荐先从
-  `env.scene.sensors["nav_scanner"]` 提取左/中/右 clearance 或 wall score 等
-  紧凑特征，再决定是否扩展 actor 输入维度。
-- `goal_position_in_robot_frame()` 当前在多个分支中被调用，但本地和开发容器
-  搜索没有找到实际定义。启用 `track_goal` 前应显式实现该 helper；推荐 4 维
-  语义为 robot-frame 相对目标 XY、目标距离、目标/出口 yaw error。
+- `height_scanner` 已包含在默认 301 维 policy obs 的 `[45:301]`，是 16×16 前方高度扫描；
+  自定义 reward/obs 中读取原始几何高度差：`sensor.data.pos_w[:, 2:3] - sensor.data.ray_hits_w[..., 2]`。
+- `nav_scanner` 默认不在 301 维 obs 中，约 13×11=143 rays 的前瞻遮挡扫描，适合迷宫转向/堵路判断；
+  推荐先提取左/中/右 clearance 等紧凑特征，再决定是否扩展 actor 输入。
+- Track 附加信息：`env.goal_positions`、`env.goal_yaw`、`env.scene.sensors["nav_scanner"]`。
+
+---
+
+## 环境协议
+
+```python
+obs, critic_obs = env.reset(usr_conf)
+frame_no, obs, rewards, terminated, truncated, (infos, privileged_obs) = env.step(actions)
+dones = terminated | truncated
+```
+
+Policy 观测布局（301 维）：
+
+| 区间 | 内容 |
+|---|---|
+| [0:3] | 机体角速度（×0.25） |
+| [3:6] | 投影重力 |
+| [6:9] | 速度指令 (vx, vy, wz) |
+| [9:21] | 相对关节位置 |
+| [21:33] | 相对关节速度（×0.05） |
+| [33:45] | 上一时刻动作 |
+| [45:301] | 16×16 高度扫描（clip [-5,5]，×2.5） |
+
+Critic 观测（316 维）额外包含 `base_lin_vel` 与 `joint_effort` 特权信息。
 
 ---
 
 ## 当前训练配置
 
-### 完整难度带开放、低难度起步的 Standard Curriculum（当前）
+当前默认阶段：**TrackNavConfig**（路线导航微调），见 `agent_ppo/conf/conf.py` 的 `Config.CURRENT`。
+切换回 `LocomotionConfig` 可进行 standard 模式训练（standard 配置模板见 `agent_diy/conf/`）。
 
-- 地形课程已开启：`terrain.curriculum = true`
-- 课程档位：`num_rows = 10`
-- 难度范围：`difficulty_range = [0.0, 1.0]`
-- 初始放置上限：`max_init_terrain_level = 0`，即始终从最简单档起步
-- 地形配比：35% 上坡、35% 下坡、15% 上台阶、15% 下台阶、0% maze
-- 外部推力：当前仍关闭，先优先稳定通过完整标准难度带
+训练配置要点：
 
-当前版本的目标不再只是“学会平地走”，而是以较保守的课程方式逐步推进到完整难度带。当前训练分布仍以坡面为主，用来维持步态收敛，同时加入 30% 楼梯样本让策略开始学习真正的上台阶和下台阶动作。
+- 地形课程（terrain curriculum）与速度课程（VelocityCurriculum）解耦，速度课程按 tracking ratio
+  推进（升级：连续 2 次 ≥ 0.55；降级：连续 3 次 < 0.30），Stage 0 必须与 `[commands.ranges]` 一致。
+- 自定义奖励遵循 `_reward_<name>` 模式，在 TOML 中通过 `[rewards.<name>]` 启用。
+- standard 子地形比例之和必须为 1.0；track 子地形列表必须以 `open_entry_maze` 结尾。
+- 模型每 `model_save_interval` 个 episode 保存一次 checkpoint。
 
-当前重点同时兼顾：
-
-- 完整 standard 难度带的课程推进
-- 上下台阶适应能力
-- 近零速度命令下的站立稳定性
-- 步态对称、机身姿态、能耗与动作平滑之间的平衡
-
-### 速度课程
-
-速度命令扩展由 Python 侧 `VelocityCurriculum` 独立管理，与 terrain curriculum 解耦。课程判断不再使用绝对奖励值，而是使用 tracking ratio（当前 tracking reward 占理论上限的比例），从而避免奖励权重变化后课程门槛漂移。
-
-| Stage | lin_vel_x | lin_vel_y | ang_vel_yaw | 用途 |
-|---|---|---|---|---|
-| 0 | [0.0, 0.5] | [-0.3, 0.3] | [-1.0, 1.0] | 启动阶段 |
-| 1 | [0.0, 1.0] | [-0.5, 0.5] | [-1.5, 1.5] | 巩固基础 trot |
-| 2 | [0.0, 1.5] | [-0.8, 0.8] | [-1.5, 1.5] | 中速稳定 |
-| 3 | [-0.5, 2.0] | [-1.0, 1.0] | [-1.5, 1.5] | 完整速度范围 |
-
-当前阈值：
-
-- 升级：tracking ratio 连续 2 次 ≥ 0.55
-- 降级：tracking ratio 连续 3 次 < 0.30
+> 注意：训练 reward 与竞赛评分（total_score / distance_score 等）不是同一指标，不要用 reward 绝对值直接对标评分。
 
 ---
 
 ## 监控与诊断
 
-当前监控面板已扩展为 9 组、35 个指标，核心分组如下：
-
-- 训练进展：`mean_episode_length`、`mean_episode_reward`
-- 速度跟踪：线速度/偏航跟踪奖励、`vel_curriculum_tracking_ratio`、`vel_curriculum_stage`
-- 姿态质量：机身水平、高度、关节偏离、侧向漂移、pitch/roll 角速度
-- 步态质量：脚部滞空、脚滑、脚撞台阶、关节速度、对称性、原地旋转
-- 稳定接触：垂直速度、非预期接触、终止惩罚、关节限位
-- 关节动作平滑：关节加速度、一阶动作变化、二阶动作平滑
-- 能耗扭矩：`reward_energy`、`reward_joint_torques`
-- 物理观测量：`obs_lin_vel_x_error`、`obs_lin_vel_y_error`、`obs_actual_vel_x`、`obs_base_height`、`obs_ang_vel_xy`
-
-其中“物理观测量”分组直接展示奖励函数所依赖的物理量，而不是加权后的奖励值，用于区分“模型确实在物理上收敛”还是“只是奖励权重掩盖了问题”。
+`arena_frontend_monitor/` 提供平台监控数据抓取与后处理脚本；监控面板分组由
+`agent_ppo/conf/monitor_builder.py` 定义，覆盖训练进展、速度跟踪、姿态/步态质量、
+稳定接触、能耗扭矩与物理观测量等 9 组指标。
 
 ---
 
-## 当前关键实现
+## 改动记录与参考
 
-### 1. 奖励与站立稳定
-
-- 新增 `stand_still_motion`，专门惩罚近零速命令下的上下晃动、pitch/roll 摇摆和腿部反复抬放
-- `joint_position_penalty` 改为分别处理线速度与角速度阈值，避免低速区间误判
-- 针对楼梯适应，适度放松 `flat_orientation`、`correct_base_height`、`action_rate`、`action_smoothness`、`dof_vel` 等过强的平地先验
-
-### 2. 观测与一致性校验
-
-- `PolicyObservationProcess` 强制校验 301 维
-- `CriticObservationProcess` 强制校验 316 维
-- 观测维度不符时直接抛错，优先暴露 height scan 缺失或布局变更问题
-
-### 3. 训练工作流健壮性
-
-- `VelocityCurriculum` 启动时会校验 Stage 0 与 `commands.ranges` 一致
-- 课程切换后若 `env.reset(usr_conf)` 失败，会直接抛出异常而不是静默继续
-- 会校验 standard 子地形比例之和是否为 1.0
-- 监控上报加入 episode 级指标与物理量采样
+- 改动记录见 [CHANGES.md](CHANGES.md)，训练交接说明见 [docs/TRAINING_HANDOFF_GUIDE.md](docs/TRAINING_HANDOFF_GUIDE.md)。
+- 赛题与框架文档见 [legged-robot/README.md](legged-robot/README.md)（腾讯开悟公开文档归档）。
+- 相关开源参考：[walk-these-ways (Improbable-AI)](https://github.com/Improbable-AI/walk-these-ways)
 
 ---
 
-## 关键配置文件速查
-
-| 文件 | 作用 |
-|---|---|
-| `agent_ppo/conf/conf.py` | Stage 定义、模型维度、训练超参 |
-| `agent_ppo/conf/train_env_conf_standard_locomotion.toml` | 地形、命令范围、奖励权重、速度课程配置 |
-| `agent_ppo/conf/monitor_builder.py` | 9 组监控面板与 35 个指标定义 |
-| `agent_ppo/workflow/train_workflow.py` | 训练主循环、课程推进、监控上报、物理量采样 |
-| `agent_ppo/feature/reward_process.py` | 自定义奖励函数实现 |
-| `agent_ppo/feature/policy_observation_process.py` | Policy 观测拼接与 301 维断言 |
-| `agent_ppo/feature/critic_observation_process.py` | Critic 观测拼接与 316 维断言 |
-| `CHANGES.md` | 本轮实际改动清单与配置更新摘要 |
-
----
-
-## 改动记录
-
-本轮改动详见 [CHANGES.md](CHANGES.md)。
-
----
-
-## 参考资料
-
-- [腾讯开悟竞赛文档](legged-robot/README.md)
-- [赛题综合分析报告](legged-robot/赛题综合分析报告.md)
-- [开源项目调研报告](legged-robot/开源项目调研报告.md)
-- [开发指南](legged-robot/开发指南)
-- [腾讯开悟强化学习框架文档](legged-robot/腾讯开悟强化学习框架)
-- [walk-these-ways (Improbable-AI)](https://github.com/Improbable-AI/walk-these-ways)
+*本项目基于腾讯开悟四足机器人运动控制竞赛（legged_robot_competition_26）训练实践整理，仅供学习交流。*
