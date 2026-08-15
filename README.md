@@ -8,11 +8,28 @@
 
 仿真环境中的地形穿越演示（坡面与楼梯）：
 
-| 上缓坡 | 下缓坡 |
-|---|---|
-| <img src="assets/demo/上缓坡.gif" width="340" alt="上缓坡"/> | <img src="assets/demo/下缓坡.gif" width="340" alt="下缓坡"/> |
-| 上台阶 | 下台阶 |
-| <img src="assets/demo/上台阶.gif" width="340" alt="上台阶"/> | <img src="assets/demo/下台阶.gif" width="340" alt="下台阶"/> |
+<table>
+  <tr>
+    <td align="center">
+      <img src="assets/demo/上缓坡.gif" width="340" alt="上缓坡"/><br/>
+      <b>上缓坡</b>
+    </td>
+    <td align="center">
+      <img src="assets/demo/下缓坡.gif" width="340" alt="下缓坡"/><br/>
+      <b>下缓坡</b>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="assets/demo/上台阶.gif" width="340" alt="上台阶"/><br/>
+      <b>上台阶</b>
+    </td>
+    <td align="center">
+      <img src="assets/demo/下台阶.gif" width="340" alt="下台阶"/><br/>
+      <b>下台阶</b>
+    </td>
+  </tr>
+</table>
 
 <!-- TODO：补充完整赛道视频与评估截图 -->
 
