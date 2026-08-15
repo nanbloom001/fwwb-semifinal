@@ -6,7 +6,15 @@
 
 ## 项目展示
 
-<!-- TODO：补充 GIF / 视频 / 真机图片 -->
+仿真环境中的地形穿越演示（坡面与楼梯）：
+
+| 上缓坡 | 下缓坡 |
+|---|---|
+| <img src="assets/demo/上缓坡.gif" width="340" alt="上缓坡"/> | <img src="assets/demo/下缓坡.gif" width="340" alt="下缓坡"/> |
+| 上台阶 | 下台阶 |
+| <img src="assets/demo/上台阶.gif" width="340" alt="上台阶"/> | <img src="assets/demo/下台阶.gif" width="340" alt="下台阶"/> |
+
+<!-- TODO：补充完整赛道视频与评估截图 -->
 
 ## 已完成功能
 
