@@ -1,4 +1,4 @@
-# fwwb-semifinal · Unitree Go2 四足机器人强化学习训练系统
+# kaiwu-semi-locomotion · Unitree Go2 四足机器人强化学习训练系统
 
 基于 Isaac Sim / Isaac Lab 与 KaiwuDRL 的 Unitree Go2 四足机器人强化学习训练项目，支持标准地形穿越与迷宫路线导航两种任务，主线为 PPO + GAE 不对称 Actor-Critic，当前处于迷宫导航微调阶段。项目全部在仿真环境中训练与评估，暂不包含真机部署代码。
 

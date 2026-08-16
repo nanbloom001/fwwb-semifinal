@@ -1,4 +1,4 @@
-<!-- AGENTS.md for fwwb-RL-dog -->
+<!-- AGENTS.md for kaiwu-semi-locomotion -->
 # Repository Notes
 
 ## Project Overview
