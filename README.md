@@ -65,7 +65,31 @@
 
 ## 系统架构
 
-<!-- TODO：补充系统架构图 -->
+```mermaid
+flowchart LR
+    subgraph TRAIN["训练（Isaac Sim 仿真）"]
+        direction TB
+        ENV["仿真环境<br/>Go2 · 地形 · 传感器"]
+        OBS["观测处理<br/>本体 + 高度扫描 + 目标特征"]
+        NET["Actor-Critic 网络<br/>策略与价值输出"]
+        REW["奖励引擎<br/>自定义奖励注册"]
+        LOOP["训练循环<br/>采样 → GAE → PPO 更新"]
+        CURR["课程与命令<br/>速度课程 · 指令混合 · 地形门控"]
+    end
+    MON["监控<br/>面板指标 · 曲线抓取后处理"]
+    EVAL["评估<br/>平台任务 · 相位命令适配"]
+
+    ENV -->|观测| OBS -->|特征| NET
+    NET -->|动作 / PD 目标| ENV
+    REW -.->|奖励注册| ENV
+    ENV -->|轨迹与奖励| LOOP
+    LOOP -->|策略更新| NET
+    LOOP -->|课程指标| CURR
+    CURR -->|命令分布| ENV
+    ENV -->|运行指标| MON
+    NET -->|同一策略| EVAL
+    EVAL -->|评估命令| ENV
+```
 
 ## 关键问题
 
